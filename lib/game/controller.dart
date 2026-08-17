@@ -447,10 +447,20 @@ class GameController extends ChangeNotifier {
       winner = alive.isEmpty ? -1 : alive.first;
       phase = GamePhase.gameOver;
       statusMessage = winner == null || winner == -1 ? 'DRAW!' : '${players[winner!].name} WINS!';
-      final humanWon = winner == 0 && !players[0].isAi;
+      // In hot-seat "Local 2P" (mode == GameMode.local) both seats are human
+      // and share this device's single account — there's no separate profile
+      // per local player. So a win for either seat should count as a win for
+      // the account, not just a win for player 0. Other modes (vs AI, hotspot)
+      // still key off player 0 specifically, since that's the local player.
+      final winningPlayerIsHuman = winner != null && winner! >= 0 && !players[winner!].isAi;
+      final humanWon = mode == GameMode.local ? winningPlayerIsHuman : (winner == 0 && !players[0].isAi);
       AudioService.instance.sfx(humanWon ? 'victory' : 'defeat');
-      // record progression for human player 0
-      if (!players[0].isAi) {
+      // record progression for the local human account. In local hot-seat
+      // mode this applies as long as at least one seat is human (always true
+      // today); in other modes it's specifically player 0.
+      final shouldRecordProgression =
+          mode == GameMode.local ? players.any((p) => !p.isAi) : !players[0].isAi;
+      if (shouldRecordProgression) {
         SaveService.instance.recordMatch(
           won: humanWon,
           damageDealt: damageDealtByHuman,

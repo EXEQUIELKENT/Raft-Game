@@ -1,4 +1,13 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- Required for hotspot multiplayer (lib/game/net.dart): opening the
+         WebSocket host/client sockets needs INTERNET, and reliably reading
+         the device's local Wi-Fi/hotspot IPv4 address via
+         NetworkInterface.list() in NetService.localIp() needs
+         ACCESS_WIFI_STATE — without it, some Android versions/OEMs silently
+         return no addresses and the host screen gets stuck showing "?"
+         instead of a joinable IP. -->
+    <uses-permission android:name="android.permission.INTERNET"/>
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE"/>
     <application
         android:label="raft_rumble"
         android:name="${applicationName}"
