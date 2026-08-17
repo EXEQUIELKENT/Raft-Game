@@ -290,7 +290,7 @@ class PhysicsWorld {
   void explode(Offset center, double radius, double damage, double knockback,
       {double structDamage = 1.0, int owner = -1, String effect = 'standard'}) {
     screenShake = min(screenShake + radius / 40, 14);
-    events.add(GameEvent('explosion', {'x': center.dx, 'y': center.dy, 'r': radius}));
+    events.add(GameEvent('explosion', {'x': center.dx, 'y': center.dy, 'r': radius, 'effect': effect}));
 
     // particles
     final count = (radius / 3).round().clamp(10, 40);

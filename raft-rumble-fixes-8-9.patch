@@ -1,0 +1,360 @@
+diff --git a/lib/game/controller.dart b/lib/game/controller.dart
+index 8cadf4b..df5079b 100644
+--- a/lib/game/controller.dart
++++ b/lib/game/controller.dart
+@@ -257,7 +257,11 @@ class GameController extends ChangeNotifier {
+     for (final e in world.events) {
+       switch (e.kind) {
+         case 'explosion':
+-          AudioService.instance.sfx('explosion');
++          AudioService.instance.sfx(switch (e.data['effect']) {
++            'ice' => 'freeze',
++            'shockwave' => 'shockwave',
++            _ => 'explosion',
++          });
+           break;
+         case 'blockDestroyed':
+           final mat = e.data['material'] as String;
+diff --git a/lib/game/physics.dart b/lib/game/physics.dart
+index 37543c6..f1a6a23 100644
+--- a/lib/game/physics.dart
++++ b/lib/game/physics.dart
+@@ -290,7 +290,7 @@ class PhysicsWorld {
+   void explode(Offset center, double radius, double damage, double knockback,
+       {double structDamage = 1.0, int owner = -1, String effect = 'standard'}) {
+     screenShake = min(screenShake + radius / 40, 14);
+-    events.add(GameEvent('explosion', {'x': center.dx, 'y': center.dy, 'r': radius}));
++    events.add(GameEvent('explosion', {'x': center.dx, 'y': center.dy, 'r': radius, 'effect': effect}));
+ 
+     // particles
+     final count = (radius / 3).round().clamp(10, 40);
+diff --git a/lib/screens/characters_screen.dart b/lib/screens/characters_screen.dart
+index c32e534..0d7544d 100644
+--- a/lib/screens/characters_screen.dart
++++ b/lib/screens/characters_screen.dart
+@@ -14,97 +14,109 @@ class _CharactersScreenState extends State<CharactersScreen> {
+   static const _hats = ['Bandana', 'Captain Hat', 'Propeller Cap', 'Viking Helm', 'Fish Hat'];
+   static const _colors = ['Ruby Red', 'Ocean Blue', 'Leaf Green', 'Sunny Amber'];
+ 
++  /// Persists the chosen hat/color before leaving the screen. Used by both
++  /// the custom back arrow and the system back button/gesture (via
++  /// PopScope) so neither path can discard an unsaved selection.
++  void _saveAndPop() {
++    AudioService.instance.sfx('click');
++    SaveService.instance.save();
++    Navigator.pop(context);
++  }
++
+   @override
+   Widget build(BuildContext context) {
+     final save = SaveService.instance.data;
+-    return Scaffold(
+-      body: Container(
+-        decoration: const BoxDecoration(gradient: RT.sunset),
+-        child: SafeArea(
+-          child: Column(
+-            children: [
+-              Padding(
+-                padding: const EdgeInsets.all(10),
+-                child: Row(
+-                  children: [
+-                    GestureDetector(
+-                      onTap: () {
+-                        AudioService.instance.sfx('click');
+-                        SaveService.instance.save();
+-                        Navigator.pop(context);
+-                      },
+-                      child: Container(
+-                        padding: const EdgeInsets.all(8),
+-                        decoration: RT.card(color: Colors.white, radius: 12, border: 3),
+-                        child: const Icon(Icons.arrow_back, color: RT.ink),
++    return PopScope(
++      canPop: false,
++      onPopInvokedWithResult: (didPop, result) {
++        if (didPop) return;
++        _saveAndPop();
++      },
++      child: Scaffold(
++        body: Container(
++          decoration: const BoxDecoration(gradient: RT.sunset),
++          child: SafeArea(
++            child: Column(
++              children: [
++                Padding(
++                  padding: const EdgeInsets.all(10),
++                  child: Row(
++                    children: [
++                      GestureDetector(
++                        onTap: _saveAndPop,
++                        child: Container(
++                          padding: const EdgeInsets.all(8),
++                          decoration: RT.card(color: Colors.white, radius: 12, border: 3),
++                          child: const Icon(Icons.arrow_back, color: RT.ink),
++                        ),
+                       ),
+-                    ),
+-                    const SizedBox(width: 10),
+-                    Text('YOUR CHARACTER', style: RT.chunky(size: 24, outline: 3)),
+-                  ],
++                      const SizedBox(width: 10),
++                      Text('YOUR CHARACTER', style: RT.chunky(size: 24, outline: 3)),
++                    ],
++                  ),
+                 ),
+-              ),
+-              // preview
+-              Container(
+-                margin: const EdgeInsets.all(14),
+-                padding: const EdgeInsets.all(20),
+-                decoration: RT.card(),
+-                child: Column(
+-                  children: [
+-                    Container(
+-                      width: 110, height: 110,
+-                      decoration: BoxDecoration(
+-                        color: RT.playerColors[save.colorIndex % 4],
+-                        shape: BoxShape.circle,
+-                        border: Border.all(color: RT.ink, width: 5),
++                // preview
++                Container(
++                  margin: const EdgeInsets.all(14),
++                  padding: const EdgeInsets.all(20),
++                  decoration: RT.card(),
++                  child: Column(
++                    children: [
++                      Container(
++                        width: 110, height: 110,
++                        decoration: BoxDecoration(
++                          color: RT.playerColors[save.colorIndex % 4],
++                          shape: BoxShape.circle,
++                          border: Border.all(color: RT.ink, width: 5),
++                        ),
++                        child: Icon(Icons.face, size: 60, color: Colors.white.withOpacity(0.9)),
+                       ),
+-                      child: Icon(Icons.face, size: 60, color: Colors.white.withOpacity(0.9)),
+-                    ),
+-                    const SizedBox(height: 8),
+-                    Text('${_hats[save.hatIndex % 5]} • ${_colors[save.colorIndex % 4]}',
+-                        style: RT.chunky(size: 14, color: RT.ink)),
++                      const SizedBox(height: 8),
++                      Text('${_hats[save.hatIndex % 5]} • ${_colors[save.colorIndex % 4]}',
++                          style: RT.chunky(size: 14, color: RT.ink)),
++                    ],
++                  ),
++                ),
++                Text('HATS', style: RT.chunky(size: 16, outline: 2.5)),
++                const SizedBox(height: 8),
++                Wrap(
++                  spacing: 10, runSpacing: 10,
++                  children: [
++                    for (int i = 0; i < _hats.length; i++)
++                      _opt(_hats[i], save.hatIndex == i, () {
++                        setState(() => save.hatIndex = i);
++                      }),
+                   ],
+                 ),
+-              ),
+-              Text('HATS', style: RT.chunky(size: 16, outline: 2.5)),
+-              const SizedBox(height: 8),
+-              Wrap(
+-                spacing: 10, runSpacing: 10,
+-                children: [
+-                  for (int i = 0; i < _hats.length; i++)
+-                    _opt(_hats[i], save.hatIndex == i, () {
+-                      setState(() => save.hatIndex = i);
+-                    }),
+-                ],
+-              ),
+-              const SizedBox(height: 18),
+-              Text('COLORS', style: RT.chunky(size: 16, outline: 2.5)),
+-              const SizedBox(height: 8),
+-              Wrap(
+-                spacing: 10, runSpacing: 10,
+-                children: [
+-                  for (int i = 0; i < 4; i++)
+-                    GestureDetector(
+-                      onTap: () {
+-                        AudioService.instance.sfx('click');
+-                        setState(() => save.colorIndex = i);
+-                      },
+-                      child: Container(
+-                        width: 56, height: 56,
+-                        decoration: BoxDecoration(
+-                          color: RT.playerColors[i],
+-                          shape: BoxShape.circle,
+-                          border: Border.all(
+-                            color: save.colorIndex == i ? RT.yellow : RT.ink,
+-                            width: save.colorIndex == i ? 5 : 3,
++                const SizedBox(height: 18),
++                Text('COLORS', style: RT.chunky(size: 16, outline: 2.5)),
++                const SizedBox(height: 8),
++                Wrap(
++                  spacing: 10, runSpacing: 10,
++                  children: [
++                    for (int i = 0; i < 4; i++)
++                      GestureDetector(
++                        onTap: () {
++                          AudioService.instance.sfx('click');
++                          setState(() => save.colorIndex = i);
++                        },
++                        child: Container(
++                          width: 56, height: 56,
++                          decoration: BoxDecoration(
++                            color: RT.playerColors[i],
++                            shape: BoxShape.circle,
++                            border: Border.all(
++                              color: save.colorIndex == i ? RT.yellow : RT.ink,
++                              width: save.colorIndex == i ? 5 : 3,
++                            ),
+                           ),
++                          child: save.colorIndex == i ? const Icon(Icons.check, color: Colors.white) : null,
+                         ),
+-                        child: save.colorIndex == i ? const Icon(Icons.check, color: Colors.white) : null,
+                       ),
+-                    ),
+-                ],
+-              ),
+-            ],
++                  ],
++                ),
++              ],
++            ),
+           ),
+         ),
+       ),
+diff --git a/lib/screens/settings_screen.dart b/lib/screens/settings_screen.dart
+index 7e4fabd..c17a429 100644
+--- a/lib/screens/settings_screen.dart
++++ b/lib/screens/settings_screen.dart
+@@ -11,65 +11,78 @@ class SettingsScreen extends StatefulWidget {
+ }
+ 
+ class _SettingsScreenState extends State<SettingsScreen> {
++  /// Persists in-memory settings changes before leaving the screen.
++  /// Used by both the custom back arrow and the system back
++  /// button/gesture (via PopScope) so neither path can discard
++  /// unsaved volume/sensitivity/toggle changes.
++  void _saveAndPop() {
++    SaveService.instance.save();
++    Navigator.pop(context);
++  }
++
+   @override
+   Widget build(BuildContext context) {
+     final d = SaveService.instance.data;
+-    return Scaffold(
+-      body: Container(
+-        decoration: const BoxDecoration(gradient: RT.sunset),
+-        child: SafeArea(
+-          child: Column(
+-            children: [
+-              Padding(
+-                padding: const EdgeInsets.all(10),
+-                child: Row(
+-                  children: [
+-                    GestureDetector(
+-                      onTap: () {
+-                        SaveService.instance.save();
+-                        Navigator.pop(context);
+-                      },
+-                      child: Container(
+-                        padding: const EdgeInsets.all(8),
+-                        decoration: RT.card(color: Colors.white, radius: 12, border: 3),
+-                        child: const Icon(Icons.arrow_back, color: RT.ink),
++    return PopScope(
++      canPop: false,
++      onPopInvokedWithResult: (didPop, result) {
++        if (didPop) return;
++        _saveAndPop();
++      },
++      child: Scaffold(
++        body: Container(
++          decoration: const BoxDecoration(gradient: RT.sunset),
++          child: SafeArea(
++            child: Column(
++              children: [
++                Padding(
++                  padding: const EdgeInsets.all(10),
++                  child: Row(
++                    children: [
++                      GestureDetector(
++                        onTap: _saveAndPop,
++                        child: Container(
++                          padding: const EdgeInsets.all(8),
++                          decoration: RT.card(color: Colors.white, radius: 12, border: 3),
++                          child: const Icon(Icons.arrow_back, color: RT.ink),
++                        ),
+                       ),
+-                    ),
+-                    const SizedBox(width: 10),
+-                    Text('SETTINGS', style: RT.chunky(size: 26, outline: 3)),
+-                  ],
++                      const SizedBox(width: 10),
++                      Text('SETTINGS', style: RT.chunky(size: 26, outline: 3)),
++                    ],
++                  ),
+                 ),
+-              ),
+-              Expanded(
+-                child: ListView(
+-                  padding: const EdgeInsets.all(14),
+-                  children: [
+-                    _slider('MUSIC VOLUME', d.musicVolume, (v) {
+-                      setState(() => d.musicVolume = v);
+-                      AudioService.instance.updateVolumes();
+-                    }),
+-                    _slider('SFX VOLUME', d.sfxVolume, (v) {
+-                      setState(() => d.sfxVolume = v);
+-                      AudioService.instance.sfx('click');
+-                    }),
+-                    _slider('CONTROL SENSITIVITY', d.sensitivity, (v) => setState(() => d.sensitivity = v), min: 0.4, max: 2.0),
+-                    _toggle('VIBRATION', d.vibration, (v) => setState(() => d.vibration = v)),
+-                    _toggle('TRAJECTORY PREVIEW', d.showTrajectory, (v) => setState(() => d.showTrajectory = v)),
+-                    _toggle('AIM ASSIST', d.aimAssist, (v) => setState(() => d.aimAssist = v)),
+-                    _qualityPicker(d),
+-                    const SizedBox(height: 10),
+-                    ChunkyButton(
+-                      label: 'RESET PROGRESS', icon: Icons.delete_forever, color: RT.red, fontSize: 16,
+-                      onPressed: () async {
+-                        AudioService.instance.sfx('explosion');
+-                        await SaveService.instance.reset();
+-                        setState(() {});
+-                      },
+-                    ),
+-                  ],
++                Expanded(
++                  child: ListView(
++                    padding: const EdgeInsets.all(14),
++                    children: [
++                      _slider('MUSIC VOLUME', d.musicVolume, (v) {
++                        setState(() => d.musicVolume = v);
++                        AudioService.instance.updateVolumes();
++                      }),
++                      _slider('SFX VOLUME', d.sfxVolume, (v) {
++                        setState(() => d.sfxVolume = v);
++                        AudioService.instance.sfx('click');
++                      }),
++                      _slider('CONTROL SENSITIVITY', d.sensitivity, (v) => setState(() => d.sensitivity = v), min: 0.4, max: 2.0),
++                      _toggle('VIBRATION', d.vibration, (v) => setState(() => d.vibration = v)),
++                      _toggle('TRAJECTORY PREVIEW', d.showTrajectory, (v) => setState(() => d.showTrajectory = v)),
++                      _toggle('AIM ASSIST', d.aimAssist, (v) => setState(() => d.aimAssist = v)),
++                      _qualityPicker(d),
++                      const SizedBox(height: 10),
++                      ChunkyButton(
++                        label: 'RESET PROGRESS', icon: Icons.delete_forever, color: RT.red, fontSize: 16,
++                        onPressed: () async {
++                          AudioService.instance.sfx('explosion');
++                          await SaveService.instance.reset();
++                          setState(() {});
++                        },
++                      ),
++                    ],
++                  ),
+                 ),
+-              ),
+-            ],
++              ],
++            ),
+           ),
+         ),
+       ),

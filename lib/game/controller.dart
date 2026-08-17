@@ -257,7 +257,11 @@ class GameController extends ChangeNotifier {
     for (final e in world.events) {
       switch (e.kind) {
         case 'explosion':
-          AudioService.instance.sfx('explosion');
+          AudioService.instance.sfx(switch (e.data['effect']) {
+            'ice' => 'freeze',
+            'shockwave' => 'shockwave',
+            _ => 'explosion',
+          });
           break;
         case 'blockDestroyed':
           final mat = e.data['material'] as String;

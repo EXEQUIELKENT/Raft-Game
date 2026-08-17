@@ -11,65 +11,78 @@ class SettingsScreen extends StatefulWidget {
 }
 
 class _SettingsScreenState extends State<SettingsScreen> {
+  /// Persists in-memory settings changes before leaving the screen.
+  /// Used by both the custom back arrow and the system back
+  /// button/gesture (via PopScope) so neither path can discard
+  /// unsaved volume/sensitivity/toggle changes.
+  void _saveAndPop() {
+    SaveService.instance.save();
+    Navigator.pop(context);
+  }
+
   @override
   Widget build(BuildContext context) {
     final d = SaveService.instance.data;
-    return Scaffold(
-      body: Container(
-        decoration: const BoxDecoration(gradient: RT.sunset),
-        child: SafeArea(
-          child: Column(
-            children: [
-              Padding(
-                padding: const EdgeInsets.all(10),
-                child: Row(
-                  children: [
-                    GestureDetector(
-                      onTap: () {
-                        SaveService.instance.save();
-                        Navigator.pop(context);
-                      },
-                      child: Container(
-                        padding: const EdgeInsets.all(8),
-                        decoration: RT.card(color: Colors.white, radius: 12, border: 3),
-                        child: const Icon(Icons.arrow_back, color: RT.ink),
+    return PopScope(
+      canPop: false,
+      onPopInvokedWithResult: (didPop, result) {
+        if (didPop) return;
+        _saveAndPop();
+      },
+      child: Scaffold(
+        body: Container(
+          decoration: const BoxDecoration(gradient: RT.sunset),
+          child: SafeArea(
+            child: Column(
+              children: [
+                Padding(
+                  padding: const EdgeInsets.all(10),
+                  child: Row(
+                    children: [
+                      GestureDetector(
+                        onTap: _saveAndPop,
+                        child: Container(
+                          padding: const EdgeInsets.all(8),
+                          decoration: RT.card(color: Colors.white, radius: 12, border: 3),
+                          child: const Icon(Icons.arrow_back, color: RT.ink),
+                        ),
                       ),
-                    ),
-                    const SizedBox(width: 10),
-                    Text('SETTINGS', style: RT.chunky(size: 26, outline: 3)),
-                  ],
+                      const SizedBox(width: 10),
+                      Text('SETTINGS', style: RT.chunky(size: 26, outline: 3)),
+                    ],
+                  ),
                 ),
-              ),
-              Expanded(
-                child: ListView(
-                  padding: const EdgeInsets.all(14),
-                  children: [
-                    _slider('MUSIC VOLUME', d.musicVolume, (v) {
-                      setState(() => d.musicVolume = v);
-                      AudioService.instance.updateVolumes();
-                    }),
-                    _slider('SFX VOLUME', d.sfxVolume, (v) {
-                      setState(() => d.sfxVolume = v);
-                      AudioService.instance.sfx('click');
-                    }),
-                    _slider('CONTROL SENSITIVITY', d.sensitivity, (v) => setState(() => d.sensitivity = v), min: 0.4, max: 2.0),
-                    _toggle('VIBRATION', d.vibration, (v) => setState(() => d.vibration = v)),
-                    _toggle('TRAJECTORY PREVIEW', d.showTrajectory, (v) => setState(() => d.showTrajectory = v)),
-                    _toggle('AIM ASSIST', d.aimAssist, (v) => setState(() => d.aimAssist = v)),
-                    _qualityPicker(d),
-                    const SizedBox(height: 10),
-                    ChunkyButton(
-                      label: 'RESET PROGRESS', icon: Icons.delete_forever, color: RT.red, fontSize: 16,
-                      onPressed: () async {
-                        AudioService.instance.sfx('explosion');
-                        await SaveService.instance.reset();
-                        setState(() {});
-                      },
-                    ),
-                  ],
+                Expanded(
+                  child: ListView(
+                    padding: const EdgeInsets.all(14),
+                    children: [
+                      _slider('MUSIC VOLUME', d.musicVolume, (v) {
+                        setState(() => d.musicVolume = v);
+                        AudioService.instance.updateVolumes();
+                      }),
+                      _slider('SFX VOLUME', d.sfxVolume, (v) {
+                        setState(() => d.sfxVolume = v);
+                        AudioService.instance.sfx('click');
+                      }),
+                      _slider('CONTROL SENSITIVITY', d.sensitivity, (v) => setState(() => d.sensitivity = v), min: 0.4, max: 2.0),
+                      _toggle('VIBRATION', d.vibration, (v) => setState(() => d.vibration = v)),
+                      _toggle('TRAJECTORY PREVIEW', d.showTrajectory, (v) => setState(() => d.showTrajectory = v)),
+                      _toggle('AIM ASSIST', d.aimAssist, (v) => setState(() => d.aimAssist = v)),
+                      _qualityPicker(d),
+                      const SizedBox(height: 10),
+                      ChunkyButton(
+                        label: 'RESET PROGRESS', icon: Icons.delete_forever, color: RT.red, fontSize: 16,
+                        onPressed: () async {
+                          AudioService.instance.sfx('explosion');
+                          await SaveService.instance.reset();
+                          setState(() {});
+                        },
+                      ),
+                    ],
+                  ),
                 ),
-              ),
-            ],
+              ],
+            ),
           ),
         ),
       ),
