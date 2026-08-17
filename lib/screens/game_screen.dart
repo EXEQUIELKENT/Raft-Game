@@ -1,4 +1,5 @@
 import 'dart:math';
+import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import '../game/audio.dart';
@@ -9,6 +10,34 @@ import '../game/physics.dart';
 import '../game/renderer.dart';
 import '../game/save.dart';
 import '../theme.dart';
+
+/// A [PanGestureRecognizer] that refuses to enter the gesture arena for
+/// touches that start inside a set of excluded screen regions.
+///
+/// [GameScreen] wraps the whole board in a single pan recognizer to drive
+/// aim-dragging, but that recognizer is an *ancestor* of the horizontally
+/// scrolling weapon wheel and build-piece palette. Because Flutter adds
+/// every recognizer along the hit-test path to the same gesture arena, the
+/// full-screen pan recognizer would otherwise race the lists' own drag
+/// recognizers on every touch, making the lists feel janky. Rejecting the
+/// pointer up front (via [isPointerAllowed]) keeps the aim recognizer out
+/// of the arena entirely for those regions, leaving the lists' scroll
+/// recognizers to win uncontested.
+class _AimPanGestureRecognizer extends PanGestureRecognizer {
+  _AimPanGestureRecognizer({required this.excludedRectsProvider});
+
+  /// Returns the current global-coordinate rects (e.g. the weapon wheel and
+  /// build-piece palette) that should not trigger aim-dragging.
+  List<Rect> Function() excludedRectsProvider;
+
+  @override
+  bool isPointerAllowed(PointerDownEvent event) {
+    for (final rect in excludedRectsProvider()) {
+      if (rect.contains(event.position)) return false;
+    }
+    return super.isPointerAllowed(event);
+  }
+}
 
 class GameScreen extends StatefulWidget {
   final MatchSettings settings;
@@ -41,6 +70,21 @@ class _GameScreenState extends State<GameScreen> {
   double _startAngle = 0;
   double _startPower = 0.6;
   bool _charging = false;
+
+  // Bounds of the horizontally-scrolling lists that must stay usable
+  // underneath the full-screen aim-drag gesture (see _AimPanGestureRecognizer).
+  final GlobalKey _weaponWheelKey = GlobalKey();
+  final GlobalKey _piecePaletteKey = GlobalKey();
+
+  List<Rect> _excludedAimGestureRects() {
+    final rects = <Rect>[];
+    for (final key in [_weaponWheelKey, _piecePaletteKey]) {
+      final box = key.currentContext?.findRenderObject() as RenderBox?;
+      if (box == null || !box.attached) continue;
+      rects.add(box.localToGlobal(Offset.zero) & box.size);
+    }
+    return rects;
+  }
 
   // building state
   PieceDef _selectedPiece = PieceDef.catalogue.first;
@@ -211,10 +255,19 @@ class _GameScreenState extends State<GameScreen> {
             colors: widget.settings.map.sky,
           ),
         ),
-        child: GestureDetector(
-          onPanStart: _onPanStart,
-          onPanUpdate: _onPanUpdate,
-          onPanEnd: _onPanEnd,
+        child: RawGestureDetector(
+          gestures: {
+            PanGestureRecognizer: GestureRecognizerFactoryWithHandlers<_AimPanGestureRecognizer>(
+              () => _AimPanGestureRecognizer(excludedRectsProvider: _excludedAimGestureRects),
+              (instance) {
+                instance
+                  ..excludedRectsProvider = _excludedAimGestureRects
+                  ..onStart = _onPanStart
+                  ..onUpdate = _onPanUpdate
+                  ..onEnd = _onPanEnd;
+              },
+            ),
+          },
           child: Stack(
             children: [
               // world
@@ -393,6 +446,7 @@ class _GameScreenState extends State<GameScreen> {
         children: [
           // weapon wheel
           SizedBox(
+            key: _weaponWheelKey,
             height: 64,
             child: ListView.builder(
               scrollDirection: Axis.horizontal,
@@ -538,6 +592,7 @@ class _GameScreenState extends State<GameScreen> {
                 // piece palette
                 Expanded(
                   child: SizedBox(
+                    key: _piecePaletteKey,
                     height: 74,
                     child: ListView.builder(
                       scrollDirection: Axis.horizontal,

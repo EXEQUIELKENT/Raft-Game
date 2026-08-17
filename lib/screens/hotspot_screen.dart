@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import '../game/audio.dart';
 import '../game/controller.dart';
 import '../game/maps.dart';
@@ -198,7 +199,15 @@ class _HotspotScreenState extends State<HotspotScreen> {
                             Expanded(
                               child: TextField(
                                 controller: _ipController,
-                                keyboardType: TextInputType.number,
+                                // A plain numeric keypad hides the "." key on most phones,
+                                // making it painful to type a dotted IPv4 address. Requesting
+                                // the decimal-enabled numeric keyboard keeps digits front and
+                                // center while still exposing a period key, and the input
+                                // formatter below blocks anything that isn't a digit or dot.
+                                keyboardType: const TextInputType.numberWithOptions(decimal: true),
+                                inputFormatters: [
+                                  FilteringTextInputFormatter.allow(RegExp(r'[0-9.]')),
+                                ],
                                 decoration: const InputDecoration(
                                   hintText: 'Host IP, e.g. 192.168.1.5',
                                   border: OutlineInputBorder(),
