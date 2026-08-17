@@ -609,6 +609,20 @@ class PhysicsWorld {
       if (b.type == BodyType.character) {
         final hit = _circleVsBody(p.pos, p.radius, b);
         if (hit != null) {
+          if (p.weapon.behavior == 'grenade') {
+            // Grenades don't detonate on contact — they arm their fuse (if not
+            // already armed) and bounce off, same as when hitting a block.
+            if (p.fuse < 0) {
+              p.fuse = 1.1;
+              events.add(GameEvent('fuse', {}));
+            }
+            final n = hit;
+            final v = p.vel;
+            p.vel = (v - n * 2 * (v.dx * n.dx + v.dy * n.dy)) * 0.55;
+            p.pos += n * (p.radius + 3);
+            events.add(GameEvent('bounce', {}));
+            return;
+          }
           final speed = p.vel.distance;
           final dmg = p.weapon.damage * (0.7 + 0.6 * (speed / 700).clamp(0.0, 1.0));
           final kb = p.vel.normalizedSafe() * p.weapon.knockback * 300;

@@ -593,7 +593,7 @@ class GameController extends ChangeNotifier {
       final piece = PieceDef.catalogue[rnd.nextInt(PieceDef.catalogue.length)];
       final x = spawn.dx + dir * (30 + rnd.nextDouble() * 90) + (rnd.nextDouble() - 0.5) * 30;
       final y = spawn.dy - 20 - rnd.nextDouble() * 130;
-      final rot = piece.size.width > piece.size.height ? 0.0 : (rnd.nextBool() ? 0.0 : pi / 2 * 0);
+      final rot = piece.size.width > piece.size.height ? 0.0 : (rnd.nextBool() ? 0.0 : pi / 2);
       final testRect = Rect.fromCenter(center: Offset(x, y), width: piece.size.width + 8, height: piece.size.height + 8);
       bool blocked = false;
       for (final b in world.bodies) {
