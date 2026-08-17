@@ -116,14 +116,17 @@ class GameController extends ChangeNotifier {
       height: worldH,
       waterLevel: worldH - 150,
       seed: s,
+      mapHazard: settings.map.hazard,
+      environment: settings.map.terrain,
     );
     _setupWorld(s, skipBuildPhase: skipBuildPhase);
   }
 
   void _setupWorld(int seed, {bool skipBuildPhase = false}) {
     MapBuilder.build(world, settings.map, players.length, seed.toDouble());
-    // wind
-    wind = (world.rng.range(-1, 1) * settings.windStrength).clamp(-1.0, 1.0);
+    // wind: each map has its own base wind (e.g. Frosty Peaks is gustier
+    // than Coconut Cove), randomized around by the player's wind setting.
+    wind = (settings.map.windBase + world.rng.range(-1, 1) * settings.windStrength).clamp(-1.0, 1.0);
     world.wind = wind;
 
     // spawn characters
@@ -302,9 +305,10 @@ class GameController extends ChangeNotifier {
 
   void _beginTurn(int player, {bool initial = false}) {
     currentPlayer = player;
-    // vary wind slightly each turn
+    // vary wind slightly each turn, drifting back toward the map's base wind
+    // so a gusty map (e.g. Frosty Peaks) stays gusty over a long match
     if (!initial) {
-      wind = (wind + world.rng.range(-0.25, 0.25)).clamp(-1.0, 1.0);
+      wind = (wind + world.rng.range(-0.25, 0.25) + (settings.map.windBase - wind) * 0.15).clamp(-1.0, 1.0);
       world.wind = wind;
     }
     turnTimeLeft = settings.turnSeconds;
@@ -643,7 +647,14 @@ class GameController extends ChangeNotifier {
     round = 1;
     damageDealtByHuman = 0;
     final s = seed ?? DateTime.now().millisecondsSinceEpoch;
-    world = PhysicsWorld(width: worldW, height: worldH, waterLevel: worldH - 150, seed: s);
+    world = PhysicsWorld(
+      width: worldW,
+      height: worldH,
+      waterLevel: worldH - 150,
+      seed: s,
+      mapHazard: settings.map.hazard,
+      environment: settings.map.terrain,
+    );
     _setupWorld(s, skipBuildPhase: settings.buildLimit == 0);
   }
 

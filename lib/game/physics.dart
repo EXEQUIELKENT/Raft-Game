@@ -37,6 +37,8 @@ class PhysBody {
   double slowUntil = 0;
   double supportTimer = 0; // seconds without support -> collapse
   bool isSensor = false; // projectiles use manual collision
+  bool explosive = false; // e.g. desert barrels: detonate when destroyed
+  bool isVehicle = false; // map-hazard traffic: cruises at fixed height, ignores gravity/wind
 
   PhysBody({
     required this.id,
@@ -159,8 +161,25 @@ class PhysicsWorld {
   /// hazard zones (fire patches)
   final List<_Hazard> hazards = [];
 
-  PhysicsWorld({required this.width, required this.height, required this.waterLevel, int seed = 42})
-      : rng = GameRng(seed);
+  /// The current map's hazard type: none | waves | rocks | barrels | lava | traffic.
+  /// 'barrels' is handled reactively in [destroyBlock] via [PhysBody.explosive];
+  /// the rest are driven periodically by [_updateMapHazard].
+  final String mapHazard;
+
+  /// What lies beyond the play area's edge: water | sand | lava. Affects the
+  /// splash effect and elimination cause when something falls off the edge.
+  final String environment;
+
+  double _hazardTimer = 3.0;
+
+  PhysicsWorld({
+    required this.width,
+    required this.height,
+    required this.waterLevel,
+    int seed = 42,
+    this.mapHazard = 'none',
+    this.environment = 'water',
+  }) : rng = GameRng(seed);
 
   int nextId() => _nextId++;
 
@@ -367,6 +386,7 @@ class PhysicsWorld {
 
   void destroyBlock(PhysBody b, {String effect = 'hit'}) {
     if (b.dead) return;
+    final wasExplosive = b.explosive;
     b.dead = true;
     events.add(GameEvent('blockDestroyed', {'material': b.material.name, 'x': b.pos.dx, 'y': b.pos.dy}));
     final color = _materialSpec(b.material).color;
@@ -390,6 +410,13 @@ class PhysicsWorld {
         color: color.withOpacity(0.7),
         gravity: 120,
       ));
+    }
+    // desert barrels: popping one detonates it (and can chain into any
+    // neighbouring barrels caught in the blast, since explode() re-enters
+    // destroyBlock for anything it kills — b.dead is already true by then
+    // so this barrel itself can't double-trigger).
+    if (wasExplosive) {
+      explode(b.pos, 80, 32, 1.15, structDamage: 1.2, owner: -1, effect: 'standard');
     }
   }
 
@@ -492,6 +519,15 @@ class PhysicsWorld {
         continue;
       }
 
+      if (b.isVehicle) {
+        // hazard traffic: cruises at a fixed height in a straight line,
+        // unaffected by gravity/wind/drag, and simply despawns once it has
+        // driven off the far side of the map.
+        b.pos += b.vel * dt;
+        if (b.pos.dx < -160 || b.pos.dx > width + 160) b.dead = true;
+        continue;
+      }
+
       final slow = b.slowUntil > elapsed ? 0.5 : 1.0;
       // gravity + wind
       b.vel += Offset(wind * 90, gravity) * dt;
@@ -502,11 +538,12 @@ class PhysicsWorld {
       b.angle += b.angularVel * dt * slow;
       if (b.angle > pi * 4 || b.angle < -pi * 4) b.angle = b.angle % (2 * pi);
 
-      // water: characters drown, debris floats/sinks
+      // water (or sand / lava, depending on the map): characters are
+      // eliminated, debris floats/sinks
       if (b.pos.dy > waterLevel + b.size.height / 2) {
         if (b.type == BodyType.character) {
           splash(b.pos, 3);
-          damageCharacter(b, 9999.0, Offset.zero, cause: 'water');
+          damageCharacter(b, 9999.0, Offset.zero, cause: _edgeCause);
         } else if (b.type == BodyType.debris) {
           b.vel = Offset(b.vel.dx * 0.9, b.vel.dy * 0.6 - 30);
           if (b.pos.dy > waterLevel + 120) b.dead = true;
@@ -537,7 +574,7 @@ class PhysicsWorld {
 
     // --- support check: dynamic blocks with nothing below slowly collapse ---
     for (final b in active) {
-      if (b.type != BodyType.block || b.isStatic) continue;
+      if (b.type != BodyType.block || b.isStatic || b.isVehicle) continue;
       final supported = _hasSupport(b, active);
       if (supported) {
         b.supportTimer = 0;
@@ -573,6 +610,9 @@ class PhysicsWorld {
       }
     }
 
+    // --- per-map hazard (rocks / traffic / embers / wind gusts) ---
+    _updateMapHazard(dt);
+
     // --- particles & texts ---
     for (final pt in particles) {
       pt.life -= dt;
@@ -588,6 +628,97 @@ class PhysicsWorld {
 
     bodies.removeWhere((b) => b.dead && b.type == BodyType.debris);
     if (screenShake > 0) screenShake = max(0, screenShake - dt * 22);
+  }
+
+  // -------------------------------------------------------------------------
+  // Per-map hazards (MapDef.hazard) — 'barrels' is reactive (see
+  // destroyBlock); everything else here fires on its own timer.
+  // -------------------------------------------------------------------------
+
+  void _updateMapHazard(double dt) {
+    if (mapHazard == 'none' || mapHazard == 'barrels') return;
+    _hazardTimer -= dt;
+    if (_hazardTimer > 0) return;
+    switch (mapHazard) {
+      case 'rocks':
+        _spawnFallingRock();
+        _hazardTimer = rng.range(4.5, 8.0);
+        break;
+      case 'lava':
+        _spawnEmber();
+        _hazardTimer = rng.range(3.0, 5.5);
+        break;
+      case 'traffic':
+        _spawnTraffic();
+        _hazardTimer = rng.range(5.0, 9.0);
+        break;
+      case 'waves':
+        _gustWind();
+        _hazardTimer = rng.range(3.5, 6.5);
+        break;
+      default:
+        _hazardTimer = 999; // unknown hazard kind: don't loop forever
+    }
+  }
+
+  /// Frosty Peaks: boulders tumble down from off-screen and slam into
+  /// whatever (or whoever) is below — reuses the normal falling-block /
+  /// impact-damage physics, it just needs to exist.
+  void _spawnFallingRock() {
+    final x = rng.range(width * 0.12, width * 0.88);
+    final side = rng.range(22.0, 34.0);
+    final rock = addBlock(
+      pos: Offset(x, -60),
+      size: Size(side, side),
+      material: MaterialType.stone,
+      isStatic: false,
+    );
+    rock.vel = Offset(rng.range(-30, 30), rng.range(120, 200));
+    events.add(GameEvent('rockfall', {'x': x}));
+  }
+
+  /// Mount Sizzle: a shower of embers drifts down and ignites a patch of
+  /// fire where it lands, reusing the existing fire-hazard/burn mechanic.
+  void _spawnEmber() {
+    final x = rng.range(width * 0.15, width * 0.85);
+    final landY = waterLevel - rng.range(20, 90);
+    for (int i = 0; i < 10; i++) {
+      particles.add(Particle(
+        pos: Offset(x + rng.range(-10, 10), landY - 260 - rng.range(0, 160)),
+        vel: Offset(rng.range(-20, 20), rng.range(160, 260)),
+        life: rng.range(0.9, 1.6),
+        size: rng.range(3, 7),
+        color: rng.nextBool() ? const Color(0xFFFF8C1A) : const Color(0xFFFFD32A),
+        gravity: 40,
+        glow: true,
+      ));
+    }
+    hazards.add(_Hazard(center: Offset(x, landY), radius: 42, until: elapsed + 3.4, kind: 'fire'));
+    events.add(GameEvent('ember', {'x': x, 'y': landY}));
+  }
+
+  /// Rooftop Rumble: a vehicle zooms along the street below the towers,
+  /// dealing the usual "moving block slam" damage to anyone in its path.
+  void _spawnTraffic() {
+    final dir = rng.nextBool() ? 1.0 : -1.0;
+    final startX = dir > 0 ? -140.0 : width + 140.0;
+    final car = addBlock(
+      pos: Offset(startX, waterLevel + 16),
+      size: const Size(70, 24),
+      material: MaterialType.metal,
+      isStatic: false,
+    );
+    car.mass = 6;
+    car.isVehicle = true;
+    car.vel = Offset(dir * rng.range(260, 340), 0);
+    events.add(GameEvent('traffic', {'dir': dir}));
+  }
+
+  /// Ocean Drift: rolling waves periodically gust the wind for a few beats.
+  void _gustWind() {
+    final dir = rng.nextBool() ? 1.0 : -1.0;
+    wind = (wind + dir * rng.range(0.15, 0.35)).clamp(-1.0, 1.0);
+    events.add(GameEvent('gust', {'wind': wind}));
   }
 
   bool _hasSupport(PhysBody b, List<PhysBody> all) {
@@ -824,15 +955,43 @@ class PhysicsWorld {
     }
   }
 
+  /// Elimination cause used when a body falls off the edge of the world,
+  /// matching whatever [environment] actually lies down there.
+  String get _edgeCause => switch (environment) {
+        'sand' => 'buried',
+        'lava' => 'lava',
+        _ => 'water',
+      };
+
   void splash(Offset pos, double strength) {
+    final Color color;
+    final double particleGravity;
+    final bool glow;
+    switch (environment) {
+      case 'sand':
+        color = const Color(0xFFE8C07D);
+        particleGravity = 900; // grit falls back down fast, doesn't arc like water
+        glow = false;
+        break;
+      case 'lava':
+        color = const Color(0xFFFF6A3D);
+        particleGravity = 500;
+        glow = true;
+        break;
+      default:
+        color = const Color(0xFFBFECFF);
+        particleGravity = 600;
+        glow = false;
+    }
     for (int i = 0; i < (strength * 4).clamp(4, 16); i++) {
       particles.add(Particle(
         pos: Offset(pos.dx, waterLevel),
         vel: Offset(rng.range(-70, 70) * strength / 2, rng.range(-220, -60) * strength / 2),
         life: rng.range(0.4, 0.9),
         size: rng.range(3, 8),
-        color: const Color(0xFFBFECFF),
-        gravity: 600,
+        color: color,
+        gravity: particleGravity,
+        glow: glow,
       ));
     }
   }

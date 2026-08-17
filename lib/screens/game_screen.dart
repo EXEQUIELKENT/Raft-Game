@@ -62,6 +62,7 @@ class _GameScreenState extends State<GameScreen> {
         );
     renderer = WorldRenderer(
       ctrl.world,
+      map: ctrl.settings.map,
       charColors: widget.players.map((p) => RT.playerColors[p.colorIndex % RT.playerColors.length]).toList(),
       charHats: widget.players.map((p) => p.hatIndex).toList(),
     );
@@ -73,6 +74,7 @@ class _GameScreenState extends State<GameScreen> {
       // rebind renderer world (world object persists but be safe)
       renderer = WorldRenderer(
         ctrl.world,
+        map: ctrl.settings.map,
         charColors: widget.players.map((p) => RT.playerColors[p.colorIndex % RT.playerColors.length]).toList(),
         charHats: widget.players.map((p) => p.hatIndex).toList(),
       );

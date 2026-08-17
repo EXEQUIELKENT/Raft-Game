@@ -45,6 +45,21 @@ class MapDef {
     this.hazard = 'none',
     this.levelLock = 1,
   });
+
+  /// What the void beyond the edge of the play area actually is: water for
+  /// most maps, but sand for the desert and lava for the volcano. Drives
+  /// both the renderer (background/foreground art) and the physics world
+  /// (splash effect + elimination cause when a body falls off the edge).
+  String get terrain {
+    switch (id) {
+      case 'desert':
+        return 'sand';
+      case 'volcano':
+        return 'lava';
+      default:
+        return 'water';
+    }
+  }
 }
 
 class GameMaps {
@@ -275,7 +290,8 @@ class MapBuilder {
         isStatic: true,
       );
     }
-    // explosive barrels (as weak wood with bonus dmg — handled via low hp)
+    // explosive barrels: low hp so they pop quickly, and flagged `explosive`
+    // so the physics world detonates them (and any neighbours) on death.
     for (int i = 0; i < 5; i++) {
       final b = w.addBlock(
         pos: Offset(w.width * (0.25 + rnd.nextDouble() * 0.5), w.waterLevel - 120 - rnd.nextDouble() * 100),
@@ -284,6 +300,7 @@ class MapBuilder {
         isStatic: true,
       );
       b.hp = 12; b.maxHp = 12; // very explody
+      b.explosive = true;
     }
   }
 

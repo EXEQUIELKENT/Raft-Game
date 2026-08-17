@@ -2,15 +2,17 @@ import 'dart:math';
 import 'dart:ui';
 import 'package:flutter/material.dart' hide MaterialType;
 import '../theme.dart';
+import 'maps.dart';
 import 'physics.dart';
 
 /// Renders the game world in vibrant comic style with thick outlines.
 class WorldRenderer {
   final PhysicsWorld world;
+  final MapDef map;
   final List<Color> charColors;
   final List<int> charHats;
 
-  WorldRenderer(this.world, {required this.charColors, required this.charHats});
+  WorldRenderer(this.world, {required this.map, required this.charColors, required this.charHats});
 
   void render(Canvas canvas, Size viewSize, Offset camPos, double camZoom, double time) {
     canvas.save();
@@ -56,7 +58,7 @@ class WorldRenderer {
       }
     }
 
-    _drawWaterForeground(canvas, time);
+    _drawEdgeForeground(canvas, time);
 
     // projectiles
     for (final p in world.projectiles) {
@@ -111,13 +113,28 @@ class WorldRenderer {
         Paint()
           ..color = const Color(0xFFFFD32A)
           ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 10));
-    // clouds
-    final cloudPaint = Paint()..color = Colors.white.withOpacity(0.85);
+    // clouds (ashy grey over the volcano, fluffy white everywhere else)
+    final cloudColor = map.terrain == 'lava' ? const Color(0xFF8A828C) : Colors.white;
+    final cloudPaint = Paint()..color = cloudColor.withOpacity(0.85);
     for (int i = 0; i < 4; i++) {
       final cx = (i * 380 + (time * 12) % (world.width + 400)) - 100;
       final cy = 70.0 + (i % 3) * 55;
       _cloud(canvas, Offset(cx.toDouble(), cy), cloudPaint, 0.8 + (i % 2) * 0.3);
     }
+
+    switch (map.terrain) {
+      case 'sand':
+        _drawDesertGround(canvas);
+        break;
+      case 'lava':
+        _drawLavaGround(canvas);
+        break;
+      default:
+        _drawOceanGround(canvas);
+    }
+  }
+
+  void _drawOceanGround(Canvas canvas) {
     // distant islands silhouettes
     final islPaint = Paint()..color = const Color(0xFF6B3FA0).withOpacity(0.35);
     canvas.drawOval(Rect.fromCenter(center: Offset(world.width * 0.2, world.waterLevel - 4), width: 260, height: 60), islPaint);
@@ -135,7 +152,56 @@ class WorldRenderer {
           ).createShader(waterRect));
   }
 
-  void _drawWaterForeground(Canvas canvas, double time) {
+  void _drawDesertGround(Canvas canvas) {
+    // distant dune silhouettes
+    final dunePaint = Paint()..color = const Color(0xFFCB8A3E).withOpacity(0.4);
+    canvas.drawOval(Rect.fromCenter(center: Offset(world.width * 0.2, world.waterLevel + 6), width: 300, height: 70), dunePaint);
+    canvas.drawOval(Rect.fromCenter(center: Offset(world.width * 0.72, world.waterLevel + 10), width: 360, height: 84), dunePaint);
+
+    // sand stretching to the horizon
+    final groundRect = Rect.fromLTWH(-400, world.waterLevel, world.width + 800, world.height - world.waterLevel + 600);
+    canvas.drawRect(
+        groundRect,
+        Paint()
+          ..shader = const LinearGradient(
+            begin: Alignment.topCenter,
+            end: Alignment.bottomCenter,
+            colors: [Color(0xFFF2C879), Color(0xFFC17A34)],
+          ).createShader(groundRect));
+  }
+
+  void _drawLavaGround(Canvas canvas) {
+    // distant volcanic ridge silhouettes
+    final ridgePaint = Paint()..color = const Color(0xFF2B141E).withOpacity(0.55);
+    canvas.drawOval(Rect.fromCenter(center: Offset(world.width * 0.18, world.waterLevel - 6), width: 280, height: 64), ridgePaint);
+    canvas.drawOval(Rect.fromCenter(center: Offset(world.width * 0.76, world.waterLevel - 2), width: 320, height: 72), ridgePaint);
+
+    // molten lava sea
+    final lavaRect = Rect.fromLTWH(-400, world.waterLevel, world.width + 800, world.height - world.waterLevel + 600);
+    canvas.drawRect(
+        lavaRect,
+        Paint()
+          ..shader = const LinearGradient(
+            begin: Alignment.topCenter,
+            end: Alignment.bottomCenter,
+            colors: [Color(0xFFFF8A3D), Color(0xFF7A1414)],
+          ).createShader(lavaRect));
+  }
+
+  void _drawEdgeForeground(Canvas canvas, double time) {
+    switch (map.terrain) {
+      case 'sand':
+        _drawDesertForeground(canvas, time);
+        break;
+      case 'lava':
+        _drawLavaForeground(canvas, time);
+        break;
+      default:
+        _drawOceanForeground(canvas, time);
+    }
+  }
+
+  void _drawOceanForeground(Canvas canvas, double time) {
     // animated wave line
     final path = Path();
     final paint = Paint()..color = Colors.white.withOpacity(0.5);
@@ -148,6 +214,39 @@ class WorldRenderer {
     path.lineTo(-400, world.waterLevel + 26);
     path.close();
     canvas.drawPath(path, paint..color = const Color(0xFF9FE4F5).withOpacity(0.85));
+  }
+
+  void _drawDesertForeground(Canvas canvas, double time) {
+    // loose sand crest — slower, gentler undulation than water, no foam
+    final path = Path();
+    final paint = Paint()..color = const Color(0xFFE8C07D).withOpacity(0.8);
+    path.moveTo(-400, world.waterLevel);
+    for (double x = -400; x <= world.width + 400; x += 16) {
+      final y = world.waterLevel + sin(x / 70 + time * 0.6) * 3;
+      path.lineTo(x, y);
+    }
+    path.lineTo(world.width + 400, world.waterLevel + 26);
+    path.lineTo(-400, world.waterLevel + 26);
+    path.close();
+    canvas.drawPath(path, paint);
+  }
+
+  void _drawLavaForeground(Canvas canvas, double time) {
+    // bubbling, glowing lava crest
+    final path = Path();
+    final glow = 0.7 + sin(time * 3.5) * 0.15;
+    final paint = Paint()
+      ..color = const Color(0xFFFFD23D).withOpacity(glow)
+      ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 3);
+    path.moveTo(-400, world.waterLevel);
+    for (double x = -400; x <= world.width + 400; x += 14) {
+      final y = world.waterLevel + sin(x / 30 + time * 4.5) * 6 + sin(x / 13 - time * 6.0) * 3;
+      path.lineTo(x, y);
+    }
+    path.lineTo(world.width + 400, world.waterLevel + 26);
+    path.lineTo(-400, world.waterLevel + 26);
+    path.close();
+    canvas.drawPath(path, paint);
   }
 
   void _cloud(Canvas canvas, Offset c, Paint paint, double s) {
