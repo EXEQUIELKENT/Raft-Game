@@ -1,0 +1,103 @@
+diff --git a/lib/game/physics.dart b/lib/game/physics.dart
+index f1a6a23..0e47104 100644
+--- a/lib/game/physics.dart
++++ b/lib/game/physics.dart
+@@ -149,6 +149,34 @@ class PhysicsWorld {
+   double elapsed = 0;
+   final GameRng rng;
+ 
++  // ---------------------------------------------------------------------
++  // Velocity safety limits.
++  //
++  // Characters are ragdolls integrated by the *same* body loop as blocks
++  // and debris (see `step()`) — never routed through the projectile path —
++  // so gravity, wind, knockback, collision impulses and hazards all act on
++  // them through ordinary linear/angular velocity, exactly like any other
++  // dynamic body. Nothing here ever writes to `pos` directly to fake a
++  // ground height; these are true terminal-velocity/terminal-spin ceilings
++  // applied to the velocities that drive position, same as a real physics
++  // engine would use. They sit far above any legitimate in-game speed
++  // (the hardest explosion knockback tops out well under half of
++  // [_maxCharacterSpeed]) so normal falls, hits, launches and tumbles are
++  // completely unaffected — they only stop *unbounded* accumulation from
++  // stacking/chained impulses (e.g. repeated tiny collision corrections
++  // while wedged between two bodies) from ever running away.
++  static const double _maxCharacterSpeed = 1600; // px/s
++  static const double _maxCharacterAngularVel = 14; // rad/s (~2.2 rev/s)
++  static const double _maxBodySpeed = 2200; // blocks/debris/hazard rocks
++  static const double _maxBodyAngularVel = 20; // rad/s
++  // Below these, residual velocity is treated as solver/collision noise
++  // and snapped to exactly zero rather than left to linger — otherwise a
++  // "resting" body can sit at some tiny nonzero velocity forever, and the
++  // next microscopic collision correction has something nonzero to keep
++  // amplifying instead of a clean zero to start from.
++  static const double _sleepLinearEps = 4; // px/s
++  static const double _sleepAngularEps = 0.05; // rad/s
++
+   final List<PhysBody> bodies = [];
+   final List<Projectile> projectiles = [];
+   final List<Particle> particles = [];
+@@ -529,7 +557,12 @@ class PhysicsWorld {
+       }
+ 
+       final slow = b.slowUntil > elapsed ? 0.5 : 1.0;
+-      // gravity + wind
++      // Gravity + wind. `gravity` (900) is positive-down in this Y-down
++      // coordinate space, so this always accelerates every non-static,
++      // non-frozen, non-vehicle body — characters included — downward,
++      // never upward. Characters go through this exact body loop (not
++      // Projectile's separate, gravity-multiplier-driven integration
++      // above), so they always fall like ragdolls, never like projectiles.
+       b.vel += Offset(wind * 90, gravity) * dt;
+       // drag
+       b.vel *= (1 - 0.12 * dt);
+@@ -613,6 +646,37 @@ class PhysicsWorld {
+     // --- per-map hazard (rocks / traffic / embers / wind gusts) ---
+     _updateMapHazard(dt);
+ 
++    // --- velocity safety net -----------------------------------------
++    // Runs last, after gravity/wind (body loop), knockback & collision
++    // impulses (_resolvePair), support-collapse wobble, and map hazards
++    // have all had their say this frame. This is a hard cap on the
++    // *result* of those forces, not a substitute for them — it never
++    // touches `pos` or `angle` directly (no Y-clamping), it only keeps
++    // the velocities that drive them inside sane, physically-plausible
++    // bounds so a chain of small impulses (e.g. a character wedged
++    // between two colliding bodies, or repeated hazard hits) can never
++    // accumulate into runaway upward drift or endless spin.
++    for (final b in bodies) {
++      if (b.dead || b.isStatic || b.isVehicle) continue;
++      if (b.frozenUntil > elapsed) continue; // already zeroed above
++      final isChar = b.type == BodyType.character;
++      final maxSpeed = isChar ? _maxCharacterSpeed : _maxBodySpeed;
++      final maxSpin = isChar ? _maxCharacterAngularVel : _maxBodyAngularVel;
++
++      final speed = b.vel.distance;
++      if (speed > maxSpeed) {
++        b.vel = b.vel * (maxSpeed / speed);
++      } else if (speed < _sleepLinearEps) {
++        b.vel = Offset.zero;
++      }
++
++      if (b.angularVel.abs() > maxSpin) {
++        b.angularVel = maxSpin * b.angularVel.sign;
++      } else if (b.angularVel.abs() < _sleepAngularEps) {
++        b.angularVel = 0;
++      }
++    }
++
+     // --- particles & texts ---
+     for (final pt in particles) {
+       pt.life -= dt;
+@@ -945,7 +1009,10 @@ class PhysicsWorld {
+         // falling blocks damage what they hit & take damage
+         if (a.type == BodyType.block && !a.isStatic && impact > 10) damageBlock(a, impact * 1.2);
+         if (b.type == BodyType.block && !b.isStatic && impact > 10) damageBlock(b, impact * 1.2);
+-        // angular fun for characters
++        // angular fun for characters (bounded by the velocity safety net
++        // at the end of step() — repeated small hits, e.g. from being
++        // wedged between colliding bodies, can no longer accumulate into
++        // unbounded spin)
+         for (final c in [a, b]) {
+           if (c.type == BodyType.character && !resting && impact > 6) {
+             c.angularVel += rng.range(-3, 3) * (impact / 8).clamp(0.2, 2.0);
