@@ -111,6 +111,7 @@ class SaveService {
       data.xp += 20;
     }
     data.xp += (damageDealt / 10).round();
+    data.totalDamage += damageDealt;
     data.matchHistory.insert(0, {
       'won': won,
       'mode': mode,

@@ -1,0 +1,173 @@
+diff --git a/lib/game/renderer.dart b/lib/game/renderer.dart
+index fb126fd..2ffa8d2 100644
+--- a/lib/game/renderer.dart
++++ b/lib/game/renderer.dart
+@@ -11,8 +11,15 @@ class WorldRenderer {
+   final MapDef map;
+   final List<Color> charColors;
+   final List<int> charHats;
++  /// 0 = low, 1 = medium, 2 = high. Drives glow/blur effects and particle
++  /// density so the GRAPHICS QUALITY setting has a visible, and
++  /// performance-relevant, effect.
++  final int quality;
+ 
+-  WorldRenderer(this.world, {required this.map, required this.charColors, required this.charHats});
++  WorldRenderer(this.world, {required this.map, required this.charColors, required this.charHats, this.quality = 1});
++
++  bool get _lowQuality => quality <= 0;
++  bool get _highQuality => quality >= 2;
+ 
+   void render(Canvas canvas, Size viewSize, Offset camPos, double camZoom, double time) {
+     canvas.save();
+@@ -66,11 +73,14 @@ class WorldRenderer {
+     }
+ 
+     // particles
+-    for (final pt in world.particles) {
++    for (int i = 0; i < world.particles.length; i++) {
++      // On low quality, skip every other particle to cut fill-rate/overdraw.
++      if (_lowQuality && i.isOdd) continue;
++      final pt = world.particles[i];
+       final t = (pt.life / pt.maxLife).clamp(0.0, 1.0);
+       final paint = Paint()..color = pt.color.withOpacity(t);
+-      if (pt.glow) {
+-        paint.maskFilter = const MaskFilter.blur(BlurStyle.normal, 4);
++      if (pt.glow && !_lowQuality) {
++        paint.maskFilter = MaskFilter.blur(BlurStyle.normal, _highQuality ? 6 : 4);
+       }
+       canvas.drawCircle(pt.pos, pt.size * t, paint);
+     }
+@@ -107,12 +117,16 @@ class WorldRenderer {
+     final sunPos = Offset(world.width * 0.78, 110);
+     canvas.drawCircle(
+         sunPos, 55, Paint()..color = const Color(0xFFFFF3B0));
+-    canvas.drawCircle(
+-        sunPos,
+-        44,
+-        Paint()
+-          ..color = const Color(0xFFFFD32A)
+-          ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 10));
++    if (_lowQuality) {
++      canvas.drawCircle(sunPos, 44, Paint()..color = const Color(0xFFFFD32A));
++    } else {
++      canvas.drawCircle(
++          sunPos,
++          44,
++          Paint()
++            ..color = const Color(0xFFFFD32A)
++            ..maskFilter = MaskFilter.blur(BlurStyle.normal, _highQuality ? 14 : 10));
++    }
+     // clouds (ashy grey over the volcano, fluffy white everywhere else)
+     final cloudColor = map.terrain == 'lava' ? const Color(0xFF8A828C) : Colors.white;
+     final cloudPaint = Paint()..color = cloudColor.withOpacity(0.85);
+@@ -235,9 +249,10 @@ class WorldRenderer {
+     // bubbling, glowing lava crest
+     final path = Path();
+     final glow = 0.7 + sin(time * 3.5) * 0.15;
+-    final paint = Paint()
+-      ..color = const Color(0xFFFFD23D).withOpacity(glow)
+-      ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 3);
++    final paint = Paint()..color = const Color(0xFFFFD23D).withOpacity(glow);
++    if (!_lowQuality) {
++      paint.maskFilter = MaskFilter.blur(BlurStyle.normal, _highQuality ? 5 : 3);
++    }
+     path.moveTo(-400, world.waterLevel);
+     for (double x = -400; x <= world.width + 400; x += 14) {
+       final y = world.waterLevel + sin(x / 30 + time * 4.5) * 6 + sin(x / 13 - time * 6.0) * 3;
+@@ -259,9 +274,10 @@ class WorldRenderer {
+   void _drawHazards(Canvas canvas, double time) {
+     for (final h in world.hazards) {
+       final flick = 0.75 + sin(time * 14) * 0.15;
+-      final paint = Paint()
+-        ..color = const Color(0xFFFF8C1A).withOpacity(0.35 * flick)
+-        ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 12);
++      final paint = Paint()..color = const Color(0xFFFF8C1A).withOpacity(0.35 * flick);
++      if (!_lowQuality) {
++        paint.maskFilter = MaskFilter.blur(BlurStyle.normal, _highQuality ? 16 : 12);
++      }
+       canvas.drawCircle(h.center, h.radius * flick, paint);
+     }
+   }
+@@ -581,7 +597,9 @@ class WorldRenderer {
+         ..lineTo(-p.radius - 14 * flick, 5)
+         ..close();
+       canvas.drawPath(flame, Paint()..color = const Color(0xFFFFD32A));
+-      canvas.drawPath(flame, Paint()..color = const Color(0xFFFF8C1A).withOpacity(0.7)..maskFilter = const MaskFilter.blur(BlurStyle.normal, 3));
++      if (!_lowQuality) {
++        canvas.drawPath(flame, Paint()..color = const Color(0xFFFF8C1A).withOpacity(0.7)..maskFilter = const MaskFilter.blur(BlurStyle.normal, 3));
++      }
+     }
+     if (p.weapon.behavior == 'grenade' && p.fuse > 0) {
+       // spark
+diff --git a/lib/game/save.dart b/lib/game/save.dart
+index afaa068..329fc21 100644
+--- a/lib/game/save.dart
++++ b/lib/game/save.dart
+@@ -111,6 +111,7 @@ class SaveService {
+       data.xp += 20;
+     }
+     data.xp += (damageDealt / 10).round();
++    data.totalDamage += damageDealt;
+     data.matchHistory.insert(0, {
+       'won': won,
+       'mode': mode,
+diff --git a/lib/screens/game_screen.dart b/lib/screens/game_screen.dart
+index 74d075b..b148dee 100644
+--- a/lib/screens/game_screen.dart
++++ b/lib/screens/game_screen.dart
+@@ -65,6 +65,7 @@ class _GameScreenState extends State<GameScreen> {
+       map: ctrl.settings.map,
+       charColors: widget.players.map((p) => RT.playerColors[p.colorIndex % RT.playerColors.length]).toList(),
+       charHats: widget.players.map((p) => p.hatIndex).toList(),
++      quality: SaveService.instance.data.quality,
+     );
+     ctrl.addListener(_onUpdate);
+   }
+@@ -77,6 +78,7 @@ class _GameScreenState extends State<GameScreen> {
+         map: ctrl.settings.map,
+         charColors: widget.players.map((p) => RT.playerColors[p.colorIndex % RT.playerColors.length]).toList(),
+         charHats: widget.players.map((p) => p.hatIndex).toList(),
++        quality: SaveService.instance.data.quality,
+       );
+     }
+     if (mounted) setState(() {});
+@@ -126,6 +128,10 @@ class _GameScreenState extends State<GameScreen> {
+     double newAngle = _startAngle - delta.dx * 0.006 * sens;
+     double newPower = (_startPower - delta.dy * 0.004 * sens).clamp(0.1, 1.0);
+ 
++    if (SaveService.instance.data.aimAssist) {
++      newAngle = _applyAimAssist(newAngle, me.first.pos, ctrl.currentPlayer);
++    }
++
+     // constrain angle to upper hemisphere facing enemies
+     if (facingLeft) {
+       newAngle = newAngle.clamp(pi * 0.5, pi * 0.98);
+@@ -144,6 +150,28 @@ class _GameScreenState extends State<GameScreen> {
+     _dragStart = null;
+   }
+ 
++  /// Nudges [rawAngle] onto a direct line-of-sight shot at the nearest enemy
++  /// when the player is already aiming close to it, giving forgiving "snap"
++  /// magnetism for a shot that would otherwise just miss.
++  double _applyAimAssist(double rawAngle, Offset origin, int player) {
++    final enemies = _enemiesOf(player);
++    if (enemies.isEmpty) return rawAngle;
++    const assistCone = 0.05; // ~3 degrees of magnetism
++    double bestAngle = rawAngle;
++    double bestDiff = assistCone;
++    for (final e in enemies) {
++      final toEnemy = e.pos - origin;
++      final angleToEnemy = atan2(toEnemy.dy, toEnemy.dx);
++      var diff = (angleToEnemy - rawAngle).abs();
++      if (diff > pi) diff = 2 * pi - diff;
++      if (diff < bestDiff) {
++        bestDiff = diff;
++        bestAngle = angleToEnemy;
++      }
++    }
++    return bestAngle;
++  }
++
+   List<PhysBody> _enemiesOf(int player) {
+     final list = <PhysBody>[];
+     for (int i = 0; i < ctrl.players.length; i++) {

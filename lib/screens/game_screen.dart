@@ -65,6 +65,7 @@ class _GameScreenState extends State<GameScreen> {
       map: ctrl.settings.map,
       charColors: widget.players.map((p) => RT.playerColors[p.colorIndex % RT.playerColors.length]).toList(),
       charHats: widget.players.map((p) => p.hatIndex).toList(),
+      quality: SaveService.instance.data.quality,
     );
     ctrl.addListener(_onUpdate);
   }
@@ -77,6 +78,7 @@ class _GameScreenState extends State<GameScreen> {
         map: ctrl.settings.map,
         charColors: widget.players.map((p) => RT.playerColors[p.colorIndex % RT.playerColors.length]).toList(),
         charHats: widget.players.map((p) => p.hatIndex).toList(),
+        quality: SaveService.instance.data.quality,
       );
     }
     if (mounted) setState(() {});
@@ -126,6 +128,10 @@ class _GameScreenState extends State<GameScreen> {
     double newAngle = _startAngle - delta.dx * 0.006 * sens;
     double newPower = (_startPower - delta.dy * 0.004 * sens).clamp(0.1, 1.0);
 
+    if (SaveService.instance.data.aimAssist) {
+      newAngle = _applyAimAssist(newAngle, me.first.pos, ctrl.currentPlayer);
+    }
+
     // constrain angle to upper hemisphere facing enemies
     if (facingLeft) {
       newAngle = newAngle.clamp(pi * 0.5, pi * 0.98);
@@ -142,6 +148,28 @@ class _GameScreenState extends State<GameScreen> {
   void _onPanEnd(DragEndDetails d) {
     _charging = false;
     _dragStart = null;
+  }
+
+  /// Nudges [rawAngle] onto a direct line-of-sight shot at the nearest enemy
+  /// when the player is already aiming close to it, giving forgiving "snap"
+  /// magnetism for a shot that would otherwise just miss.
+  double _applyAimAssist(double rawAngle, Offset origin, int player) {
+    final enemies = _enemiesOf(player);
+    if (enemies.isEmpty) return rawAngle;
+    const assistCone = 0.05; // ~3 degrees of magnetism
+    double bestAngle = rawAngle;
+    double bestDiff = assistCone;
+    for (final e in enemies) {
+      final toEnemy = e.pos - origin;
+      final angleToEnemy = atan2(toEnemy.dy, toEnemy.dx);
+      var diff = (angleToEnemy - rawAngle).abs();
+      if (diff > pi) diff = 2 * pi - diff;
+      if (diff < bestDiff) {
+        bestDiff = diff;
+        bestAngle = angleToEnemy;
+      }
+    }
+    return bestAngle;
   }
 
   List<PhysBody> _enemiesOf(int player) {

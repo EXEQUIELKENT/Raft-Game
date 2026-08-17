@@ -11,8 +11,15 @@ class WorldRenderer {
   final MapDef map;
   final List<Color> charColors;
   final List<int> charHats;
+  /// 0 = low, 1 = medium, 2 = high. Drives glow/blur effects and particle
+  /// density so the GRAPHICS QUALITY setting has a visible, and
+  /// performance-relevant, effect.
+  final int quality;
 
-  WorldRenderer(this.world, {required this.map, required this.charColors, required this.charHats});
+  WorldRenderer(this.world, {required this.map, required this.charColors, required this.charHats, this.quality = 1});
+
+  bool get _lowQuality => quality <= 0;
+  bool get _highQuality => quality >= 2;
 
   void render(Canvas canvas, Size viewSize, Offset camPos, double camZoom, double time) {
     canvas.save();
@@ -66,11 +73,14 @@ class WorldRenderer {
     }
 
     // particles
-    for (final pt in world.particles) {
+    for (int i = 0; i < world.particles.length; i++) {
+      // On low quality, skip every other particle to cut fill-rate/overdraw.
+      if (_lowQuality && i.isOdd) continue;
+      final pt = world.particles[i];
       final t = (pt.life / pt.maxLife).clamp(0.0, 1.0);
       final paint = Paint()..color = pt.color.withOpacity(t);
-      if (pt.glow) {
-        paint.maskFilter = const MaskFilter.blur(BlurStyle.normal, 4);
+      if (pt.glow && !_lowQuality) {
+        paint.maskFilter = MaskFilter.blur(BlurStyle.normal, _highQuality ? 6 : 4);
       }
       canvas.drawCircle(pt.pos, pt.size * t, paint);
     }
@@ -107,12 +117,16 @@ class WorldRenderer {
     final sunPos = Offset(world.width * 0.78, 110);
     canvas.drawCircle(
         sunPos, 55, Paint()..color = const Color(0xFFFFF3B0));
-    canvas.drawCircle(
-        sunPos,
-        44,
-        Paint()
-          ..color = const Color(0xFFFFD32A)
-          ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 10));
+    if (_lowQuality) {
+      canvas.drawCircle(sunPos, 44, Paint()..color = const Color(0xFFFFD32A));
+    } else {
+      canvas.drawCircle(
+          sunPos,
+          44,
+          Paint()
+            ..color = const Color(0xFFFFD32A)
+            ..maskFilter = MaskFilter.blur(BlurStyle.normal, _highQuality ? 14 : 10));
+    }
     // clouds (ashy grey over the volcano, fluffy white everywhere else)
     final cloudColor = map.terrain == 'lava' ? const Color(0xFF8A828C) : Colors.white;
     final cloudPaint = Paint()..color = cloudColor.withOpacity(0.85);
@@ -235,9 +249,10 @@ class WorldRenderer {
     // bubbling, glowing lava crest
     final path = Path();
     final glow = 0.7 + sin(time * 3.5) * 0.15;
-    final paint = Paint()
-      ..color = const Color(0xFFFFD23D).withOpacity(glow)
-      ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 3);
+    final paint = Paint()..color = const Color(0xFFFFD23D).withOpacity(glow);
+    if (!_lowQuality) {
+      paint.maskFilter = MaskFilter.blur(BlurStyle.normal, _highQuality ? 5 : 3);
+    }
     path.moveTo(-400, world.waterLevel);
     for (double x = -400; x <= world.width + 400; x += 14) {
       final y = world.waterLevel + sin(x / 30 + time * 4.5) * 6 + sin(x / 13 - time * 6.0) * 3;
@@ -259,9 +274,10 @@ class WorldRenderer {
   void _drawHazards(Canvas canvas, double time) {
     for (final h in world.hazards) {
       final flick = 0.75 + sin(time * 14) * 0.15;
-      final paint = Paint()
-        ..color = const Color(0xFFFF8C1A).withOpacity(0.35 * flick)
-        ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 12);
+      final paint = Paint()..color = const Color(0xFFFF8C1A).withOpacity(0.35 * flick);
+      if (!_lowQuality) {
+        paint.maskFilter = MaskFilter.blur(BlurStyle.normal, _highQuality ? 16 : 12);
+      }
       canvas.drawCircle(h.center, h.radius * flick, paint);
     }
   }
@@ -581,7 +597,9 @@ class WorldRenderer {
         ..lineTo(-p.radius - 14 * flick, 5)
         ..close();
       canvas.drawPath(flame, Paint()..color = const Color(0xFFFFD32A));
-      canvas.drawPath(flame, Paint()..color = const Color(0xFFFF8C1A).withOpacity(0.7)..maskFilter = const MaskFilter.blur(BlurStyle.normal, 3));
+      if (!_lowQuality) {
+        canvas.drawPath(flame, Paint()..color = const Color(0xFFFF8C1A).withOpacity(0.7)..maskFilter = const MaskFilter.blur(BlurStyle.normal, 3));
+      }
     }
     if (p.weapon.behavior == 'grenade' && p.fuse > 0) {
       // spark
