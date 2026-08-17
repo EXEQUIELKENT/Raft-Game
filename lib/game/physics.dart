@@ -290,8 +290,8 @@ class PhysicsWorld {
       ));
     }
 
-    // damage bodies
-    for (final b in bodies) {
+    // damage bodies (iterate a copy — destroyBlock spawns debris into bodies)
+    for (final b in List.of(bodies)) {
       if (b.dead) continue;
       final d = (b.pos - center).distance;
       if (d > radius + b.size.longestSide / 2) continue;
@@ -402,7 +402,8 @@ class PhysicsWorld {
     events.clear();
 
     // --- projectiles ---
-    for (final p in projectiles) {
+    // iterate a copy: cluster split appends children to `projectiles`
+    for (final p in List.of(projectiles)) {
       if (p.dead) continue;
       p.age += dt;
       final gMult = p.weapon.behavior == 'rocket' && p.age < 0.55 ? 0.25 : p.weapon.gravity;

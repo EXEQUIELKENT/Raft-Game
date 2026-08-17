@@ -3,38 +3,43 @@ import 'package:flutter/foundation.dart';
 import 'save.dart';
 
 /// Central audio service: music loops + pooled one-shot SFX.
+///
+/// Fully defensive: in environments without the audioplayers platform
+/// implementation (unit/widget tests, headless runs) every operation is a
+/// no-op instead of throwing. Player construction itself can trigger async
+/// platform calls that complete with MissingPluginException *after* the
+/// constructor returns, so we never construct players until init() succeeds.
 class AudioService {
   static final AudioService instance = AudioService._();
 
-  late final AudioPlayer _music;
+  AudioPlayer? _music;
   final List<AudioPlayer> _pool = [];
   int _poolIndex = 0;
   String? _currentMusic;
   bool _ready = false;
   bool _available = true;
 
-  AudioService._() {
-    try {
-      _music = AudioPlayer(playerId: 'music');
-    } catch (_) {
-      _available = false;
-    }
-  }
+  AudioService._();
 
   Future<void> init() async {
     if (_ready || !_available) return;
     try {
-      for (int i = 0; i < 6; i++) {
-        _pool.add(AudioPlayer(playerId: 'sfx$i'));
-      }
-      await _music.setReleaseMode(ReleaseMode.loop);
-      for (final p in _pool) {
+      final music = AudioPlayer(playerId: 'music');
+      final pool = <AudioPlayer>[
+        for (int i = 0; i < 6; i++) AudioPlayer(playerId: 'sfx$i'),
+      ];
+      await music.setReleaseMode(ReleaseMode.loop);
+      for (final p in pool) {
         await p.setReleaseMode(ReleaseMode.stop);
       }
+      _music = music;
+      _pool.addAll(pool);
       _ready = true;
     } catch (e) {
       debugPrint('audio unavailable: $e');
       _available = false;
+      _music = null;
+      _pool.clear();
     }
   }
 
@@ -42,13 +47,14 @@ class AudioService {
   double get _musicVol => SaveService.instance.data.musicVolume;
 
   Future<void> playMusic(String name) async {
-    if (!_ready || !_available) return;
+    final m = _music;
+    if (!_ready || !_available || m == null) return;
     if (_currentMusic == name) return;
     _currentMusic = name;
     try {
-      await _music.stop();
-      await _music.setVolume(_musicVol);
-      await _music.play(AssetSource('sfx/$name.wav'));
+      await m.stop();
+      await m.setVolume(_musicVol);
+      await m.play(AssetSource('sfx/$name.wav'));
     } catch (e) {
       debugPrint('music error: $e');
     }
@@ -56,21 +62,23 @@ class AudioService {
 
   Future<void> stopMusic() async {
     _currentMusic = null;
-    if (!_available) return;
+    final m = _music;
+    if (!_available || m == null) return;
     try {
-      await _music.stop();
+      await m.stop();
     } catch (_) {}
   }
 
   Future<void> updateVolumes() async {
-    if (!_ready || !_available) return;
+    final m = _music;
+    if (!_ready || !_available || m == null) return;
     try {
-      await _music.setVolume(_musicVol);
+      await m.setVolume(_musicVol);
     } catch (_) {}
   }
 
   void sfx(String name, {double volume = 1.0}) {
-    if (!_ready || !_available || _sfxVol <= 0.01) return;
+    if (!_ready || !_available || _sfxVol <= 0.01 || _pool.isEmpty) return;
     final p = _pool[_poolIndex];
     _poolIndex = (_poolIndex + 1) % _pool.length;
     () async {
@@ -85,7 +93,7 @@ class AudioService {
   void dispose() {
     if (!_available) return;
     try {
-      _music.dispose();
+      _music?.dispose();
       for (final p in _pool) {
         p.dispose();
       }

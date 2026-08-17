@@ -42,9 +42,10 @@ void main() {
     expect(ctrl.phase, GamePhase.aiming);
     expect(ctrl.currentPlayer, 0);
 
-    // human fires a rocket
-    ctrl.aimAngle = -0.6;
-    ctrl.aimPower = 0.8;
+    // human fires a rocket nearly straight up — it comes back down and
+    // explodes on the shooter's own raft: a deterministic explosion.
+    ctrl.aimAngle = -1.45;
+    ctrl.aimPower = 0.55;
     ctrl.selectedWeaponId = 'rocket';
     ctrl.humanFire();
     expect(ctrl.phase, GamePhase.firing);
@@ -87,9 +88,9 @@ void main() {
     }
     expect(explosions, greaterThanOrEqualTo(2));
 
-    // cluster split
+    // cluster split — fire from mid-air so nothing blocks it before 0.7s
     ctrl.world.fire(
-      from: MapBuilder.spawnFor(ctrl.world, 0, 2),
+      from: const Offset(550, 200),
       angleRad: -1.0,
       power: 0.6,
       weapon: Weapons.byId('cluster'),
