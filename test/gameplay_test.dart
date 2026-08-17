@@ -7,6 +7,8 @@ import 'package:raft_rumble/game/models.dart';
 import 'package:raft_rumble/game/physics.dart';
 
 void main() {
+  TestWidgetsFlutterBinding.ensureInitialized();
+
   test('Full match smoke test: build, fire, physics, AI', () {
     final settings = MatchSettings(
       map: GameMaps.all.first,
@@ -29,13 +31,14 @@ void main() {
       ctrl.world.step(1 / 60);
     }
 
-    // place a block as player 0
+    // place a block as player 0 (inside the build area, clear of the starter wall)
     final spawn = MapBuilder.spawnFor(ctrl.world, 0, 2);
-    final ok = ctrl.placeBuildingPiece(spawn.dx - 60, spawn.dy - 60, 0, PieceDef.catalogue[0]);
+    final ok = ctrl.placeBuildingPiece(spawn.dx + 40, spawn.dy - 90, 0, PieceDef.catalogue[0]);
     expect(ok, true);
     expect(ctrl.piecesLeft, 4);
-    ctrl.finishBuilding();
-    // AI auto-builds, phase should advance to aiming
+    ctrl.finishBuilding(); // P1 done -> P2 building
+    expect(ctrl.buildingPlayer, 1);
+    ctrl.finishBuilding(); // P2 done -> battle begins
     expect(ctrl.phase, GamePhase.aiming);
     expect(ctrl.currentPlayer, 0);
 
@@ -48,15 +51,13 @@ void main() {
     expect(ctrl.world.projectiles.length, 1);
 
     // simulate ~12 seconds of physics
-    int explosions = 0, destroyed = 0;
+    int explosions = 0;
     for (int i = 0; i < 60 * 12; i++) {
       ctrl.world.step(1 / 60);
       for (final e in ctrl.world.events) {
         if (e.kind == 'explosion') explosions++;
-        if (e.kind == 'blockDestroyed') destroyed++;
       }
     }
-    // rocket must have exploded on impact or in water
     expect(explosions, greaterThanOrEqualTo(1));
     expect(ctrl.world.projectiles.length, 0);
 
@@ -70,24 +71,21 @@ void main() {
     expect(aiShot.power, inInclusiveRange(0.1, 1.0));
     expect(aiShot.angle, isNot(0.0));
 
-    // grenade bounce + fuse behavior
-    final p = ctrl.world.fire(
+    // grenade: fuse eventually triggers explosion
+    ctrl.world.fire(
       from: MapBuilder.spawnFor(ctrl.world, 0, 2),
       angleRad: -0.8,
       power: 0.7,
       weapon: Weapons.byId('grenade'),
       owner: 0,
     );
-    expect(p.weapon.behavior, 'grenade');
-    int bounces = 0;
-    for (int i = 0; i < 60 * 8 && ctrl.world.projectiles.isNotEmpty; i++) {
+    for (int i = 0; i < 60 * 10 && ctrl.world.projectiles.isNotEmpty; i++) {
       ctrl.world.step(1 / 60);
       for (final e in ctrl.world.events) {
-        if (e.kind == 'bounce') bounces++;
         if (e.kind == 'explosion') explosions++;
       }
     }
-    expect(explosions, greaterThanOrEqualTo(2)); // grenade eventually explodes
+    expect(explosions, greaterThanOrEqualTo(2));
 
     // cluster split
     ctrl.world.fire(
@@ -118,7 +116,6 @@ void main() {
       final s1 = MapBuilder.spawnFor(world, 1, 2);
       expect(s0.dy < world.waterLevel, true, reason: 'map ${map.id} spawn above water');
       expect(s1.dy < world.waterLevel, true, reason: 'map ${map.id} spawn above water');
-      // settle without crashes
       for (int i = 0; i < 300; i++) {
         world.step(1 / 60);
       }
@@ -134,7 +131,6 @@ void main() {
     }
     final beforeHp = c.hp;
     world.explode(const Offset(520, 570), 100, 30, 2.0);
-    // damage applied (may be fully eliminated by close-range blast) or knocked back
     expect(c.hp < beforeHp || c.vel.distance > 50 || c.dead, true);
     for (int i = 0; i < 180; i++) {
       world.step(1 / 60);

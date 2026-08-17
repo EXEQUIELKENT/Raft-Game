@@ -141,7 +141,7 @@ class MapBuilder {
   }
 
   static Offset spawnOn(PhysBody platform) =>
-      Offset(platform.pos.dx, platform.pos.dy - platform.size.height / 2 - 28);
+      Offset(platform.pos.dx, platform.pos.dy - platform.size.height / 2 - 32);
 
   static void _buildOcean(PhysicsWorld w, List<double> slots, Random rnd) {
     for (final x in slots) {

@@ -4,7 +4,6 @@ import 'save.dart';
 
 /// Central audio service: music loops + pooled one-shot SFX.
 class AudioService {
-  AudioService._();
   static final AudioService instance = AudioService._();
 
   late final AudioPlayer _music;

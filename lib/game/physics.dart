@@ -779,19 +779,30 @@ class PhysicsWorld {
         if (a.type == BodyType.character || b.type == BodyType.character) {
           final c = a.type == BodyType.character ? a : b;
           final other = identical(c, a) ? b : a;
-          double dmg = (impact - 2.2) * 6;
-          if (other.type == BodyType.block && !other.isStatic) dmg *= 1.3;
+          // Use the character's own pre-collision speed along the contact
+          // normal: a normal standing landing (~1-2 char heights) peaks well
+          // under 150 px/s and must be harmless, while explosion knockback,
+          // long falls and block slams are several hundred px/s.
+          final cVelAlongN = (c.vel.dx * n.dx + c.vel.dy * n.dy).abs();
+          double dmg = 0;
+          if (other.type == BodyType.block && !other.isStatic) {
+            // moving block slam: scale with impulse
+            dmg = (impact - 6) * 3.0;
+          } else if (cVelAlongN > 260) {
+            // genuinely hard landing (long fall / thrown by explosion)
+            dmg = (cVelAlongN - 260) * 0.09;
+          }
           if (dmg > 2) {
             damageCharacter(c, min(dmg, 45), Offset.zero, cause: 'crush');
           }
         }
         // falling blocks damage what they hit & take damage
-        if (a.type == BodyType.block && !a.isStatic && impact > 4) damageBlock(a, impact * 1.2);
-        if (b.type == BodyType.block && !b.isStatic && impact > 4) damageBlock(b, impact * 1.2);
+        if (a.type == BodyType.block && !a.isStatic && impact > 10) damageBlock(a, impact * 1.2);
+        if (b.type == BodyType.block && !b.isStatic && impact > 10) damageBlock(b, impact * 1.2);
         // angular fun for characters
         for (final c in [a, b]) {
-          if (c.type == BodyType.character && !resting) {
-            c.angularVel += rng.range(-3, 3) * (impact / 4).clamp(0.2, 2.0);
+          if (c.type == BodyType.character && !resting && impact > 6) {
+            c.angularVel += rng.range(-3, 3) * (impact / 8).clamp(0.2, 2.0);
           }
         }
       }
