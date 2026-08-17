@@ -31,7 +31,7 @@ class _AimPanGestureRecognizer extends PanGestureRecognizer {
   List<Rect> Function() excludedRectsProvider;
 
   @override
-  bool isPointerAllowed(PointerDownEvent event) {
+  bool isPointerAllowed(PointerEvent event) {
     for (final rect in excludedRectsProvider()) {
       if (rect.contains(event.position)) return false;
     }
@@ -257,7 +257,7 @@ class _GameScreenState extends State<GameScreen> {
         ),
         child: RawGestureDetector(
           gestures: {
-            PanGestureRecognizer: GestureRecognizerFactoryWithHandlers<_AimPanGestureRecognizer>(
+          _AimPanGestureRecognizer: GestureRecognizerFactoryWithHandlers<_AimPanGestureRecognizer>(
               () => _AimPanGestureRecognizer(excludedRectsProvider: _excludedAimGestureRects),
               (instance) {
                 instance
