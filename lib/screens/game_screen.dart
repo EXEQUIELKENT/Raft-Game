@@ -65,11 +65,19 @@ class _GameScreenState extends State<GameScreen> {
   late GameController ctrl;
   late WorldRenderer renderer;
 
-  // gesture state
-  Offset? _dragStart;
-  double _startAngle = 0;
-  double _startPower = 0.6;
+  // ---------------------------------------------------------------------
+  // Aiming: press-drag-release "slingshot" gesture. The drag is anchored to
+  // the shooter's own on-screen position (captured once at drag-start), not
+  // an arbitrary relative delta — pulling the finger away from the
+  // character aims/charges in the opposite direction, exactly like a
+  // slingshot, and lifting the finger fires directly (no separate button
+  // press required, though the FIRE button remains as a fallback).
+  // ---------------------------------------------------------------------
+  Offset? _aimAnchorScreen;
+  Offset? _fingerScreen;
   bool _charging = false;
+  static const double _minDragPx = 16; // ignore tiny jitters — no accidental aims/shots
+  static const double _basePullPx = 165; // drag distance (at sensitivity 1.0) for 100% power
 
   // Bounds of the horizontally-scrolling lists that must stay usable
   // underneath the full-screen aim-drag gesture (see _AimPanGestureRecognizer).
@@ -90,7 +98,25 @@ class _GameScreenState extends State<GameScreen> {
   PieceDef _selectedPiece = PieceDef.catalogue.first;
   Offset? _ghostPos;
   double _ghostRot = 0;
-  bool _rotating = false;
+
+  // ---------------------------------------------------------------------
+  // HUD rebuild throttling: the world/aim/ghost canvases repaint every
+  // physics tick on their own (see the AnimatedBuilder in build()), but the
+  // surrounding HUD — player cards, weapon wheel, piece palette, buttons —
+  // has no reason to rebuild 60 times a second when nothing it displays has
+  // actually changed. _onUpdate runs every tick (needed for the renderer
+  // rebind below) but only calls setState when one of these snapshotted
+  // fields is actually different from last time.
+  // ---------------------------------------------------------------------
+  GamePhase? _lastPhase;
+  int _lastPlayer = -1;
+  int _lastTurnSec = -1;
+  double _lastWind = 0;
+  String _lastStatus = '';
+  int _lastPieces = -1;
+  int _lastBuildingPlayer = -1;
+  int? _lastWinner;
+  List<int> _lastHp = const [];
 
   @override
   void initState() {
@@ -125,7 +151,40 @@ class _GameScreenState extends State<GameScreen> {
         quality: SaveService.instance.data.quality,
       );
     }
-    if (mounted) setState(() {});
+    if (!mounted) return;
+
+    final hp = [
+      for (int i = 0; i < ctrl.players.length; i++)
+        ctrl.world.charactersOf(i).fold<int>(0, (s, c) => s + max(0, c.hp).round()),
+    ];
+    final turnSec = ctrl.turnTimeLeft.ceil();
+    var hpChanged = hp.length != _lastHp.length;
+    if (!hpChanged) {
+      for (int i = 0; i < hp.length; i++) {
+        if (hp[i] != _lastHp[i]) { hpChanged = true; break; }
+      }
+    }
+    final dirty = _lastPhase != ctrl.phase ||
+        _lastPlayer != ctrl.currentPlayer ||
+        _lastTurnSec != turnSec ||
+        (_lastWind - ctrl.wind).abs() > 0.005 ||
+        _lastStatus != ctrl.statusMessage ||
+        _lastPieces != ctrl.piecesLeft ||
+        _lastBuildingPlayer != ctrl.buildingPlayer ||
+        _lastWinner != ctrl.winner ||
+        hpChanged;
+    if (dirty) {
+      _lastPhase = ctrl.phase;
+      _lastPlayer = ctrl.currentPlayer;
+      _lastTurnSec = turnSec;
+      _lastWind = ctrl.wind;
+      _lastStatus = ctrl.statusMessage;
+      _lastPieces = ctrl.piecesLeft;
+      _lastBuildingPlayer = ctrl.buildingPlayer;
+      _lastWinner = ctrl.winner;
+      _lastHp = hp;
+      setState(() {});
+    }
   }
 
   @override
@@ -145,37 +204,49 @@ class _GameScreenState extends State<GameScreen> {
 
   void _onPanStart(DragStartDetails d) {
     if (ctrl.phase == GamePhase.building && ctrl.canHumanBuild) {
-      _ghostPos = _toWorld(d.localPosition);
+      setState(() => _ghostPos = _snapGhost(_toWorld(d.localPosition)));
       return;
     }
     if (!ctrl.canHumanAct) return;
-    _dragStart = d.localPosition;
-    _startAngle = ctrl.aimAngle;
-    _startPower = ctrl.aimPower;
-    _charging = true;
+    final me = ctrl.world.charactersOf(ctrl.currentPlayer);
+    if (me.isEmpty) return;
+    setState(() {
+      _aimAnchorScreen = _toScreen(me.first.pos);
+      _fingerScreen = d.localPosition;
+      _charging = true;
+    });
   }
 
   void _onPanUpdate(DragUpdateDetails d) {
     if (ctrl.phase == GamePhase.building && ctrl.canHumanBuild) {
-      setState(() => _ghostPos = _toWorld(d.localPosition));
+      setState(() => _ghostPos = _snapGhost(_toWorld(d.localPosition)));
       return;
     }
-    if (!ctrl.canHumanAct || _dragStart == null) return;
-    final sens = SaveService.instance.data.sensitivity;
-    final delta = (d.localPosition - _dragStart!) / ctrl.camZoom;
-    // horizontal drag -> angle, vertical drag -> power
+    if (!ctrl.canHumanAct || !_charging || _aimAnchorScreen == null) return;
+    _fingerScreen = d.localPosition;
+
+    // Slingshot model: aim direction is straight from the current finger
+    // position back toward the anchor (pull back, launch forward) — no
+    // relative-delta math, so what you see is exactly where you're
+    // pointing. Small movements below the drag threshold are ignored
+    // entirely (don't even nudge the last committed aim) so a light touch
+    // can't cause a stray angle change or, on release, an accidental shot.
+    final pull = _fingerScreen! - _aimAnchorScreen!;
+    final dist = pull.distance;
+    if (dist < _minDragPx) {
+      setState(() {});
+      return;
+    }
+
     final me = ctrl.world.charactersOf(ctrl.currentPlayer);
     if (me.isEmpty) return;
-    final facingLeft = _enemiesOf(ctrl.currentPlayer).isNotEmpty &&
-        _enemiesOf(ctrl.currentPlayer).first.pos.dx < me.first.pos.dx;
+    final enemies = _enemiesOf(ctrl.currentPlayer);
+    final facingLeft = enemies.isNotEmpty && enemies.first.pos.dx < me.first.pos.dx;
 
-    double newAngle = _startAngle - delta.dx * 0.006 * sens;
-    double newPower = (_startPower - delta.dy * 0.004 * sens).clamp(0.1, 1.0);
-
+    double newAngle = atan2(-pull.dy, -pull.dx);
     if (SaveService.instance.data.aimAssist) {
       newAngle = _applyAimAssist(newAngle, me.first.pos, ctrl.currentPlayer);
     }
-
     // constrain angle to upper hemisphere facing enemies
     if (facingLeft) {
       newAngle = newAngle.clamp(pi * 0.5, pi * 0.98);
@@ -183,6 +254,14 @@ class _GameScreenState extends State<GameScreen> {
     } else {
       newAngle = newAngle.clamp(-pi * 0.98, -pi * 0.02);
     }
+
+    // Higher sensitivity = less physical drag distance needed for full
+    // power — the opposite of the old relative-delta scheme, but the same
+    // "bigger number = more sensitive" feel from the settings screen.
+    final sens = SaveService.instance.data.sensitivity.clamp(0.25, 4.0);
+    final maxPull = (_basePullPx / sens).clamp(60.0, 420.0);
+    final newPower = ((dist - _minDragPx) / maxPull).clamp(0.1, 1.0);
+
     setState(() {
       ctrl.aimAngle = newAngle;
       ctrl.aimPower = newPower;
@@ -190,8 +269,26 @@ class _GameScreenState extends State<GameScreen> {
   }
 
   void _onPanEnd(DragEndDetails d) {
-    _charging = false;
-    _dragStart = null;
+    if (ctrl.phase == GamePhase.building && ctrl.canHumanBuild) {
+      if (_ghostPos != null) _placeGhost();
+      return;
+    }
+    final wasCharging = _charging;
+    final anchor = _aimAnchorScreen;
+    final finger = _fingerScreen;
+    setState(() {
+      _charging = false;
+      _aimAnchorScreen = null;
+      _fingerScreen = null;
+    });
+    if (!wasCharging || !ctrl.canHumanAct || anchor == null || finger == null) return;
+    // Release-to-fire: only a deliberate drag (past the same threshold that
+    // gates aim updates) actually launches a shot, so a light tap or tiny
+    // wobble can never fire by accident.
+    if ((finger - anchor).distance >= _minDragPx) {
+      if (SaveService.instance.data.vibration) HapticFeedback.heavyImpact();
+      ctrl.humanFire();
+    }
   }
 
   /// Nudges [rawAngle] onto a direct line-of-sight shot at the nearest enemy
@@ -227,6 +324,40 @@ class _GameScreenState extends State<GameScreen> {
   Offset _toWorld(Offset local) {
     final size = MediaQuery.of(context).size;
     return (local - Offset(size.width / 2, size.height / 2)) / ctrl.camZoom + ctrl.camPos;
+  }
+
+  /// Inverse of [_toWorld] — where a world point currently is on screen.
+  /// Used to anchor the slingshot-style aim drag to the shooter's actual
+  /// rendered position.
+  Offset _toScreen(Offset world) {
+    final size = MediaQuery.of(context).size;
+    return (world - ctrl.camPos) * ctrl.camZoom + Offset(size.width / 2, size.height / 2);
+  }
+
+  /// Snaps a raw touch-derived world position to a clean placement: a
+  /// coarse horizontal grid for tidy alignment, plus — if the piece's
+  /// bottom edge is close to an existing block's top surface it already
+  /// overlaps horizontally — locking onto that surface so it visibly rests
+  /// on top instead of needing pixel-perfect placement.
+  Offset _snapGhost(Offset raw) {
+    final piece = _selectedPiece;
+    double x = (raw.dx / 8).roundToDouble() * 8;
+    double y = raw.dy;
+    final halfW = piece.size.width / 2, halfH = piece.size.height / 2;
+    double? snapY;
+    double bestDist = 16;
+    for (final b in ctrl.world.bodies) {
+      if (b.dead) continue;
+      final bb = b.aabb;
+      if (x + halfW < bb.left - 6 || x - halfW > bb.right + 6) continue;
+      final dTop = (y + halfH - bb.top).abs();
+      if (dTop < bestDist) {
+        bestDist = dTop;
+        snapY = bb.top - halfH;
+      }
+    }
+    if (snapY != null) y = snapY;
+    return Offset(x, y);
   }
 
   void _placeGhost() {
@@ -270,26 +401,33 @@ class _GameScreenState extends State<GameScreen> {
           },
           child: Stack(
             children: [
-              // world
+              // World/ghost/aim canvases, wrapped in their own
+              // AnimatedBuilder so they repaint on every controller tick
+              // (camera easing, projectile motion, ragdoll physics) without
+              // rebuilding the HUD below — that's throttled separately in
+              // _onUpdate to only when something it actually shows changes.
               Positioned.fill(
-                child: CustomPaint(
-                  painter: _GamePainter(ctrl, renderer),
+                child: AnimatedBuilder(
+                  animation: ctrl,
+                  builder: (context, _) => Stack(
+                    fit: StackFit.expand,
+                    children: [
+                      CustomPaint(painter: _GamePainter(ctrl, renderer)),
+                      if (ctrl.phase == GamePhase.building && ctrl.canHumanBuild && _ghostPos != null)
+                        CustomPaint(painter: _GhostPainter(ctrl, _selectedPiece, _ghostPos!, _ghostRot)),
+                      if (ctrl.phase == GamePhase.aiming && ctrl.world.charactersOf(ctrl.currentPlayer).isNotEmpty)
+                        CustomPaint(
+                          painter: _AimPainter(
+                            ctrl,
+                            charging: _charging,
+                            anchorScreen: _aimAnchorScreen,
+                            fingerScreen: _fingerScreen,
+                          ),
+                        ),
+                    ],
+                  ),
                 ),
               ),
-              // building ghost
-              if (ctrl.phase == GamePhase.building && ctrl.canHumanBuild && _ghostPos != null)
-                Positioned.fill(
-                  child: CustomPaint(
-                    painter: _GhostPainter(ctrl, _selectedPiece, _ghostPos!, _ghostRot),
-                  ),
-                ),
-              // aim indicator
-              if (ctrl.phase == GamePhase.aiming && ctrl.world.charactersOf(ctrl.currentPlayer).isNotEmpty)
-                Positioned.fill(
-                  child: CustomPaint(
-                    painter: _AimPainter(ctrl),
-                  ),
-                ),
               // HUD
               SafeArea(child: _buildHud()),
               // building UI
@@ -524,7 +662,7 @@ class _GameScreenState extends State<GameScreen> {
           ),
         ),
         const SizedBox(height: 4),
-        Text('↔ aim  ↕ power', style: RT.chunky(size: 10, color: Colors.white70)),
+        Text('pull back & release to fire', style: RT.chunky(size: 10, color: Colors.white70)),
       ],
     );
   }
@@ -571,7 +709,36 @@ class _GameScreenState extends State<GameScreen> {
 
   Widget _buildBuildUi() {
     final me = ctrl.buildingPlayerConfig;
-    return Column(
+    final blocker = _ghostPos != null ? ctrl.checkPlacement(_ghostPos!.dx, _ghostPos!.dy, _selectedPiece) : null;
+    final blockerReason = switch (blocker) {
+      PlacementBlocker.outsideArea => "Outside your build area",
+      PlacementBlocker.overlapping => "Overlapping something",
+      PlacementBlocker.noPiecesLeft => "No pieces left",
+      _ => null,
+    };
+    return Stack(
+      children: [
+        // camera controls: the build gesture is dragging pieces around, so
+        // there's no free gesture left to pan — zoom + recenter buttons
+        // still let the player inspect their construction area.
+        if (ctrl.canHumanBuild)
+          Positioned(
+            top: 4,
+            right: 8,
+            child: Row(
+              children: [
+                _miniBtn(Icons.remove, () => setState(() => ctrl.zoomCamera(-0.12))),
+                const SizedBox(width: 6),
+                _miniBtn(Icons.add, () => setState(() => ctrl.zoomCamera(0.12))),
+                const SizedBox(width: 6),
+                _miniBtn(Icons.my_location, () {
+                  final spawn = MapBuilder.spawnFor(ctrl.world, ctrl.buildingPlayer, ctrl.players.length);
+                  setState(() => ctrl.panCameraTo(spawn));
+                }),
+              ],
+            ),
+          ),
+        Column(
       children: [
         const Spacer(),
         if (ctrl.canHumanBuild) ...[
@@ -579,10 +746,18 @@ class _GameScreenState extends State<GameScreen> {
             padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 6),
             decoration: RT.card(color: RT.ink.withOpacity(0.75), radius: 18, border: 0),
             child: Text(
-              '${me.name} — place ${ctrl.piecesLeft} pieces! Tap to place, ⟳ to rotate',
+              '${me.name} — place ${ctrl.piecesLeft} pieces! Drag onto your area & let go to place',
               style: RT.chunky(size: 13, color: Colors.white),
             ),
           ),
+          if (blockerReason != null) ...[
+            const SizedBox(height: 4),
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 5),
+              decoration: RT.card(color: RT.red, radius: 14, border: 0),
+              child: Text("Can't place — $blockerReason", style: RT.chunky(size: 12, color: Colors.white)),
+            ),
+          ],
           const SizedBox(height: 6),
           Padding(
             padding: const EdgeInsets.only(bottom: 8),
@@ -633,11 +808,25 @@ class _GameScreenState extends State<GameScreen> {
                     _miniBtn(Icons.rotate_right, () => setState(() => _ghostRot += pi / 4)),
                     const SizedBox(height: 6),
                     GestureDetector(
-                      onTap: _placeGhost,
+                      onTap: _ghostPos == null ? null : _placeGhost,
                       child: Container(
                         padding: const EdgeInsets.all(10),
                         decoration: RT.card(color: RT.green, radius: 12, border: 3),
                         child: const Icon(Icons.check, color: Colors.white, size: 22),
+                      ),
+                    ),
+                    const SizedBox(height: 6),
+                    GestureDetector(
+                      onTap: _ghostPos == null
+                          ? null
+                          : () {
+                              AudioService.instance.sfx('click');
+                              setState(() => _ghostPos = null);
+                            },
+                      child: Container(
+                        padding: const EdgeInsets.all(10),
+                        decoration: RT.card(color: Colors.white, radius: 12, border: 3),
+                        child: const Icon(Icons.close, color: RT.ink, size: 22),
                       ),
                     ),
                   ],
@@ -667,6 +856,8 @@ class _GameScreenState extends State<GameScreen> {
               child: Text('${me.name} is building…', style: RT.chunky(size: 14, color: RT.ink)),
             ),
           ),
+      ],
+    ),
       ],
     );
   }
@@ -815,26 +1006,49 @@ class _GamePainter extends CustomPainter {
 
 class _AimPainter extends CustomPainter {
   final GameController ctrl;
-  _AimPainter(this.ctrl);
+  final bool charging;
+  final Offset? anchorScreen;
+  final Offset? fingerScreen;
+  _AimPainter(this.ctrl, {this.charging = false, this.anchorScreen, this.fingerScreen});
 
   @override
   void paint(Canvas canvas, Size size) {
     final chars = ctrl.world.charactersOf(ctrl.currentPlayer);
     if (chars.isEmpty) return;
-    final me = chars.first;
     final showTrajectory = SaveService.instance.data.showTrajectory;
+    final weapon = Weapons.byId(ctrl.selectedWeaponId);
+
+    // Slingshot pull-line, drawn in screen space (not affected by the
+    // world/camera transform below) so it tracks the raw finger position
+    // exactly — a stretchy rubber-band from the character to the touch
+    // point, thickening/brightening with power for a clear "how hard am I
+    // pulling" cue.
+    if (charging && anchorScreen != null && fingerScreen != null) {
+      final pull = fingerScreen! - anchorScreen!;
+      if (pull.distance > 4) {
+        final bandPaint = Paint()
+          ..color = weapon.color.withOpacity(0.85)
+          ..strokeWidth = 3 + ctrl.aimPower * 4
+          ..strokeCap = StrokeCap.round;
+        canvas.drawLine(anchorScreen!, fingerScreen!, Paint()..color = RT.ink.withOpacity(0.6)..strokeWidth = bandPaint.strokeWidth + 3..strokeCap = StrokeCap.round);
+        canvas.drawLine(anchorScreen!, fingerScreen!, bandPaint);
+        canvas.drawCircle(fingerScreen!, 9 + ctrl.aimPower * 5, Paint()..color = Colors.white.withOpacity(0.35));
+        canvas.drawCircle(fingerScreen!, 5, Paint()..color = Colors.white.withOpacity(0.8));
+      }
+    }
 
     canvas.save();
     canvas.translate(size.width / 2, size.height / 2);
     canvas.scale(ctrl.camZoom);
     canvas.translate(-ctrl.camPos.dx, -ctrl.camPos.dy);
 
-    final weapon = Weapons.byId(ctrl.selectedWeaponId);
     final from = ctrl.muzzlePos;
 
-    // aim arrow
+    // aim arrow — length scales with power, so the launch indicator itself
+    // also doubles as a power cue
     final dir = Offset(cos(ctrl.aimAngle), sin(ctrl.aimAngle));
-    final arrowEnd = from + dir * 60;
+    final arrowLen = 38 + ctrl.aimPower * 55;
+    final arrowEnd = from + dir * arrowLen;
     final paint = Paint()
       ..color = weapon.color
       ..strokeWidth = 5
@@ -897,8 +1111,11 @@ class _GhostPainter extends CustomPainter {
           ..style = PaintingStyle.stroke
           ..strokeWidth = 3);
 
-    // ghost piece
-    final valid = area.contains(pos);
+    // ghost piece — validity mirrors the actual placement rules (inside the
+    // build area AND not overlapping anything already there), not just the
+    // area check, so red/green is never misleading.
+    final blocker = ctrl.checkPlacement(pos.dx, pos.dy, piece);
+    final valid = blocker == PlacementBlocker.none;
     canvas.save();
     canvas.translate(pos.dx, pos.dy);
     canvas.rotate(rot);

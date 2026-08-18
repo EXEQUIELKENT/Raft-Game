@@ -21,6 +21,17 @@ class WorldRenderer {
   bool get _lowQuality => quality <= 0;
   bool get _highQuality => quality >= 2;
 
+  // The sky is a screen-space gradient painted behind the canvas (see
+  // GameScreen), so it always fills the viewport regardless of camera
+  // position — no world-space margin needed there. The ground/water plane
+  // below the waterline, however, IS drawn in world space, so it must
+  // extend far enough that GameController's camera clamp (which allows the
+  // camera up to ~480px beyond the world bounds) can never zoom out past
+  // it and reveal a hard rectangular edge. This margin is deliberately much
+  // larger than that clamp to cover any aspect ratio/zoom combination.
+  static const double _groundMargin = 2200;
+  static const double _foregroundMargin = 1100;
+
   void render(Canvas canvas, Size viewSize, Offset camPos, double camZoom, double time) {
     canvas.save();
     // screen shake
@@ -155,7 +166,8 @@ class WorldRenderer {
     canvas.drawOval(Rect.fromCenter(center: Offset(world.width * 0.72, world.waterLevel - 2), width: 340, height: 76), islPaint);
 
     // water body
-    final waterRect = Rect.fromLTWH(-400, world.waterLevel, world.width + 800, world.height - world.waterLevel + 600);
+    final waterRect = Rect.fromLTWH(-_groundMargin, world.waterLevel, world.width + _groundMargin * 2,
+        world.height - world.waterLevel + _groundMargin);
     canvas.drawRect(
         waterRect,
         Paint()
@@ -173,7 +185,8 @@ class WorldRenderer {
     canvas.drawOval(Rect.fromCenter(center: Offset(world.width * 0.72, world.waterLevel + 10), width: 360, height: 84), dunePaint);
 
     // sand stretching to the horizon
-    final groundRect = Rect.fromLTWH(-400, world.waterLevel, world.width + 800, world.height - world.waterLevel + 600);
+    final groundRect = Rect.fromLTWH(-_groundMargin, world.waterLevel, world.width + _groundMargin * 2,
+        world.height - world.waterLevel + _groundMargin);
     canvas.drawRect(
         groundRect,
         Paint()
@@ -191,7 +204,8 @@ class WorldRenderer {
     canvas.drawOval(Rect.fromCenter(center: Offset(world.width * 0.76, world.waterLevel - 2), width: 320, height: 72), ridgePaint);
 
     // molten lava sea
-    final lavaRect = Rect.fromLTWH(-400, world.waterLevel, world.width + 800, world.height - world.waterLevel + 600);
+    final lavaRect = Rect.fromLTWH(-_groundMargin, world.waterLevel, world.width + _groundMargin * 2,
+        world.height - world.waterLevel + _groundMargin);
     canvas.drawRect(
         lavaRect,
         Paint()
@@ -219,13 +233,13 @@ class WorldRenderer {
     // animated wave line
     final path = Path();
     final paint = Paint()..color = Colors.white.withOpacity(0.5);
-    path.moveTo(-400, world.waterLevel);
-    for (double x = -400; x <= world.width + 400; x += 16) {
+    path.moveTo(-_foregroundMargin, world.waterLevel);
+    for (double x = -_foregroundMargin; x <= world.width + _foregroundMargin; x += 16) {
       final y = world.waterLevel + sin(x / 40 + time * 2.2) * 5 + sin(x / 17 - time * 3.1) * 2.5;
       path.lineTo(x, y);
     }
-    path.lineTo(world.width + 400, world.waterLevel + 26);
-    path.lineTo(-400, world.waterLevel + 26);
+    path.lineTo(world.width + _foregroundMargin, world.waterLevel + 26);
+    path.lineTo(-_foregroundMargin, world.waterLevel + 26);
     path.close();
     canvas.drawPath(path, paint..color = const Color(0xFF9FE4F5).withOpacity(0.85));
   }
@@ -234,13 +248,13 @@ class WorldRenderer {
     // loose sand crest — slower, gentler undulation than water, no foam
     final path = Path();
     final paint = Paint()..color = const Color(0xFFE8C07D).withOpacity(0.8);
-    path.moveTo(-400, world.waterLevel);
-    for (double x = -400; x <= world.width + 400; x += 16) {
+    path.moveTo(-_foregroundMargin, world.waterLevel);
+    for (double x = -_foregroundMargin; x <= world.width + _foregroundMargin; x += 16) {
       final y = world.waterLevel + sin(x / 70 + time * 0.6) * 3;
       path.lineTo(x, y);
     }
-    path.lineTo(world.width + 400, world.waterLevel + 26);
-    path.lineTo(-400, world.waterLevel + 26);
+    path.lineTo(world.width + _foregroundMargin, world.waterLevel + 26);
+    path.lineTo(-_foregroundMargin, world.waterLevel + 26);
     path.close();
     canvas.drawPath(path, paint);
   }
@@ -253,13 +267,13 @@ class WorldRenderer {
     if (!_lowQuality) {
       paint.maskFilter = MaskFilter.blur(BlurStyle.normal, _highQuality ? 5 : 3);
     }
-    path.moveTo(-400, world.waterLevel);
-    for (double x = -400; x <= world.width + 400; x += 14) {
+    path.moveTo(-_foregroundMargin, world.waterLevel);
+    for (double x = -_foregroundMargin; x <= world.width + _foregroundMargin; x += 14) {
       final y = world.waterLevel + sin(x / 30 + time * 4.5) * 6 + sin(x / 13 - time * 6.0) * 3;
       path.lineTo(x, y);
     }
-    path.lineTo(world.width + 400, world.waterLevel + 26);
-    path.lineTo(-400, world.waterLevel + 26);
+    path.lineTo(world.width + _foregroundMargin, world.waterLevel + 26);
+    path.lineTo(-_foregroundMargin, world.waterLevel + 26);
     path.close();
     canvas.drawPath(path, paint);
   }
@@ -391,118 +405,168 @@ class WorldRenderer {
 
   // -------------------------------------------------------------------------
 
+  static const List<BodyPart> _limbDrawOrder = [
+    BodyPart.lowerLegL, BodyPart.upperLegL,
+    BodyPart.lowerLegR, BodyPart.upperLegR,
+    BodyPart.torso,
+    BodyPart.upperArmL, BodyPart.lowerArmL,
+    BodyPart.upperArmR, BodyPart.lowerArmR,
+  ];
+
   void _drawCharacter(Canvas canvas, PhysBody b, double time) {
     final idx = b.playerIndex.clamp(0, charColors.length - 1);
     final color = charColors[idx];
     final dark = Color.lerp(color, Colors.black, 0.3)!;
-    final ragdoll = b.vel.distance > 60 || b.angularVel.abs() > 1.0 || b.dead;
-    final idle = sin(time * 3 + b.id) * 1.5;
+    final limbColor = Color.lerp(color, Colors.black, 0.16)!;
+    final ragdoll = world.ragdolls[b.id];
 
-    canvas.save();
-    canvas.translate(b.pos.dx, b.pos.dy);
-    canvas.rotate(b.angle);
+    if (ragdoll == null) {
+      // Every character gets a Ragdoll in PhysicsWorld.addCharacter; this
+      // is just a defensive fallback so a missing entry never crashes render.
+      canvas.drawCircle(b.pos, b.size.width / 2, Paint()..color = color);
+      return;
+    }
 
-    final w = b.size.width, h = b.size.height;
-    final bodyRect = Rect.fromCenter(center: const Offset(0, 4), width: w, height: h * 0.62);
+    final bonesByPart = {for (final bo in ragdoll.bones) bo.part: bo};
+    final feetY = ((bonesByPart[BodyPart.lowerLegL]?.b.dy ?? b.pos.dy) +
+            (bonesByPart[BodyPart.lowerLegR]?.b.dy ?? b.pos.dy)) /
+        2;
 
-    // drop shadow
-    canvas.drawOval(Rect.fromCenter(center: Offset(0, h / 2 + 4), width: w * 1.1, height: 8),
+    // drop shadow at the feet
+    canvas.drawOval(
+        Rect.fromCenter(center: Offset(b.pos.dx, feetY + 4), width: b.size.width * 1.3, height: 8),
         Paint()..color = Colors.black.withOpacity(0.18));
 
     final outlinePaint = Paint()..color = RT.ink;
-
-    // legs
-    if (!ragdoll) {
-      canvas.drawRRect(
-          RRect.fromRectAndRadius(Rect.fromCenter(center: Offset(-6, h * 0.32 + idle * 0.3), width: 9, height: 14), const Radius.circular(4)),
-          outlinePaint);
-      canvas.drawRRect(
-          RRect.fromRectAndRadius(Rect.fromCenter(center: Offset(6, h * 0.32 - idle * 0.3), width: 9, height: 14), const Radius.circular(4)),
-          outlinePaint);
-    } else {
-      canvas.drawRRect(
-          RRect.fromRectAndRadius(Rect.fromCenter(center: Offset(-8, h * 0.32), width: 9, height: 14), const Radius.circular(4)),
-          outlinePaint);
-      canvas.drawRRect(
-          RRect.fromRectAndRadius(Rect.fromCenter(center: Offset(9, h * 0.28), width: 9, height: 14), const Radius.circular(4)),
-          outlinePaint);
+    const skinTone = Color(0xFFFFDFC4);
+    for (final part in _limbDrawOrder) {
+      final bo = bonesByPart[part];
+      if (bo == null) continue;
+      final isTorso = part == BodyPart.torso;
+      canvas.drawLine(bo.a, bo.b,
+          Paint()..color = RT.ink..strokeWidth = bo.width..strokeCap = StrokeCap.round);
+      canvas.drawLine(bo.a, bo.b,
+          Paint()
+            ..color = isTorso ? color : limbColor
+            ..strokeWidth = max(2.0, bo.width - 3.2)
+            ..strokeCap = StrokeCap.round);
     }
 
-    // body (chunky rounded)
-    canvas.drawRRect(RRect.fromRectAndRadius(bodyRect, const Radius.circular(12)), outlinePaint);
-    canvas.drawRRect(RRect.fromRectAndRadius(bodyRect.deflate(3), const Radius.circular(9)), Paint()..color = color);
-    // belly highlight
-    canvas.drawOval(Rect.fromCenter(center: const Offset(0, 10), width: w * 0.5, height: h * 0.3),
-        Paint()..color = Colors.white.withOpacity(0.25));
+    // joint blobs at the shoulders/hips/elbows/knees: smooths the seam
+    // between two bones meeting at an angle so the figure reads as a
+    // continuously-connected body rather than a set of separate sticks.
+    void jointBlob(Offset p, double w, Color fill) {
+      canvas.drawCircle(p, w / 2, outlinePaint);
+      canvas.drawCircle(p, max(1.0, w / 2 - 1.6), Paint()..color = fill);
+    }
 
-    // head
-    final headC = Offset(0, -h * 0.32 + (ragdoll ? 0 : idle));
-    canvas.drawCircle(headC, w * 0.52, outlinePaint);
-    canvas.drawCircle(headC, w * 0.52 - 3, Paint()..color = const Color(0xFFFFDFC4));
+    final torsoBone = bonesByPart[BodyPart.torso];
+    final upperArmL = bonesByPart[BodyPart.upperArmL];
+    final upperArmR = bonesByPart[BodyPart.upperArmR];
+    final upperLegL = bonesByPart[BodyPart.upperLegL];
+    final upperLegR = bonesByPart[BodyPart.upperLegR];
+    if (torsoBone != null) {
+      jointBlob(torsoBone.a, torsoBone.width * 0.9, color); // shoulders/neck base
+      jointBlob(torsoBone.b, torsoBone.width * 0.82, color); // hips
+      canvas.drawCircle(torsoBone.mid, torsoBone.width * 0.34, Paint()..color = Colors.white.withOpacity(0.22));
+    }
+    if (upperArmL != null) jointBlob(upperArmL.b, upperArmL.width * 0.95, limbColor);
+    if (upperArmR != null) jointBlob(upperArmR.b, upperArmR.width * 0.95, limbColor);
+    if (upperLegL != null) jointBlob(upperLegL.b, upperLegL.width * 0.98, limbColor);
+    if (upperLegR != null) jointBlob(upperLegR.b, upperLegR.width * 0.98, limbColor);
 
-    // eyes
-    final eyeY = headC.dy - 2;
+    // hands & feet: small distinct shapes at the limb tips, so arms end in
+    // visible hands and legs end in visible feet rather than just stopping.
+    void capShape(Offset p, double angle, double len, double wid, Color fill) {
+      canvas.save();
+      canvas.translate(p.dx, p.dy);
+      canvas.rotate(angle);
+      final rect = Rect.fromCenter(center: Offset.zero, width: len, height: wid);
+      canvas.drawRRect(RRect.fromRectAndRadius(rect, Radius.circular(wid / 2)), outlinePaint);
+      canvas.drawRRect(RRect.fromRectAndRadius(rect.deflate(1.6), Radius.circular(wid / 2)), Paint()..color = fill);
+      canvas.restore();
+    }
+
+    final lowerArmL = bonesByPart[BodyPart.lowerArmL];
+    final lowerArmR = bonesByPart[BodyPart.lowerArmR];
+    final lowerLegL = bonesByPart[BodyPart.lowerLegL];
+    final lowerLegR = bonesByPart[BodyPart.lowerLegR];
+    if (lowerArmL != null) capShape(lowerArmL.b, lowerArmL.angle, 12, 9, skinTone);
+    if (lowerArmR != null) capShape(lowerArmR.b, lowerArmR.angle, 12, 9, skinTone);
+    if (lowerLegL != null) capShape(lowerLegL.b, lowerLegL.angle, 17, 10, dark);
+    if (lowerLegR != null) capShape(lowerLegR.b, lowerLegR.angle, 17, 10, dark);
+
+    // head + face: drawn in a frame translated/rotated to the head-neck
+    // bone so the face tilts naturally as the ragdoll tumbles.
+    final headC = ragdoll.headCenter;
+    final tilt = ragdoll.headTilt;
+    final isRagdolling = ragdoll.isRagdolling;
+    const r = Ragdoll.headRadius;
+
+    canvas.save();
+    canvas.translate(headC.dx, headC.dy);
+    canvas.rotate(tilt);
+
+    canvas.drawCircle(Offset.zero, r, outlinePaint);
+    canvas.drawCircle(Offset.zero, r - 2.5, Paint()..color = skinTone);
+
+    const eyeY = -2.0;
     if (b.dead) {
-      // X X eyes
       final xp = Paint()
         ..color = RT.ink
-        ..strokeWidth = 2.5
+        ..strokeWidth = 2.3
         ..strokeCap = StrokeCap.round;
-      for (final ex in [-6.0, 6.0]) {
-        canvas.drawLine(Offset(headC.dx + ex - 3, eyeY - 3), Offset(headC.dx + ex + 3, eyeY + 3), xp);
-        canvas.drawLine(Offset(headC.dx + ex + 3, eyeY - 3), Offset(headC.dx + ex - 3, eyeY + 3), xp);
+      for (final ex in [-4.5, 4.5]) {
+        canvas.drawLine(Offset(ex - 2.6, eyeY - 2.6), Offset(ex + 2.6, eyeY + 2.6), xp);
+        canvas.drawLine(Offset(ex + 2.6, eyeY - 2.6), Offset(ex - 2.6, eyeY + 2.6), xp);
       }
-    } else if (ragdoll) {
-      // dizzy spiral-ish: big white eyes with small pupils up
-      for (final ex in [-6.0, 6.0]) {
-        canvas.drawCircle(Offset(headC.dx + ex, eyeY), 4.5, Paint()..color = Colors.white);
-        canvas.drawCircle(Offset(headC.dx + ex, eyeY - 1.5), 2, outlinePaint);
+    } else if (isRagdolling) {
+      for (final ex in [-4.5, 4.5]) {
+        canvas.drawCircle(Offset(ex, eyeY), 3.6, Paint()..color = Colors.white);
+        canvas.drawCircle(Offset(ex, eyeY - 1.2), 1.7, outlinePaint);
       }
     } else {
-      for (final ex in [-6.0, 6.0]) {
-        canvas.drawCircle(Offset(headC.dx + ex, eyeY), 4, Paint()..color = Colors.white);
-        canvas.drawCircle(Offset(headC.dx + ex + 1, eyeY), 2, outlinePaint);
+      for (final ex in [-4.5, 4.5]) {
+        canvas.drawCircle(Offset(ex, eyeY), 3.2, Paint()..color = Colors.white);
+        canvas.drawCircle(Offset(ex + 0.8, eyeY), 1.6, outlinePaint);
       }
     }
 
-    // mouth
     final mouthPaint = Paint()
       ..color = RT.ink
-      ..strokeWidth = 2.2
+      ..strokeWidth = 1.9
       ..style = PaintingStyle.stroke
       ..strokeCap = StrokeCap.round;
     if (b.dead) {
-      canvas.drawArc(Rect.fromCenter(center: Offset(headC.dx, eyeY + 12), width: 10, height: 8), pi, -pi, false, mouthPaint);
-    } else if (ragdoll) {
-      canvas.drawCircle(Offset(headC.dx, eyeY + 9), 3.5, mouthPaint..style = PaintingStyle.fill);
+      canvas.drawArc(Rect.fromCenter(center: const Offset(0, eyeY + 9), width: 8, height: 6), pi, -pi, false, mouthPaint);
+    } else if (isRagdolling) {
+      canvas.drawCircle(const Offset(0, eyeY + 7), 2.8, mouthPaint..style = PaintingStyle.fill);
     } else {
-      canvas.drawArc(Rect.fromCenter(center: Offset(headC.dx, eyeY + 6), width: 12, height: 9), 0.2, pi - 0.4, false, mouthPaint);
+      canvas.drawArc(Rect.fromCenter(center: const Offset(0, eyeY + 5), width: 9, height: 7), 0.2, pi - 0.4, false, mouthPaint);
     }
 
-    // hat / bandana
     final hat = idx < charHats.length ? charHats[idx] : 0;
-    _drawHat(canvas, headC, w * 0.52, hat, color, dark);
+    _drawHat(canvas, Offset.zero, r, hat, color, dark);
 
-    // hp ring (small arc above head when damaged)
+    canvas.restore();
+
+    // status rings/tints: drawn upright in world space for readability,
+    // regardless of how far the head has tilted.
     if (b.hp < b.maxHp && !b.dead) {
       final frac = (b.hp / b.maxHp).clamp(0.0, 1.0);
-      final arcRect = Rect.fromCircle(center: headC, radius: w * 0.62);
+      final arcRect = Rect.fromCircle(center: headC, radius: r * 1.25);
       canvas.drawArc(arcRect, -pi / 2 + pi * 0.7, pi * 1.6, false,
           Paint()..color = Colors.white.withOpacity(0.4)..strokeWidth = 3..style = PaintingStyle.stroke);
       canvas.drawArc(arcRect, -pi / 2 + pi * 0.7, pi * 1.6 * frac, false,
           Paint()..color = frac > 0.5 ? RT.green : frac > 0.25 ? RT.orange : RT.red..strokeWidth = 3..style = PaintingStyle.stroke..strokeCap = StrokeCap.round);
     }
-
-    // frozen tint
     if (b.frozenUntil > world.elapsed) {
-      canvas.drawCircle(headC, w * 0.6, Paint()..color = const Color(0xFF7DD8FF).withOpacity(0.4));
+      canvas.drawCircle(headC, r * 1.15, Paint()..color = const Color(0xFF7DD8FF).withOpacity(0.4));
     }
     if (b.burnUntil > world.elapsed) {
-      canvas.drawCircle(const Offset(0, -6), w * 0.7,
+      canvas.drawCircle(headC, r * 1.3,
           Paint()..color = const Color(0xFFFF8C1A).withOpacity(0.3 + sin(time * 12) * 0.1));
     }
-
-    canvas.restore();
   }
 
   void _drawHat(Canvas canvas, Offset headC, double r, int hat, Color color, Color dark) {

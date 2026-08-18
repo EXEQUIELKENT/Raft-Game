@@ -14,6 +14,11 @@ enum GamePhase { building, aiming, firing, settling, turnTransition, gameOver }
 
 enum GameMode { vsAi, local, hotspot }
 
+/// Why a build piece can't be placed at a given spot right now — lets the
+/// UI explain the specific reason (outside area vs. overlapping something
+/// vs. out of pieces) instead of just refusing silently.
+enum PlacementBlocker { none, outsideArea, overlapping, noPiecesLeft }
+
 class PlayerConfig {
   final String name;
   final int colorIndex;
@@ -123,7 +128,7 @@ class GameController extends ChangeNotifier {
   }
 
   void _setupWorld(int seed, {bool skipBuildPhase = false}) {
-    MapBuilder.build(world, settings.map, players.length, seed.toDouble());
+    MapBuilder.build(world, settings.map, players.length);
     // wind: each map has its own base wind (e.g. Frosty Peaks is gustier
     // than Coconut Cove), randomized around by the player's wind setting.
     wind = (settings.map.windBase + world.rng.range(-1, 1) * settings.windStrength).clamp(-1.0, 1.0);
@@ -146,11 +151,32 @@ class GameController extends ChangeNotifier {
       statusMessage = '${players[0].name}: fortify your raft! ($piecesLeft left)';
     }
 
-    // initial camera
+    // Camera target: player 0's normal in-turn framing (zoom 1.0, centered
+    // on them) — unchanged from before.
     final c = world.charactersOf(0);
-    camPos = c.isNotEmpty ? c.first.pos : Offset(worldW / 2, worldH / 2);
-    _camTarget = camPos;
+    _camTarget = c.isNotEmpty ? c.first.pos : Offset(worldW / 2, worldH / 2);
     _fitZoom();
+
+    // Camera *starting position*: a brief wide establishing shot framing
+    // every player's spawn instead of snapping straight to player 0's
+    // close-up. Since camPos/camZoom already ease toward _camTarget/
+    // _camZoomTarget every tick (see _tick), setting only the starting
+    // values here means the view smoothly zooms in from "here's the whole
+    // battlefield" to "here's your character" over the next second or so,
+    // with no extra timer/state needed — now that players spawn much
+    // farther apart, jumping straight to a tight zoom on player 0 would
+    // otherwise hide where the rest of the arena and opponent(s) are.
+    final allChars = world.bodies.where((b) => b.type == BodyType.character).toList();
+    if (allChars.length > 1) {
+      final xs = allChars.map((b) => b.pos.dx);
+      final minX = xs.reduce(min), maxX = xs.reduce(max);
+      final spread = maxX - minX;
+      camPos = Offset((minX + maxX) / 2, worldH * 0.44);
+      camZoom = (760 / (spread + 320)).clamp(0.5, 1.0);
+    } else {
+      camPos = _camTarget;
+      camZoom = _camZoomTarget;
+    }
 
     _hookNet();
     _startTicker();
@@ -246,8 +272,11 @@ class GameController extends ChangeNotifier {
         break;
     }
 
-    // camera easing
+    // camera easing (clamped so it can never outrun the renderer's extended
+    // background art and expose the raw world boundary — see _clampCamera)
+    _camTarget = _clampCamera(_camTarget);
     camPos = Offset.lerp(camPos, _camTarget, (dt * 4.5).clamp(0.0, 1.0))!;
+    camPos = _clampCamera(camPos);
     camZoom = camZoom + (_camZoomTarget - camZoom) * (dt * 3).clamp(0.0, 1.0);
 
     notifyListeners();
@@ -533,11 +562,34 @@ class GameController extends ChangeNotifier {
     return !players[buildingPlayer].isAi;
   }
 
-  /// Build area: near the player's spawn
+  /// Build area: near the player's spawn. Width is capped by how much room
+  /// is actually available between neighbouring players (accounting for the
+  /// spawn platform's own position jitter) so build areas never overlap —
+  /// a fixed 300px worked for 2 players but could overlap in 3-4 player
+  /// matches, where slots sit much closer together.
   Rect buildAreaFor(int player) {
     final spawn = MapBuilder.spawnFor(world, player, players.length);
-    return Rect.fromCenter(center: Offset(spawn.dx, spawn.dy - 40), width: 300, height: 280);
+    final spacing = MapBuilder.slotSpacing(world.width, players.length);
+    final width = (spacing - 100).clamp(180.0, 300.0);
+    return Rect.fromCenter(center: Offset(spawn.dx, spawn.dy - 40), width: width, height: 280);
   }
+
+  /// Why (if at all) [piece] can't be placed at (x, y) right now — shared by
+  /// the actual placement call and the UI's ghost-preview so both always
+  /// agree on what's valid.
+  PlacementBlocker checkPlacement(double x, double y, PieceDef piece) {
+    if (piecesLeft <= 0) return PlacementBlocker.noPiecesLeft;
+    final area = buildAreaFor(buildingPlayer);
+    if (!area.contains(Offset(x, y))) return PlacementBlocker.outsideArea;
+    final testRect = Rect.fromCenter(center: Offset(x, y), width: piece.size.width, height: piece.size.height);
+    for (final b in world.bodies) {
+      if (b.dead) continue;
+      if (b.aabb.inflate(-4).overlaps(testRect)) return PlacementBlocker.overlapping;
+    }
+    return PlacementBlocker.none;
+  }
+
+  bool canPlaceAt(double x, double y, PieceDef piece) => checkPlacement(x, y, piece) == PlacementBlocker.none;
 
   bool placeBuildingPiece(double x, double y, double rot, PieceDef piece) {
     if (!canHumanBuild || piecesLeft <= 0) return false;
@@ -548,14 +600,7 @@ class GameController extends ChangeNotifier {
   }
 
   bool _placeBlock(double x, double y, double rot, PieceDef piece, PlayerConfig player, {bool fromNetwork = false}) {
-    final area = buildAreaFor(buildingPlayer);
-    if (!area.contains(Offset(x, y))) return false;
-    // avoid placing on existing bodies
-    final testRect = Rect.fromCenter(center: Offset(x, y), width: piece.size.width, height: piece.size.height);
-    for (final b in world.bodies) {
-      if (b.dead) continue;
-      if (b.aabb.inflate(-4).overlaps(testRect)) return false;
-    }
+    if (checkPlacement(x, y, piece) != PlacementBlocker.none) return false;
     world.addBlock(
       pos: Offset(x, y),
       size: piece.size,
@@ -631,6 +676,22 @@ class GameController extends ChangeNotifier {
     _camZoomTarget = 1.0;
   }
 
+  // The renderer paints sky/water/ground art well beyond the physics bounds
+  // specifically so the player never sees the world's raw rectangular edge
+  // (see WorldRenderer's edge margin). That only holds if the camera itself
+  // never strays far enough to outrun that extended art — this clamp is the
+  // other half of that contract: it bounds camPos/camTarget to a budget the
+  // renderer's margin comfortably covers at any zoom this game allows
+  // (0.5x-1.6x), even while chasing a wild projectile or an explosion-
+  // launched ragdoll near/past the map's edge.
+  static const double _camMarginX = 480;
+  static const double _camMarginY = 360;
+
+  Offset _clampCamera(Offset p) => Offset(
+        p.dx.clamp(-_camMarginX, worldW + _camMarginX),
+        p.dy.clamp(-_camMarginY, worldH + _camMarginY),
+      );
+
   void zoomCamera(double delta) {
     _camZoomTarget = (_camZoomTarget + delta).clamp(0.5, 1.6);
   }
@@ -643,6 +704,14 @@ class GameController extends ChangeNotifier {
         _camTarget.dy.clamp(0, worldH),
       );
     }
+  }
+
+  /// Recenters the camera on an arbitrary world point — used by the
+  /// building UI's "recenter" button, since [resetCameraToPlayer] targets
+  /// whoever's turn it is to fire, not necessarily whoever's building.
+  void panCameraTo(Offset pos) {
+    _camTarget = pos;
+    _camZoomTarget = 1.0;
   }
 
   void resetCameraToPlayer() {

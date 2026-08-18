@@ -1,6 +1,9 @@
 import 'dart:math';
 import 'dart:ui';
 import 'models.dart';
+import 'ragdoll.dart';
+
+export 'ragdoll.dart' show Ragdoll, RagdollBone, BodyPart;
 
 /// ---------------------------------------------------------------------------
 /// Raft Rumble custom 2D physics engine.
@@ -183,6 +186,12 @@ class PhysicsWorld {
   final List<FloatingText> texts = [];
   final List<GameEvent> events = [];
 
+  /// Multi-segment ragdoll skeleton for each character, keyed by body id.
+  /// The main [PhysBody] remains authoritative for gameplay physics; the
+  /// ragdoll is a secondary, physically-simulated skeleton tethered to it
+  /// (see [Ragdoll]) driving limb visuals and location-based hit reactions.
+  final Map<int, Ragdoll> ragdolls = {};
+
   int _nextId = 1;
   double screenShake = 0;
 
@@ -263,6 +272,7 @@ class PhysicsWorld {
       material: MaterialType.wood,
     );
     bodies.add(b);
+    ragdolls[b.id] = Ragdoll(pos: pos);
     return b;
   }
 
@@ -312,6 +322,20 @@ class PhysicsWorld {
     );
     projectiles.add(p);
     events.add(GameEvent('fire', {'owner': owner, 'weapon': weapon.id}));
+    // muzzle flash: a short-lived burst along the launch direction
+    final dir = Offset(cos(angleRad), sin(angleRad));
+    for (int i = 0; i < 7; i++) {
+      final spread = rng.range(-0.35, 0.35);
+      final speed = rng.range(80, 220) * weapon.weight;
+      particles.add(Particle(
+        pos: from,
+        vel: rotate(dir, spread) * speed,
+        life: rng.range(0.12, 0.22),
+        size: rng.range(3, 7) * weapon.weight,
+        color: weapon.color,
+        glow: true,
+      ));
+    }
     return p;
   }
 
@@ -348,7 +372,10 @@ class PhysicsWorld {
 
       if (b.type == BodyType.character) {
         final dmg = damage * falloff;
-        damageCharacter(b, dmg, n * knockback * 260 * falloff, owner: owner, cause: effect);
+        // approximate the impact point as the spot on the character's
+        // silhouette nearest the blast, for hit-location detection
+        final hitPos = b.pos + n * (b.size.longestSide / 2);
+        damageCharacter(b, dmg, n * knockback * 260 * falloff, owner: owner, cause: effect, hitPos: hitPos);
       } else if (b.type == BodyType.block && !b.isStatic) {
         damageBlock(b, damage * structDamage * falloff * 1.4, effect: effect);
         b.vel += n * knockback * 200 * falloff / max(b.mass, 0.5);
@@ -373,12 +400,16 @@ class PhysicsWorld {
     }
   }
 
-  void damageCharacter(PhysBody c, double amount, Offset impulse, {int owner = -1, String cause = 'hit'}) {
+  void damageCharacter(PhysBody c, double amount, Offset impulse, {int owner = -1, String cause = 'hit', Offset? hitPos}) {
     if (c.dead || amount <= 0 && impulse == Offset.zero) return;
     c.hp -= amount;
     c.vel += impulse / c.mass;
     c.angularVel += rng.range(-6, 6) * (impulse.distance / 200).clamp(0.3, 2.0);
     c.sleeping = false;
+    // Location-based ragdoll reaction: figure out which limb/segment was
+    // struck (or approximate it from the collision normal for explosions/
+    // crush impacts) and kick that bone specifically — see Ragdoll.applyHit.
+    ragdolls[c.id]?.applyHit(hitPos ?? c.pos, impulse, c, this);
     texts.add(FloatingText(
       c.pos + const Offset(0, -40),
       '-${amount.round()}',
@@ -571,6 +602,26 @@ class PhysicsWorld {
       b.angle += b.angularVel * dt * slow;
       if (b.angle > pi * 4 || b.angle < -pi * 4) b.angle = b.angle % (2 * pi);
 
+      // Self-righting: once a character has essentially stopped moving, it
+      // isn't a free-tumbling ragdoll anymore — like a person catching
+      // their balance, gently ease any residual tilt back to upright
+      // rather than leaving it permanently stuck at whatever angle a spin
+      // (e.g. from a hit) happened to damp out at. Only engages once
+      // vel/angularVel are already small, so it never fights an active
+      // knockback/tumble — it just prevents "stable" from meaning "frozen
+      // sideways".
+      if (b.type == BodyType.character && b.vel.distance < 40 && b.angularVel.abs() < 0.3 && b.angle != 0) {
+        var diff = -b.angle;
+        diff -= (2 * pi) * (diff / (2 * pi)).roundToDouble(); // shortest path, wrapped to (-pi, pi]
+        if (diff.abs() < 0.01) {
+          b.angle = 0;
+          b.angularVel = 0;
+        } else {
+          b.angle += diff * min(1.0, dt * 4.0);
+          b.angularVel = 0;
+        }
+      }
+
       // water (or sand / lava, depending on the map): characters are
       // eliminated, debris floats/sinks
       if (b.pos.dy > waterLevel + b.size.height / 2) {
@@ -675,6 +726,15 @@ class PhysicsWorld {
       } else if (b.angularVel.abs() < _sleepAngularEps) {
         b.angularVel = 0;
       }
+    }
+
+    // --- ragdoll skeletons (multi-segment limb simulation) -------------
+    // Runs after the main body loop, collisions and the velocity safety
+    // net above, so each ragdoll sees this frame's fully-resolved body
+    // state. Only characters have a ragdoll entry (see addCharacter).
+    for (final b in bodies) {
+      if (b.type != BodyType.character) continue;
+      ragdolls[b.id]?.update(dt, b, this);
     }
 
     // --- particles & texts ---
@@ -825,7 +885,7 @@ class PhysicsWorld {
             explode(p.pos, p.weapon.radius, p.weapon.damage, p.weapon.knockback,
                 structDamage: p.weapon.structDamage, owner: p.owner, effect: p.weapon.behavior);
           } else {
-            damageCharacter(b, dmg, kb, owner: p.owner);
+            damageCharacter(b, dmg, kb, owner: p.owner, hitPos: p.pos);
             events.add(GameEvent('hit', {}));
           }
           p.dead = true;
@@ -892,14 +952,22 @@ class PhysicsWorld {
         } else {
           events.add(GameEvent('impact', {'x': p.pos.dx, 'y': p.pos.dy}));
           screenShake = min(screenShake + 3 + speed / 200, 10);
+          // impact color/behavior reads the material that got hit: sparks
+          // for metal, chips for stone, splinters for wood, shards for glass
+          final matSpec = _materialSpec(b.material);
+          final impactColor = b.material == MaterialType.metal
+              ? const Color(0xFFFFE9B0)
+              : Color.lerp(matSpec.color, const Color(0xFFFFFFFF), 0.35)!;
+          final impactGlow = b.material == MaterialType.metal;
           for (int i = 0; i < 8; i++) {
             particles.add(Particle(
               pos: p.pos,
               vel: Offset(rng.range(-120, 120), rng.range(-160, 0)),
               life: rng.range(0.3, 0.6),
-              size: rng.range(3, 8),
-              color: const Color(0xFFFFE3A3),
+              size: rng.range(3, 8) * (b.material == MaterialType.glass ? 0.7 : 1.0),
+              color: impactColor,
               gravity: 500,
+              glow: impactGlow,
             ));
           }
         }
@@ -986,38 +1054,44 @@ class PhysicsWorld {
       // impact damage from momentum (falling blocks hurt!)
       final impact = jimp.abs();
       if (impact > 2.2) {
-        if (a.type == BodyType.character || b.type == BodyType.character) {
-          final c = a.type == BodyType.character ? a : b;
+        for (final c in [a, b]) {
+          if (c.type != BodyType.character) continue;
           final other = identical(c, a) ? b : a;
           // Use the character's own pre-collision speed along the contact
           // normal: a normal standing landing (~1-2 char heights) peaks well
           // under 150 px/s and must be harmless, while explosion knockback,
           // long falls and block slams are several hundred px/s.
           final cVelAlongN = (c.vel.dx * n.dx + c.vel.dy * n.dy).abs();
+          final movingBlockSlam = other.type == BodyType.block && !other.isStatic;
+          final hardLanding = cVelAlongN > 260;
           double dmg = 0;
-          if (other.type == BodyType.block && !other.isStatic) {
+          if (movingBlockSlam) {
             // moving block slam: scale with impulse
             dmg = (impact - 6) * 3.0;
-          } else if (cVelAlongN > 260) {
+          } else if (hardLanding) {
             // genuinely hard landing (long fall / thrown by explosion)
             dmg = (cVelAlongN - 260) * 0.09;
           }
           if (dmg > 2) {
-            damageCharacter(c, min(dmg, 45), Offset.zero, cause: 'crush');
+            damageCharacter(c, min(dmg, 45), Offset.zero, cause: 'crush', hitPos: c.pos + n * (c.size.longestSide / 2));
+          }
+          // Angular "fun" spin belongs only to genuinely violent contacts —
+          // the same bar as the damage check above (slammed by a moving
+          // block, or a hard enough fall/launch to count as a hard
+          // landing). An ordinary touchdown onto a static platform
+          // (spawning, walking, settling after a routine short fall) must
+          // NOT set the character spinning: that was previously firing on
+          // any impact>6 regardless of cause, so standing characters would
+          // randomly tip over on landing and spend seconds spinning down —
+          // which, via the AABB's rotation-dependent footprint, also
+          // showed up as spurious vertical bobbing while just standing.
+          if (!resting && (movingBlockSlam || hardLanding) && impact > 6) {
+            c.angularVel += rng.range(-3, 3) * (impact / 8).clamp(0.2, 2.0);
           }
         }
         // falling blocks damage what they hit & take damage
         if (a.type == BodyType.block && !a.isStatic && impact > 10) damageBlock(a, impact * 1.2);
         if (b.type == BodyType.block && !b.isStatic && impact > 10) damageBlock(b, impact * 1.2);
-        // angular fun for characters (bounded by the velocity safety net
-        // at the end of step() — repeated small hits, e.g. from being
-        // wedged between colliding bodies, can no longer accumulate into
-        // unbounded spin)
-        for (final c in [a, b]) {
-          if (c.type == BodyType.character && !resting && impact > 6) {
-            c.angularVel += rng.range(-3, 3) * (impact / 8).clamp(0.2, 2.0);
-          }
-        }
       }
     }
   }
