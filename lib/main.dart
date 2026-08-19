@@ -26,7 +26,7 @@ class RaftRumbleApp extends StatelessWidget {
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
         useMaterial3: true,
-        scaffoldBackgroundColor: RT.sky2,
+        scaffoldBackgroundColor: RT.sea2,
         colorScheme: ColorScheme.fromSeed(seedColor: RT.orange, brightness: Brightness.light),
       ),
       home: const MainMenuScreen(),

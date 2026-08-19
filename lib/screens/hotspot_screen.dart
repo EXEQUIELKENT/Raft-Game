@@ -3,8 +3,8 @@ import 'package:flutter/services.dart';
 import '../game/audio.dart';
 import '../game/controller.dart';
 import '../game/maps.dart';
-import '../game/models.dart';
 import '../game/net.dart';
+import '../game/raft.dart';
 import '../game/save.dart';
 import '../theme.dart';
 import 'game_screen.dart';
@@ -25,9 +25,7 @@ class _HotspotScreenState extends State<HotspotScreen> {
   MapDef _map = GameMaps.all.first;
 
   // match settings (host picks)
-  int _buildLimit = 10;
   double _startHp = 100;
-  double _wind = 0.5;
 
   @override
   void initState() {
@@ -61,9 +59,7 @@ class _HotspotScreenState extends State<HotspotScreen> {
     if (msg['t'] == 'start' && !_net.isHost) {
       final settings = MatchSettings(
         map: GameMaps.byId(msg['map']),
-        buildLimit: msg['build'],
         startHp: (msg['hp'] as num).toDouble(),
-        windStrength: (msg['wind'] as num).toDouble(),
         turnSeconds: 30,
       );
       _startGame(settings, seed: msg['seed']);
@@ -85,7 +81,8 @@ class _HotspotScreenState extends State<HotspotScreen> {
     if (ip.isEmpty) return;
     setState(() { _busy = true; _status = 'Connecting…'; });
     AudioService.instance.sfx('click');
-    final ok = await _net.join(ip);
+    await _net.join(ip);
+    // Success or failure both surface through _net.status.
     setState(() { _busy = false; _status = _net.status; });
   }
 
@@ -94,20 +91,26 @@ class _HotspotScreenState extends State<HotspotScreen> {
     _net.send({
       't': 'start',
       'map': _map.id,
-      'build': _buildLimit,
       'hp': _startHp,
-      'wind': _wind,
       'seed': seed,
     });
-    final settings = MatchSettings(map: _map, buildLimit: _buildLimit, startHp: _startHp, windStrength: _wind, turnSeconds: 30);
+    final settings = MatchSettings(map: _map, startHp: _startHp, turnSeconds: 30);
     _startGame(settings, seed: seed);
   }
 
   void _startGame(MatchSettings settings, {required int seed}) {
     final save = SaveService.instance.data;
     final players = [
-      PlayerConfig(name: 'HOST', colorIndex: save.colorIndex, hatIndex: save.hatIndex, netId: 0),
-      PlayerConfig(name: 'GUEST', colorIndex: 1, hatIndex: 3, netId: 1),
+      PlayerConfig(
+        name: 'HOST',
+        loadout: save.raftLoadout,
+        netId: 0,
+      ),
+      PlayerConfig(
+        name: 'GUEST',
+        loadout: RaftLoadout.custom(hullId: 'log', sizeId: 'medium', colorIndex: 1),
+        netId: 1,
+      ),
     ];
     final controller = GameController(
       settings: settings,

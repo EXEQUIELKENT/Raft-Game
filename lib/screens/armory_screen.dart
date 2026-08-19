@@ -45,10 +45,10 @@ class ArmoryScreen extends StatelessWidget {
                                 const SizedBox(height: 6),
                                 Row(
                                   children: [
-                                    _stat('DMG', w.damage / 60, RT.red),
-                                    _stat('SPD', w.speed / 1.4, RT.blue),
-                                    _stat('KB', w.knockback / 3.2, RT.orange),
-                                    _stat('BLD', w.structDamage / 2.6, RT.purple),
+                                    _stat('DMG', w.damage / 80, RT.red),
+                                    _stat('SPD', w.speed / 1.2, RT.blue),
+                                    _stat('SPLASH', w.splash / 140, RT.orange),
+                                    _stat('AMMO', w.infinite ? 1.0 : w.startAmmo / 3, RT.purple),
                                   ],
                                 ),
                               ],

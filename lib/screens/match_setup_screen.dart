@@ -1,12 +1,15 @@
 import 'package:flutter/material.dart';
 import '../game/ai.dart';
 import '../game/audio.dart';
+import '../game/battle.dart';
 import '../game/maps.dart';
+import '../game/raft.dart';
 import '../game/save.dart';
 import '../game/models.dart';
 import '../theme.dart';
 import 'game_screen.dart';
 import '../game/controller.dart';
+import 'raft_preview.dart';
 
 /// Match setup for vs-AI and local modes
 class MatchSetupScreen extends StatefulWidget {
@@ -19,12 +22,19 @@ class MatchSetupScreen extends StatefulWidget {
 
 class _MatchSetupScreenState extends State<MatchSetupScreen> {
   MapDef _map = GameMaps.all.first;
-  int _buildLimit = 10;
   double _startHp = 100;
   double _turnSeconds = 30;
-  double _wind = 0.5;
   int _aiLevel = 1; // 0 easy 1 normal 2 hard 3 expert
-  Set<String> _weapons = Weapons.all.map((w) => w.id).toSet();
+  final Set<String> _weapons = Weapons.all.map((w) => w.id).toSet();
+
+  // Per-seat raft customization. Seat 0 is the local player in both modes;
+  // seat 1 is the second local player (unused when playing against AI).
+  final List<String> _hullIds = ['tube', 'log'];
+  final List<String> _sizeIds = ['medium', 'medium'];
+  final List<int> _raftColors = [0, 1];
+
+  /// Which seat the raft pickers currently edit.
+  int _editingSeat = 0;
 
   static const _aiNames = ['Easy Pete', 'Normal Nora', 'Hard Hank', 'Expert Eva'];
 
@@ -44,11 +54,11 @@ class _MatchSetupScreenState extends State<MatchSetupScreen> {
                   padding: const EdgeInsets.all(14),
                   child: Column(
                     children: [
-                      _section('MAP', _mapPicker(save)),
-                      _section('BUILD PIECES', _buildPicker()),
+                      _section('WATERS', _mapPicker(save)),
+                      if (!isAi) _section('EDITING RAFT', _seatPicker()),
+                      _section(isAi ? 'YOUR RAFT' : 'RAFT ${_editingSeat + 1}', _raftPicker()),
                       _section('STARTING HEALTH', _hpPicker()),
                       _section('TURN TIMER', _turnPicker()),
-                      _section('WIND', _windPicker()),
                       if (isAi) _section('AI DIFFICULTY', _aiPicker()),
                       _section('WEAPONS', _weaponPicker(save)),
                       const SizedBox(height: 20),
@@ -169,12 +179,82 @@ class _MatchSetupScreenState extends State<MatchSetupScreen> {
     );
   }
 
-  Widget _buildPicker() {
+  Widget _seatPicker() {
     return Row(
-      mainAxisAlignment: MainAxisAlignment.spaceEvenly,
       children: [
-        for (final (label, val) in [('QUICK', 5), ('STRATEGIC', 10), ('ADVANCED', 15), ('NONE', 0)])
-          _chip(label, _buildLimit == val, () => setState(() => _buildLimit = val)),
+        for (int i = 0; i < 2; i++) ...[
+          _chip('PLAYER ${i + 1}', _editingSeat == i, () => setState(() => _editingSeat = i)),
+          const SizedBox(width: 8),
+        ],
+      ],
+    );
+  }
+
+  /// Raft hull / size / colour pickers for the seat currently being edited.
+  Widget _raftPicker() {
+    final seat = _editingSeat;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        RaftPreview(
+          loadout: RaftLoadout.custom(
+            hullId: _hullIds[seat],
+            sizeId: _sizeIds[seat],
+            colorIndex: _raftColors[seat],
+          ),
+        ),
+        const SizedBox(height: 10),
+        Text('DESIGN', style: RT.body(size: 10, color: RT.ink.withOpacity(0.6), weight: FontWeight.w800, letterSpacing: 1.4)),
+        const SizedBox(height: 6),
+        Wrap(
+          spacing: 8,
+          runSpacing: 8,
+          children: [
+            for (final h in RaftHull.all)
+              _chip(h.name.toUpperCase(), _hullIds[seat] == h.id,
+                  () => setState(() => _hullIds[seat] = h.id)),
+          ],
+        ),
+        const SizedBox(height: 12),
+        Text('SIZE', style: RT.body(size: 10, color: RT.ink.withOpacity(0.6), weight: FontWeight.w800, letterSpacing: 1.4)),
+        const SizedBox(height: 6),
+        Row(
+          children: [
+            for (final s in RaftSize.all) ...[
+              _chip('${s.name.toUpperCase()} · ${s.crewCapacity} CREW', _sizeIds[seat] == s.id,
+                  () => setState(() => _sizeIds[seat] = s.id)),
+              const SizedBox(width: 8),
+            ],
+          ],
+        ),
+        const SizedBox(height: 12),
+        Text('COLOUR', style: RT.body(size: 10, color: RT.ink.withOpacity(0.6), weight: FontWeight.w800, letterSpacing: 1.4)),
+        const SizedBox(height: 6),
+        Wrap(
+          spacing: 8,
+          runSpacing: 8,
+          children: [
+            for (int c = 0; c < raftColors.length; c++)
+              GestureDetector(
+                onTap: () {
+                  AudioService.instance.sfx('click');
+                  setState(() => _raftColors[seat] = c);
+                },
+                child: Container(
+                  width: 34,
+                  height: 34,
+                  decoration: BoxDecoration(
+                    color: raftColorAt(c),
+                    shape: BoxShape.circle,
+                    border: Border.all(
+                      color: _raftColors[seat] == c ? RT.ink : Colors.transparent,
+                      width: 3,
+                    ),
+                  ),
+                ),
+              ),
+          ],
+        ),
       ],
     );
   }
@@ -195,16 +275,6 @@ class _MatchSetupScreenState extends State<MatchSetupScreen> {
       children: [
         for (final v in [15.0, 30.0, 45.0, 60.0])
           _chip('${v.round()}s', _turnSeconds == v, () => setState(() => _turnSeconds = v)),
-      ],
-    );
-  }
-
-  Widget _windPicker() {
-    return Row(
-      mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-      children: [
-        for (final (label, v) in [('CALM', 0.0), ('BREEZY', 0.35), ('WINDY', 0.65), ('STORM', 1.0)])
-          _chip(label, _wind == v, () => setState(() => _wind = v)),
       ],
     );
   }
@@ -279,31 +349,50 @@ class _MatchSetupScreenState extends State<MatchSetupScreen> {
 
   void _start() {
     AudioService.instance.sfx('fire');
+    final save = SaveService.instance.data;
+    // Campaign upgrades pay off everywhere, not just in campaign battles —
+    // same principle as XP-unlocked weapons not being campaign-exclusive.
+    // Local 2P is hot-seat on one shared account, so both seats get it;
+    // vs-AI only the human side does.
+    final localBoth = widget.mode == 'local';
     final settings = MatchSettings(
       map: _map,
-      buildLimit: _buildLimit,
       startHp: _startHp,
       turnSeconds: _turnSeconds,
-      windStrength: _wind,
       enabledWeapons: _weapons.toList(),
+      startHpPerPlayer: [
+        _startHp + save.bonusHp,
+        localBoth ? _startHp + save.bonusHp : _startHp,
+      ],
+      ammo: save.battleAmmo(),
     );
-    final save = SaveService.instance.data;
+
+    RaftLoadout seatLoadout(int seat) => RaftLoadout.custom(
+          hullId: _hullIds[seat],
+          sizeId: _sizeIds[seat],
+          colorIndex: _raftColors[seat],
+        );
+
     final List<PlayerConfig> players;
     if (widget.mode == 'ai') {
       players = [
-        PlayerConfig(name: 'YOU', colorIndex: save.colorIndex, hatIndex: save.hatIndex),
+        PlayerConfig(
+          name: 'YOU',
+          loadout: seatLoadout(0),
+          powerMultiplier: save.powerMultiplier,
+        ),
         PlayerConfig(
           name: _aiNames[_aiLevel],
-          colorIndex: 1,
-          hatIndex: 3,
+          loadout: RaftLoadout.custom(hullId: 'log', sizeId: 'medium', colorIndex: 7),
+          look: CrewLook.pirate,
           isAi: true,
           aiDifficulty: AiDifficulty.values[_aiLevel],
         ),
       ];
     } else {
       players = [
-        PlayerConfig(name: 'PLAYER 1', colorIndex: 0, hatIndex: save.hatIndex),
-        PlayerConfig(name: 'PLAYER 2', colorIndex: 1, hatIndex: 3),
+        PlayerConfig(name: 'PLAYER 1', loadout: seatLoadout(0), powerMultiplier: save.powerMultiplier),
+        PlayerConfig(name: 'PLAYER 2', loadout: seatLoadout(1), powerMultiplier: save.powerMultiplier),
       ];
     }
     Navigator.pushReplacement(

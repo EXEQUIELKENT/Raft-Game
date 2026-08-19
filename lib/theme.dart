@@ -1,52 +1,58 @@
 import 'dart:math';
 import 'package:flutter/material.dart';
+import 'package:google_fonts/google_fonts.dart';
 
-/// Raft Rumble theme — Style 2: Vibrant Comic / Candy
+/// Raft Rumble theme — "Raft Duel": pirate/nautical, sky-to-sea gradients,
+/// borderless chunky buttons with a color-matched drop shadow, frosted
+/// white pill chips for HUD readouts. Ported from the Claude Design mockup.
 class RT {
   RT._();
 
   // Core palette
-  static const Color ink = Color(0xFF2B1B3D);        // thick outline color
-  static const Color sky1 = Color(0xFFFF9D5C);       // sunset orange
-  static const Color sky2 = Color(0xFFFF5E8A);       // pink
-  static const Color sky3 = Color(0xFF7B4FB3);       // purple
-  static const Color sea1 = Color(0xFF3EC6E0);       // candy teal
-  static const Color sea2 = Color(0xFF1B7FB8);       // deep blue
-  static const Color sand = Color(0xFFFFE3A3);
+  static const Color ink = Color(0xFF16323F);         // navy-teal text/outline
+  static const Color sky1 = Color(0xFF77BFE3);         // horizon sky blue
+  static const Color sky2 = Color(0xFFC6E6F3);         // pale sky/cloud blue
+  static const Color sky3 = Color(0xFFE7D9A0);         // sand highlight
+  static const Color sea1 = Color(0xFF2C8B99);         // mid sea teal
+  static const Color sea2 = Color(0xFF175F6B);         // deep sea teal
+  static const Color sand = Color(0xFFE0D193);
   static const Color cream = Color(0xFFFFF6E8);
-  static const Color red = Color(0xFFFF4757);
-  static const Color orange = Color(0xFFFF8C1A);
-  static const Color yellow = Color(0xFFFFD32A);
-  static const Color green = Color(0xFF2ED573);
-  static const Color blue = Color(0xFF3B9CFF);
-  static const Color purple = Color(0xFF9B59D0);
-  static const Color pink = Color(0xFFFF6BC1);
+  static const Color red = Color(0xFFE0574F);
+  static const Color orange = Color(0xFFFF6B4A);       // primary accent / CTA
+  static const Color yellow = Color(0xFFFFD34D);       // gold / coins
+  static const Color coin = yellow;
+  static const Color green = Color(0xFF4EC06A);
+  static const Color blue = Color(0xFF3F7FC9);
+  static const Color purple = Color(0xFF8A5FB0);
+  static const Color pink = Color(0xFFC05A86);
 
-  // Player colors
+  // Player colors — kept distinct/vivid for gameplay legibility.
   static const List<Color> playerColors = [
-    Color(0xFFFF4757), // red
-    Color(0xFF3B9CFF), // blue
-    Color(0xFF2ED573), // green
+    Color(0xFFE0574F), // red
+    Color(0xFF3F7FC9), // blue
+    Color(0xFF4EC06A), // green
     Color(0xFFFFB020), // amber
   ];
 
   static const List<Color> playerDark = [
-    Color(0xFFC02836),
-    Color(0xFF2270C9),
-    Color(0xFF1DA452),
+    Color(0xFFA83A34),
+    Color(0xFF2A5A94),
+    Color(0xFF34903F),
     Color(0xFFCC8400),
   ];
 
-  /// Chunky comic text style with outline-ish shadow
+  /// Chunky display text (Baloo 2) — used for titles, buttons, HUD numbers.
+  /// [outline] draws an 8-direction ink outline for text sitting directly on
+  /// a gradient/photo background; leave it at 0 for text already inside a
+  /// white/colored card, where a simple soft shadow reads better.
   static TextStyle chunky({
     double size = 20,
     Color color = Colors.white,
     double outline = 0,
-    FontWeight weight = FontWeight.w900,
-    double letterSpacing = 1.2,
+    FontWeight weight = FontWeight.w800,
+    double letterSpacing = 0.2,
   }) {
-    return TextStyle(
-      fontFamily: 'RaftRumble',
+    return GoogleFonts.baloo2(
       fontSize: size,
       fontWeight: weight,
       color: color,
@@ -63,39 +69,74 @@ class RT {
               Shadow(color: ink, offset: Offset(-outline, outline)),
               Shadow(color: ink, offset: Offset(outline, -outline)),
             ]
-          : const [
-              Shadow(color: Color(0x55000000), offset: Offset(0, 3), blurRadius: 0),
+          : [
+              Shadow(color: ink.withOpacity(0.22), offset: const Offset(0, 3)),
             ],
     );
   }
 
-  /// Sunset gradient used across menus
+  /// Rounder, lighter-weight body text (Nunito) — subtitles, descriptions,
+  /// stat labels, anything secondary to a [chunky] headline.
+  static TextStyle body({
+    double size = 13,
+    Color color = ink,
+    FontWeight weight = FontWeight.w700,
+    double letterSpacing = 0.2,
+  }) {
+    return GoogleFonts.nunito(
+      fontSize: size,
+      fontWeight: weight,
+      color: color,
+      letterSpacing: letterSpacing,
+      height: 1.3,
+    );
+  }
+
+  /// Tropical hero gradient: sky blue -> pale sky -> sand -> sea teal.
+  /// Kept as `RT.sunset` so every existing `gradient: RT.sunset` reference
+  /// picks up the new look without touching each call site.
   static const LinearGradient sunset = LinearGradient(
     begin: Alignment.topCenter,
     end: Alignment.bottomCenter,
-    colors: [sky1, sky2, sky3],
+    stops: [0.0, 0.42, 0.58, 1.0],
+    colors: [sky1, sky2, sky3, sea1],
   );
 
-  /// Ocean gradient
+  /// Deep-water gradient for battle/ocean-heavy screens.
   static const LinearGradient ocean = LinearGradient(
     begin: Alignment.topCenter,
     end: Alignment.bottomCenter,
     colors: [sea1, sea2],
   );
 
-  static BoxDecoration card({Color color = cream, double radius = 20, double border = 4}) {
+  static BoxDecoration card({Color color = cream, double radius = 20, double border = 2.5}) {
     return BoxDecoration(
       color: color,
       borderRadius: BorderRadius.circular(radius),
-      border: Border.all(color: ink, width: border),
+      border: border > 0 ? Border.all(color: ink.withOpacity(0.14), width: border) : null,
       boxShadow: const [
-        BoxShadow(color: Color(0x55000000), offset: Offset(0, 5), blurRadius: 0),
+        BoxShadow(color: Color(0x33000000), offset: Offset(0, 5), blurRadius: 0),
+      ],
+    );
+  }
+
+  /// Frosted translucent-white pill, for HUD chips floating over the world
+  /// canvas (health readouts, wind, status messages) — mirrors the
+  /// mockup's `rgba(255,255,255,.8)` chip style.
+  static BoxDecoration pill({Color color = Colors.white, double opacity = 0.85, double radius = 16}) {
+    return BoxDecoration(
+      color: color.withOpacity(opacity),
+      borderRadius: BorderRadius.circular(radius),
+      boxShadow: const [
+        BoxShadow(color: Color(0x2A000000), offset: Offset(0, 3), blurRadius: 6),
       ],
     );
   }
 }
 
-/// Chunky cartoon button with press animation + haptic + click sound
+/// Chunky cartoon button with press animation + haptic + click sound.
+/// Borderless, solid-fill, with a color-matched offset drop shadow —
+/// matches the mockup's flatter chunky-button style.
 class ChunkyButton extends StatefulWidget {
   final String label;
   final IconData? icon;
@@ -127,7 +168,7 @@ class _ChunkyButtonState extends State<ChunkyButton> {
 
   Color _darken(Color c) {
     final hsl = HSLColor.fromColor(c);
-    return hsl.withLightness(max(0.0, hsl.lightness - 0.14)).toColor();
+    return hsl.withLightness(max(0.0, hsl.lightness - 0.16)).toColor();
   }
 
   @override
@@ -147,11 +188,10 @@ class _ChunkyButtonState extends State<ChunkyButton> {
         duration: const Duration(milliseconds: 80),
         width: widget.width,
         height: widget.height,
-        transform: Matrix4.translationValues(0, _down ? 5 : 0, 0),
+        transform: Matrix4.translationValues(0, _down ? 6 : 0, 0),
         decoration: BoxDecoration(
           color: base,
-          borderRadius: BorderRadius.circular(18),
-          border: Border.all(color: RT.ink, width: 4),
+          borderRadius: BorderRadius.circular(20),
           boxShadow: _down
               ? [BoxShadow(color: _darken(base), offset: const Offset(0, 2))]
               : [BoxShadow(color: _darken(base), offset: const Offset(0, 7))],
@@ -167,7 +207,7 @@ class _ChunkyButtonState extends State<ChunkyButton> {
               child: Text(
                 widget.label,
                 overflow: TextOverflow.ellipsis,
-                style: RT.chunky(size: widget.fontSize, color: widget.textColor ?? Colors.white, outline: 2),
+                style: RT.chunky(size: widget.fontSize, color: widget.textColor ?? Colors.white),
               ),
             ),
           ],
@@ -177,7 +217,7 @@ class _ChunkyButtonState extends State<ChunkyButton> {
   }
 }
 
-/// Comic starburst painter for explosions / logos
+/// Comic starburst painter for explosions / logos.
 class StarburstPainter extends CustomPainter {
   final Color color;
   final int points;

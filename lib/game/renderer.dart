@@ -1,674 +1,649 @@
 import 'dart:math';
 import 'dart:ui';
-import 'package:flutter/material.dart' hide MaterialType;
+
+import 'package:flutter/material.dart';
+
 import '../theme.dart';
+import 'battle.dart';
 import 'maps.dart';
-import 'physics.dart';
 
-/// Renders the game world in vibrant comic style with thick outlines.
+/// ---------------------------------------------------------------------------
+/// Scene renderer, drawn in the flat-vector style of the Claude Design mockup:
+/// a sky-to-sand-to-sea gradient, drifting clouds, a few horizon props, and
+/// big-headed crew sitting on their rafts.
+///
+/// The world is [BattleConst.worldW] x [BattleConst.worldH] in design units.
+/// The canvas is scaled so the full world height always fits the screen, and
+/// panned horizontally by the camera — which is why the visible width varies
+/// with device aspect and is fed back into the world as `viewWidth`.
+/// ---------------------------------------------------------------------------
 class WorldRenderer {
-  final PhysicsWorld world;
+  final BattleWorld world;
   final MapDef map;
-  final List<Color> charColors;
-  final List<int> charHats;
-  /// 0 = low, 1 = medium, 2 = high. Drives glow/blur effects and particle
-  /// density so the GRAPHICS QUALITY setting has a visible, and
-  /// performance-relevant, effect.
-  final int quality;
 
-  WorldRenderer(this.world, {required this.map, required this.charColors, required this.charHats, this.quality = 1});
+  /// Decoration positions, generated once per world from its seed so props
+  /// don't twitch between frames.
+  final List<_Prop> _props = [];
+  final List<_Cloud> _clouds = [];
+  bool _decorBuilt = false;
 
-  bool get _lowQuality => quality <= 0;
-  bool get _highQuality => quality >= 2;
+  WorldRenderer(this.world, {required this.map});
 
-  // The sky is a screen-space gradient painted behind the canvas (see
-  // GameScreen), so it always fills the viewport regardless of camera
-  // position — no world-space margin needed there. The ground/water plane
-  // below the waterline, however, IS drawn in world space, so it must
-  // extend far enough that GameController's camera clamp (which allows the
-  // camera up to ~480px beyond the world bounds) can never zoom out past
-  // it and reveal a hard rectangular edge. This margin is deliberately much
-  // larger than that clamp to cover any aspect ratio/zoom combination.
-  static const double _groundMargin = 2200;
-  static const double _foregroundMargin = 1100;
+  void render(Canvas canvas, Size size, double time) {
+    final scale = size.height / BattleConst.worldH;
+    world.viewWidth = size.width / scale;
+    if (!_decorBuilt) _buildDecor();
 
-  void render(Canvas canvas, Size viewSize, Offset camPos, double camZoom, double time) {
     canvas.save();
-    // screen shake
-    final shake = world.screenShake;
-    if (shake > 0) {
-      final r = Random((time * 1000).toInt() % 1000);
-      canvas.translate((r.nextDouble() - 0.5) * shake, (r.nextDouble() - 0.5) * shake);
-    }
-    // camera transform
-    canvas.translate(viewSize.width / 2, viewSize.height / 2);
-    canvas.scale(camZoom);
-    canvas.translate(-camPos.dx, -camPos.dy);
+    canvas.scale(scale);
+    canvas.translate(-world.cam, 0);
 
-    _drawBackground(canvas, time);
-    _drawHazards(canvas, time);
+    _drawSky(canvas, time);
+    _drawClouds(canvas, time);
+    _drawProps(canvas, time);
+    _drawWater(canvas, time);
+    _drawRafts(canvas, time);
+    _drawShot(canvas);
+    _drawEffects(canvas);
 
-    // bodies: statics first, then blocks, characters, debris on top
-    final sorted = [...world.bodies]..sort((a, b) {
-        int rank(PhysBody x) => x.isStatic
-            ? 0
-            : x.type == BodyType.block
-                ? 1
-                : x.type == BodyType.character
-                    ? 2
-                    : 1;
-        return rank(a).compareTo(rank(b));
-      });
-    for (final b in sorted) {
-      if (b.dead) continue;
-      switch (b.type) {
-        case BodyType.block:
-          _drawBlock(canvas, b, time);
-          break;
-        case BodyType.character:
-          _drawCharacter(canvas, b, time);
-          break;
-        case BodyType.debris:
-          _drawDebris(canvas, b);
-          break;
-        case BodyType.projectile:
-          break;
-      }
-    }
-
-    _drawEdgeForeground(canvas, time);
-
-    // projectiles
-    for (final p in world.projectiles) {
-      _drawProjectile(canvas, p, time);
-    }
-
-    // particles
-    for (int i = 0; i < world.particles.length; i++) {
-      // On low quality, skip every other particle to cut fill-rate/overdraw.
-      if (_lowQuality && i.isOdd) continue;
-      final pt = world.particles[i];
-      final t = (pt.life / pt.maxLife).clamp(0.0, 1.0);
-      final paint = Paint()..color = pt.color.withOpacity(t);
-      if (pt.glow && !_lowQuality) {
-        paint.maskFilter = MaskFilter.blur(BlurStyle.normal, _highQuality ? 6 : 4);
-      }
-      canvas.drawCircle(pt.pos, pt.size * t, paint);
-    }
-
-    canvas.restore();
-
-    // floating texts drawn in world space but after restore of shake? keep in world
-    canvas.save();
-    canvas.translate(viewSize.width / 2, viewSize.height / 2);
-    canvas.scale(camZoom);
-    canvas.translate(-camPos.dx, -camPos.dy);
-    for (final t in world.texts) {
-      final alpha = (t.life / 1.2).clamp(0.0, 1.0);
-      final tp = TextPainter(
-        text: TextSpan(
-          text: t.text,
-          style: RT.chunky(size: t.size, color: t.color.withOpacity(alpha), outline: 2.5),
-        ),
-        textDirection: TextDirection.ltr,
-      )..layout();
-      tp.paint(canvas, t.pos - Offset(tp.width / 2, tp.height / 2));
-    }
     canvas.restore();
   }
 
-  // -------------------------------------------------------------------------
+  // ---------------------------------------------------------------------------
+  // Decoration
+  // ---------------------------------------------------------------------------
 
-  void _drawBackground(Canvas canvas, double time) {
-    // sky
-    final skyRect = Rect.fromLTWH(-400, -600, world.width + 800, world.waterLevel + 600);
-    canvas.drawRect(skyRect, Paint()..color = const Color(0x00000000));
-    // (gradient painted by widget behind canvas — here just sun + clouds)
-    // sun
-    final sunPos = Offset(world.width * 0.78, 110);
-    canvas.drawCircle(
-        sunPos, 55, Paint()..color = const Color(0xFFFFF3B0));
-    if (_lowQuality) {
-      canvas.drawCircle(sunPos, 44, Paint()..color = const Color(0xFFFFD32A));
-    } else {
-      canvas.drawCircle(
-          sunPos,
-          44,
-          Paint()
-            ..color = const Color(0xFFFFD32A)
-            ..maskFilter = MaskFilter.blur(BlurStyle.normal, _highQuality ? 14 : 10));
-    }
-    // clouds (ashy grey over the volcano, fluffy white everywhere else)
-    final cloudColor = map.terrain == 'lava' ? const Color(0xFF8A828C) : Colors.white;
-    final cloudPaint = Paint()..color = cloudColor.withOpacity(0.85);
-    for (int i = 0; i < 4; i++) {
-      final cx = (i * 380 + (time * 12) % (world.width + 400)) - 100;
-      final cy = 70.0 + (i % 3) * 55;
-      _cloud(canvas, Offset(cx.toDouble(), cy), cloudPaint, 0.8 + (i % 2) * 0.3);
-    }
+  void _buildDecor() {
+    _decorBuilt = true;
+    final rng = world.rng;
+    // Keep props clear of the player raft and the enemy slots so nothing ever
+    // draws on top of a crew member.
+    final reserved = <double>[BattleConst.playerX, ...BattleConst.enemySlots];
+    bool clear(double x) => reserved.every((r) => (x - r).abs() > 130);
 
-    switch (map.terrain) {
-      case 'sand':
-        _drawDesertGround(canvas);
-        break;
-      case 'lava':
-        _drawLavaGround(canvas);
-        break;
-      default:
-        _drawOceanGround(canvas);
-    }
-  }
-
-  void _drawOceanGround(Canvas canvas) {
-    // distant islands silhouettes
-    final islPaint = Paint()..color = const Color(0xFF6B3FA0).withOpacity(0.35);
-    canvas.drawOval(Rect.fromCenter(center: Offset(world.width * 0.2, world.waterLevel - 4), width: 260, height: 60), islPaint);
-    canvas.drawOval(Rect.fromCenter(center: Offset(world.width * 0.72, world.waterLevel - 2), width: 340, height: 76), islPaint);
-
-    // water body
-    final waterRect = Rect.fromLTWH(-_groundMargin, world.waterLevel, world.width + _groundMargin * 2,
-        world.height - world.waterLevel + _groundMargin);
-    canvas.drawRect(
-        waterRect,
-        Paint()
-          ..shader = const LinearGradient(
-            begin: Alignment.topCenter,
-            end: Alignment.bottomCenter,
-            colors: [Color(0xFF3EC6E0), Color(0xFF1B5F9E)],
-          ).createShader(waterRect));
-  }
-
-  void _drawDesertGround(Canvas canvas) {
-    // distant dune silhouettes
-    final dunePaint = Paint()..color = const Color(0xFFCB8A3E).withOpacity(0.4);
-    canvas.drawOval(Rect.fromCenter(center: Offset(world.width * 0.2, world.waterLevel + 6), width: 300, height: 70), dunePaint);
-    canvas.drawOval(Rect.fromCenter(center: Offset(world.width * 0.72, world.waterLevel + 10), width: 360, height: 84), dunePaint);
-
-    // sand stretching to the horizon
-    final groundRect = Rect.fromLTWH(-_groundMargin, world.waterLevel, world.width + _groundMargin * 2,
-        world.height - world.waterLevel + _groundMargin);
-    canvas.drawRect(
-        groundRect,
-        Paint()
-          ..shader = const LinearGradient(
-            begin: Alignment.topCenter,
-            end: Alignment.bottomCenter,
-            colors: [Color(0xFFF2C879), Color(0xFFC17A34)],
-          ).createShader(groundRect));
-  }
-
-  void _drawLavaGround(Canvas canvas) {
-    // distant volcanic ridge silhouettes
-    final ridgePaint = Paint()..color = const Color(0xFF2B141E).withOpacity(0.55);
-    canvas.drawOval(Rect.fromCenter(center: Offset(world.width * 0.18, world.waterLevel - 6), width: 280, height: 64), ridgePaint);
-    canvas.drawOval(Rect.fromCenter(center: Offset(world.width * 0.76, world.waterLevel - 2), width: 320, height: 72), ridgePaint);
-
-    // molten lava sea
-    final lavaRect = Rect.fromLTWH(-_groundMargin, world.waterLevel, world.width + _groundMargin * 2,
-        world.height - world.waterLevel + _groundMargin);
-    canvas.drawRect(
-        lavaRect,
-        Paint()
-          ..shader = const LinearGradient(
-            begin: Alignment.topCenter,
-            end: Alignment.bottomCenter,
-            colors: [Color(0xFFFF8A3D), Color(0xFF7A1414)],
-          ).createShader(lavaRect));
-  }
-
-  void _drawEdgeForeground(Canvas canvas, double time) {
-    switch (map.terrain) {
-      case 'sand':
-        _drawDesertForeground(canvas, time);
-        break;
-      case 'lava':
-        _drawLavaForeground(canvas, time);
-        break;
-      default:
-        _drawOceanForeground(canvas, time);
-    }
-  }
-
-  void _drawOceanForeground(Canvas canvas, double time) {
-    // animated wave line
-    final path = Path();
-    final paint = Paint()..color = Colors.white.withOpacity(0.5);
-    path.moveTo(-_foregroundMargin, world.waterLevel);
-    for (double x = -_foregroundMargin; x <= world.width + _foregroundMargin; x += 16) {
-      final y = world.waterLevel + sin(x / 40 + time * 2.2) * 5 + sin(x / 17 - time * 3.1) * 2.5;
-      path.lineTo(x, y);
-    }
-    path.lineTo(world.width + _foregroundMargin, world.waterLevel + 26);
-    path.lineTo(-_foregroundMargin, world.waterLevel + 26);
-    path.close();
-    canvas.drawPath(path, paint..color = const Color(0xFF9FE4F5).withOpacity(0.85));
-  }
-
-  void _drawDesertForeground(Canvas canvas, double time) {
-    // loose sand crest — slower, gentler undulation than water, no foam
-    final path = Path();
-    final paint = Paint()..color = const Color(0xFFE8C07D).withOpacity(0.8);
-    path.moveTo(-_foregroundMargin, world.waterLevel);
-    for (double x = -_foregroundMargin; x <= world.width + _foregroundMargin; x += 16) {
-      final y = world.waterLevel + sin(x / 70 + time * 0.6) * 3;
-      path.lineTo(x, y);
-    }
-    path.lineTo(world.width + _foregroundMargin, world.waterLevel + 26);
-    path.lineTo(-_foregroundMargin, world.waterLevel + 26);
-    path.close();
-    canvas.drawPath(path, paint);
-  }
-
-  void _drawLavaForeground(Canvas canvas, double time) {
-    // bubbling, glowing lava crest
-    final path = Path();
-    final glow = 0.7 + sin(time * 3.5) * 0.15;
-    final paint = Paint()..color = const Color(0xFFFFD23D).withOpacity(glow);
-    if (!_lowQuality) {
-      paint.maskFilter = MaskFilter.blur(BlurStyle.normal, _highQuality ? 5 : 3);
-    }
-    path.moveTo(-_foregroundMargin, world.waterLevel);
-    for (double x = -_foregroundMargin; x <= world.width + _foregroundMargin; x += 14) {
-      final y = world.waterLevel + sin(x / 30 + time * 4.5) * 6 + sin(x / 13 - time * 6.0) * 3;
-      path.lineTo(x, y);
-    }
-    path.lineTo(world.width + _foregroundMargin, world.waterLevel + 26);
-    path.lineTo(-_foregroundMargin, world.waterLevel + 26);
-    path.close();
-    canvas.drawPath(path, paint);
-  }
-
-  void _cloud(Canvas canvas, Offset c, Paint paint, double s) {
-    canvas.drawCircle(c, 26 * s, paint);
-    canvas.drawCircle(c + Offset(28 * s, 6 * s), 20 * s, paint);
-    canvas.drawCircle(c - Offset(28 * s, 8 * s), 18 * s, paint);
-    canvas.drawRect(Rect.fromCenter(center: c + Offset(0, 12 * s), width: 76 * s, height: 22 * s), paint);
-  }
-
-  void _drawHazards(Canvas canvas, double time) {
-    for (final h in world.hazards) {
-      final flick = 0.75 + sin(time * 14) * 0.15;
-      final paint = Paint()..color = const Color(0xFFFF8C1A).withOpacity(0.35 * flick);
-      if (!_lowQuality) {
-        paint.maskFilter = MaskFilter.blur(BlurStyle.normal, _highQuality ? 16 : 12);
+    for (int i = 0; i < 7; i++) {
+      final kind = map.props[rng.nextInt(map.props.length)];
+      double x = 0;
+      for (int tries = 0; tries < 12; tries++) {
+        x = rng.range(280, BattleConst.worldW - 180);
+        if (clear(x)) break;
       }
-      canvas.drawCircle(h.center, h.radius * flick, paint);
+      if (!clear(x)) continue;
+      _props.add(_Prop(kind: kind, x: x, scale: rng.range(0.78, 1.25), phase: rng.range(0, pi * 2)));
+    }
+    for (int i = 0; i < 8; i++) {
+      _clouds.add(_Cloud(
+        x: rng.range(0, BattleConst.worldW),
+        y: rng.range(24, 110),
+        w: rng.range(90, 165),
+        opacity: rng.range(0.55, 0.95),
+        speed: rng.range(2.5, 7.0),
+      ));
     }
   }
 
-  // -------------------------------------------------------------------------
+  // ---------------------------------------------------------------------------
+  // Sky / water
+  // ---------------------------------------------------------------------------
 
-  void _drawBlock(Canvas canvas, PhysBody b, double time) {
-    canvas.save();
-    canvas.translate(b.pos.dx, b.pos.dy);
-    canvas.rotate(b.angle);
-    final rect = Rect.fromCenter(center: Offset.zero, width: b.size.width, height: b.size.height);
-    final spec = _matColors(b.material);
-    final frozen = b.frozenUntil > world.elapsed;
-
-    Color fill = spec.$1;
-    Color dark = spec.$2;
-    if (frozen) {
-      fill = Color.lerp(fill, const Color(0xFF7DD8FF), 0.55)!;
-      dark = Color.lerp(dark, const Color(0xFF4FA8D9), 0.55)!;
-    }
-
-    final rrect = RRect.fromRectAndRadius(rect, Radius.circular(b.isStatic ? 4 : 7));
-    // outline
-    canvas.drawRRect(rrect, Paint()..color = RT.ink);
-    canvas.drawRRect(
-      RRect.fromRectAndRadius(rect.deflate(3), Radius.circular(b.isStatic ? 2 : 5)),
-      Paint()..color = fill,
+  void _drawSky(Canvas canvas, double time) {
+    final rect = Rect.fromLTWH(world.cam - 40, 0, world.viewWidth + 80, BattleConst.waterY + 4);
+    canvas.drawRect(
+      rect,
+      Paint()
+        ..shader = LinearGradient(
+          begin: Alignment.topCenter,
+          end: Alignment.bottomCenter,
+          colors: map.sky,
+        ).createShader(rect),
     );
-    // inner shading
-    canvas.drawRRect(
-      RRect.fromRectAndRadius(Rect.fromLTWH(rect.left + 3, rect.top + 3, rect.width - 6, rect.height * 0.35), const Radius.circular(4)),
-      Paint()..color = Colors.white.withOpacity(0.28),
-    );
+  }
 
-    // material details
-    final dp = Paint()..color = dark;
-    if (b.material == MaterialType.wood || b.material == MaterialType.raft) {
-      // plank lines
-      final lines = max(1, (b.size.height / 22).floor());
-      for (int i = 1; i <= lines; i++) {
-        final y = rect.top + rect.height * i / (lines + 1);
-        canvas.drawLine(Offset(rect.left + 5, y), Offset(rect.right - 5, y), dp..strokeWidth = 2.5);
-      }
-      // nails
-      canvas.drawCircle(Offset(rect.left + 9, rect.top + 9), 2.5, dp);
-      canvas.drawCircle(Offset(rect.right - 9, rect.bottom - 9), 2.5, dp);
-    } else if (b.material == MaterialType.metal) {
-      // rivets
-      for (final p in [
-        Offset(rect.left + 8, rect.top + 8),
-        Offset(rect.right - 8, rect.top + 8),
-        Offset(rect.left + 8, rect.bottom - 8),
-        Offset(rect.right - 8, rect.bottom - 8),
-      ]) {
-        canvas.drawCircle(p, 3, dp);
-      }
-      canvas.drawLine(Offset(rect.left + 6, 0), Offset(rect.right - 6, 0), dp..strokeWidth = 2);
-    } else if (b.material == MaterialType.stone) {
-      canvas.drawCircle(Offset(rect.left + rect.width * 0.3, rect.top + rect.height * 0.35), 4, dp);
-      canvas.drawCircle(Offset(rect.left + rect.width * 0.65, rect.top + rect.height * 0.6), 3, dp);
-    } else if (b.material == MaterialType.glass) {
-      // shine streak
-      canvas.drawLine(Offset(rect.left + 8, rect.bottom - 8), Offset(rect.right - 14, rect.top + 8),
-          Paint()..color = Colors.white.withOpacity(0.7)..strokeWidth = 4);
-    }
-
-    // damage cracks — visible states 100/75/50/25
-    final frac = b.damageFrac;
-    if (frac < 0.99 && !b.isStatic) {
-      final crackPaint = Paint()
-        ..color = RT.ink.withOpacity(0.85)
-        ..strokeWidth = 2
-        ..style = PaintingStyle.stroke;
-      final rnd = Random(b.id);
-      final cracks = frac < 0.25 ? 5 : frac < 0.5 ? 3 : frac < 0.75 ? 2 : 1;
-      for (int i = 0; i < cracks; i++) {
-        final sx = rect.left + rnd.nextDouble() * rect.width;
-        final sy = rect.top + rnd.nextDouble() * rect.height;
-        final path = Path()..moveTo(sx, sy);
-        double cx = sx, cy = sy;
-        for (int sgm = 0; sgm < 3; sgm++) {
-          cx += (rnd.nextDouble() - 0.5) * rect.width * 0.4;
-          cy += rnd.nextDouble() * rect.height * 0.35;
-          path.lineTo(cx, cy);
-        }
-        canvas.drawPath(path, crackPaint);
-      }
-    }
-
-    // frozen shimmer
-    if (frozen) {
+  void _drawClouds(Canvas canvas, double time) {
+    for (final c in _clouds) {
+      // Slow horizontal drift, wrapped so clouds never run out.
+      final x = (c.x + time * c.speed) % (BattleConst.worldW + 400) - 200;
+      final paint = Paint()..color = Colors.white.withOpacity(c.opacity);
+      final h = c.w * 0.34;
       canvas.drawRRect(
-        RRect.fromRectAndRadius(rect.deflate(3), const Radius.circular(5)),
-        Paint()..color = Colors.white.withOpacity(0.25 + sin(time * 6) * 0.08),
+        RRect.fromRectAndRadius(Rect.fromLTWH(x, c.y, c.w * 0.62, h), Radius.circular(h)),
+        paint,
+      );
+      canvas.drawRRect(
+        RRect.fromRectAndRadius(
+            Rect.fromLTWH(x + c.w * 0.3, c.y - h * 0.34, c.w * 0.5, h * 0.9), Radius.circular(h)),
+        paint,
+      );
+      canvas.drawRRect(
+        RRect.fromRectAndRadius(
+            Rect.fromLTWH(x + c.w * 0.6, c.y - h * 0.1, c.w * 0.42, h * 0.75), Radius.circular(h)),
+        paint,
       );
     }
-
-    canvas.restore();
   }
 
-  (Color, Color) _matColors(MaterialType m) {
-    switch (m) {
-      case MaterialType.wood: return (const Color(0xFFB5793B), const Color(0xFF8A5726));
-      case MaterialType.stone: return (const Color(0xFF9AA5B1), const Color(0xFF6E7987));
-      case MaterialType.metal: return (const Color(0xFF7FB3D9), const Color(0xFF527E9E));
-      case MaterialType.glass: return (const Color(0xFFBFECFF), const Color(0xFF8CC6E8));
-      case MaterialType.raft: return (const Color(0xFF9C6B30), const Color(0xFF6E4A1E));
-      default: return (const Color(0xFFB5793B), const Color(0xFF8A5726));
+  void _drawWater(Canvas canvas, double time) {
+    final top = BattleConst.waterY;
+    final rect = Rect.fromLTWH(world.cam - 40, top, world.viewWidth + 80, BattleConst.worldH - top);
+    canvas.drawRect(
+      rect,
+      Paint()
+        ..shader = LinearGradient(
+          begin: Alignment.topCenter,
+          end: Alignment.bottomCenter,
+          colors: [map.water, map.waterDeep],
+        ).createShader(rect),
+    );
+
+    // Two offset wave lines along the surface for a bit of motion.
+    for (int layer = 0; layer < 2; layer++) {
+      final path = Path();
+      final amp = (layer == 0 ? 3.4 : 2.2) * map.chop;
+      final yBase = top + (layer == 0 ? 2.0 : 9.0);
+      final speed = layer == 0 ? 34.0 : -22.0;
+      final startX = world.cam - 40;
+      path.moveTo(startX, yBase);
+      for (double x = startX; x <= startX + world.viewWidth + 80; x += 14) {
+        final y = yBase + sin((x + time * speed) / 46 + layer) * amp;
+        path.lineTo(x, y);
+      }
+      path.lineTo(startX + world.viewWidth + 80, top + 26);
+      path.lineTo(startX, top + 26);
+      path.close();
+      canvas.drawPath(path, Paint()..color = Colors.white.withOpacity(layer == 0 ? 0.22 : 0.12));
     }
   }
 
-  // -------------------------------------------------------------------------
-
-  static const List<BodyPart> _limbDrawOrder = [
-    BodyPart.lowerLegL, BodyPart.upperLegL,
-    BodyPart.lowerLegR, BodyPart.upperLegR,
-    BodyPart.torso,
-    BodyPart.upperArmL, BodyPart.lowerArmL,
-    BodyPart.upperArmR, BodyPart.lowerArmR,
-  ];
-
-  void _drawCharacter(Canvas canvas, PhysBody b, double time) {
-    final idx = b.playerIndex.clamp(0, charColors.length - 1);
-    final color = charColors[idx];
-    final dark = Color.lerp(color, Colors.black, 0.3)!;
-    final limbColor = Color.lerp(color, Colors.black, 0.16)!;
-    final ragdoll = world.ragdolls[b.id];
-
-    if (ragdoll == null) {
-      // Every character gets a Ragdoll in PhysicsWorld.addCharacter; this
-      // is just a defensive fallback so a missing entry never crashes render.
-      canvas.drawCircle(b.pos, b.size.width / 2, Paint()..color = color);
-      return;
-    }
-
-    final bonesByPart = {for (final bo in ragdoll.bones) bo.part: bo};
-    final feetY = ((bonesByPart[BodyPart.lowerLegL]?.b.dy ?? b.pos.dy) +
-            (bonesByPart[BodyPart.lowerLegR]?.b.dy ?? b.pos.dy)) /
-        2;
-
-    // drop shadow at the feet
-    canvas.drawOval(
-        Rect.fromCenter(center: Offset(b.pos.dx, feetY + 4), width: b.size.width * 1.3, height: 8),
-        Paint()..color = Colors.black.withOpacity(0.18));
-
-    final outlinePaint = Paint()..color = RT.ink;
-    const skinTone = Color(0xFFFFDFC4);
-    for (final part in _limbDrawOrder) {
-      final bo = bonesByPart[part];
-      if (bo == null) continue;
-      final isTorso = part == BodyPart.torso;
-      canvas.drawLine(bo.a, bo.b,
-          Paint()..color = RT.ink..strokeWidth = bo.width..strokeCap = StrokeCap.round);
-      canvas.drawLine(bo.a, bo.b,
-          Paint()
-            ..color = isTorso ? color : limbColor
-            ..strokeWidth = max(2.0, bo.width - 3.2)
-            ..strokeCap = StrokeCap.round);
-    }
-
-    // joint blobs at the shoulders/hips/elbows/knees: smooths the seam
-    // between two bones meeting at an angle so the figure reads as a
-    // continuously-connected body rather than a set of separate sticks.
-    void jointBlob(Offset p, double w, Color fill) {
-      canvas.drawCircle(p, w / 2, outlinePaint);
-      canvas.drawCircle(p, max(1.0, w / 2 - 1.6), Paint()..color = fill);
-    }
-
-    final torsoBone = bonesByPart[BodyPart.torso];
-    final upperArmL = bonesByPart[BodyPart.upperArmL];
-    final upperArmR = bonesByPart[BodyPart.upperArmR];
-    final upperLegL = bonesByPart[BodyPart.upperLegL];
-    final upperLegR = bonesByPart[BodyPart.upperLegR];
-    if (torsoBone != null) {
-      jointBlob(torsoBone.a, torsoBone.width * 0.9, color); // shoulders/neck base
-      jointBlob(torsoBone.b, torsoBone.width * 0.82, color); // hips
-      canvas.drawCircle(torsoBone.mid, torsoBone.width * 0.34, Paint()..color = Colors.white.withOpacity(0.22));
-    }
-    if (upperArmL != null) jointBlob(upperArmL.b, upperArmL.width * 0.95, limbColor);
-    if (upperArmR != null) jointBlob(upperArmR.b, upperArmR.width * 0.95, limbColor);
-    if (upperLegL != null) jointBlob(upperLegL.b, upperLegL.width * 0.98, limbColor);
-    if (upperLegR != null) jointBlob(upperLegR.b, upperLegR.width * 0.98, limbColor);
-
-    // hands & feet: small distinct shapes at the limb tips, so arms end in
-    // visible hands and legs end in visible feet rather than just stopping.
-    void capShape(Offset p, double angle, double len, double wid, Color fill) {
+  void _drawProps(Canvas canvas, double time) {
+    for (final p in _props) {
       canvas.save();
-      canvas.translate(p.dx, p.dy);
-      canvas.rotate(angle);
-      final rect = Rect.fromCenter(center: Offset.zero, width: len, height: wid);
-      canvas.drawRRect(RRect.fromRectAndRadius(rect, Radius.circular(wid / 2)), outlinePaint);
-      canvas.drawRRect(RRect.fromRectAndRadius(rect.deflate(1.6), Radius.circular(wid / 2)), Paint()..color = fill);
+      canvas.translate(p.x, BattleConst.waterY);
+      canvas.scale(p.scale);
+      switch (p.kind) {
+        case SceneProp.palm:
+          _palm(canvas, time, p.phase);
+          break;
+        case SceneProp.hut:
+          _hut(canvas);
+          break;
+        case SceneProp.rock:
+          _rock(canvas);
+          break;
+        case SceneProp.iceberg:
+          _iceberg(canvas);
+          break;
+        case SceneProp.wreck:
+          _wreck(canvas);
+          break;
+        case SceneProp.cactus:
+          _cactus(canvas);
+          break;
+        case SceneProp.ember:
+          _emberStack(canvas, time, p.phase);
+          break;
+        case SceneProp.buoy:
+          _buoy(canvas, time, p.phase);
+          break;
+        case SceneProp.rig:
+          _rig(canvas);
+          break;
+        case SceneProp.crane:
+          _crane(canvas);
+          break;
+      }
       canvas.restore();
     }
+  }
 
-    final lowerArmL = bonesByPart[BodyPart.lowerArmL];
-    final lowerArmR = bonesByPart[BodyPart.lowerArmR];
-    final lowerLegL = bonesByPart[BodyPart.lowerLegL];
-    final lowerLegR = bonesByPart[BodyPart.lowerLegR];
-    if (lowerArmL != null) capShape(lowerArmL.b, lowerArmL.angle, 12, 9, skinTone);
-    if (lowerArmR != null) capShape(lowerArmR.b, lowerArmR.angle, 12, 9, skinTone);
-    if (lowerLegL != null) capShape(lowerLegL.b, lowerLegL.angle, 17, 10, dark);
-    if (lowerLegR != null) capShape(lowerLegR.b, lowerLegR.angle, 17, 10, dark);
-
-    // head + face: drawn in a frame translated/rotated to the head-neck
-    // bone so the face tilts naturally as the ragdoll tumbles.
-    final headC = ragdoll.headCenter;
-    final tilt = ragdoll.headTilt;
-    final isRagdolling = ragdoll.isRagdolling;
-    const r = Ragdoll.headRadius;
-
+  void _palm(Canvas canvas, double time, double phase) {
+    final sway = sin(time * 0.9 + phase) * 0.05;
     canvas.save();
-    canvas.translate(headC.dx, headC.dy);
-    canvas.rotate(tilt);
-
-    canvas.drawCircle(Offset.zero, r, outlinePaint);
-    canvas.drawCircle(Offset.zero, r - 2.5, Paint()..color = skinTone);
-
-    const eyeY = -2.0;
-    if (b.dead) {
-      final xp = Paint()
-        ..color = RT.ink
-        ..strokeWidth = 2.3
-        ..strokeCap = StrokeCap.round;
-      for (final ex in [-4.5, 4.5]) {
-        canvas.drawLine(Offset(ex - 2.6, eyeY - 2.6), Offset(ex + 2.6, eyeY + 2.6), xp);
-        canvas.drawLine(Offset(ex + 2.6, eyeY - 2.6), Offset(ex - 2.6, eyeY + 2.6), xp);
-      }
-    } else if (isRagdolling) {
-      for (final ex in [-4.5, 4.5]) {
-        canvas.drawCircle(Offset(ex, eyeY), 3.6, Paint()..color = Colors.white);
-        canvas.drawCircle(Offset(ex, eyeY - 1.2), 1.7, outlinePaint);
-      }
-    } else {
-      for (final ex in [-4.5, 4.5]) {
-        canvas.drawCircle(Offset(ex, eyeY), 3.2, Paint()..color = Colors.white);
-        canvas.drawCircle(Offset(ex + 0.8, eyeY), 1.6, outlinePaint);
-      }
-    }
-
-    final mouthPaint = Paint()
-      ..color = RT.ink
-      ..strokeWidth = 1.9
-      ..style = PaintingStyle.stroke
-      ..strokeCap = StrokeCap.round;
-    if (b.dead) {
-      canvas.drawArc(Rect.fromCenter(center: const Offset(0, eyeY + 9), width: 8, height: 6), pi, -pi, false, mouthPaint);
-    } else if (isRagdolling) {
-      canvas.drawCircle(const Offset(0, eyeY + 7), 2.8, mouthPaint..style = PaintingStyle.fill);
-    } else {
-      canvas.drawArc(Rect.fromCenter(center: const Offset(0, eyeY + 5), width: 9, height: 7), 0.2, pi - 0.4, false, mouthPaint);
-    }
-
-    final hat = idx < charHats.length ? charHats[idx] : 0;
-    _drawHat(canvas, Offset.zero, r, hat, color, dark);
-
+    canvas.rotate(0.12 + sway);
+    canvas.drawRRect(
+      RRect.fromRectAndRadius(Rect.fromLTWH(-7, -128, 14, 128), const Radius.circular(7)),
+      Paint()..color = const Color(0xFF8A5F35),
+    );
     canvas.restore();
-
-    // status rings/tints: drawn upright in world space for readability,
-    // regardless of how far the head has tilted.
-    if (b.hp < b.maxHp && !b.dead) {
-      final frac = (b.hp / b.maxHp).clamp(0.0, 1.0);
-      final arcRect = Rect.fromCircle(center: headC, radius: r * 1.25);
-      canvas.drawArc(arcRect, -pi / 2 + pi * 0.7, pi * 1.6, false,
-          Paint()..color = Colors.white.withOpacity(0.4)..strokeWidth = 3..style = PaintingStyle.stroke);
-      canvas.drawArc(arcRect, -pi / 2 + pi * 0.7, pi * 1.6 * frac, false,
-          Paint()..color = frac > 0.5 ? RT.green : frac > 0.25 ? RT.orange : RT.red..strokeWidth = 3..style = PaintingStyle.stroke..strokeCap = StrokeCap.round);
-    }
-    if (b.frozenUntil > world.elapsed) {
-      canvas.drawCircle(headC, r * 1.15, Paint()..color = const Color(0xFF7DD8FF).withOpacity(0.4));
-    }
-    if (b.burnUntil > world.elapsed) {
-      canvas.drawCircle(headC, r * 1.3,
-          Paint()..color = const Color(0xFFFF8C1A).withOpacity(0.3 + sin(time * 12) * 0.1));
-    }
+    final canopy = Paint()..color = const Color(0xFF2F7D43);
+    canvas.drawOval(Rect.fromCenter(center: const Offset(2, -140), width: 92, height: 50), canopy);
+    canvas.drawOval(
+      Rect.fromCenter(center: const Offset(-24, -128), width: 58, height: 30),
+      Paint()..color = const Color(0xFF357F49),
+    );
   }
 
-  void _drawHat(Canvas canvas, Offset headC, double r, int hat, Color color, Color dark) {
-    final outline = Paint()..color = RT.ink;
-    switch (hat % 5) {
-      case 0: // bandana
-        final rect = Rect.fromCenter(center: headC - Offset(0, r * 0.55), width: r * 2.05, height: r * 0.7);
-        canvas.drawRRect(RRect.fromRectAndRadius(rect, const Radius.circular(6)), outline);
-        canvas.drawRRect(RRect.fromRectAndRadius(rect.deflate(2.5), const Radius.circular(4)), Paint()..color = dark);
-        // knot
-        canvas.drawCircle(headC + Offset(r * 0.9, -r * 0.55), 4.5, outline);
-        canvas.drawCircle(headC + Offset(r * 0.9, -r * 0.55), 2.5, Paint()..color = dark);
-        break;
-      case 1: // captain hat
-        final rect = Rect.fromCenter(center: headC - Offset(0, r * 0.75), width: r * 1.7, height: r * 0.75);
-        canvas.drawRRect(RRect.fromRectAndRadius(rect, const Radius.circular(6)), outline);
-        canvas.drawRRect(RRect.fromRectAndRadius(rect.deflate(2.5), const Radius.circular(4)), Paint()..color = const Color(0xFF2B3A67));
-        canvas.drawCircle(headC - Offset(0, r * 0.75), 4, Paint()..color = RT.yellow);
-        break;
-      case 2: // propeller cap
-        final rect = Rect.fromCenter(center: headC - Offset(0, r * 0.6), width: r * 1.8, height: r * 0.6);
-        canvas.drawArc(rect, pi, pi, true, outline);
-        canvas.drawArc(Rect.fromCenter(center: headC - Offset(0, r * 0.6), width: r * 1.8 - 5, height: r * 0.6 - 5), pi, pi, true, Paint()..color = color);
-        canvas.drawRect(Rect.fromCenter(center: headC - Offset(0, r * 1.15), width: r * 1.3, height: 5), outline);
-        canvas.drawRect(Rect.fromCenter(center: headC - Offset(0, r * 1.15), width: r * 1.3 - 3, height: 3), Paint()..color = RT.yellow);
-        break;
-      case 3: // viking helm
-        final rect = Rect.fromCenter(center: headC - Offset(0, r * 0.62), width: r * 1.8, height: r * 0.85);
-        canvas.drawArc(rect, pi, pi, true, outline);
-        canvas.drawArc(Rect.fromCenter(center: headC - Offset(0, r * 0.62), width: r * 1.8 - 5, height: r * 0.85 - 5), pi, pi, true,
-            Paint()..color = const Color(0xFF9AA5B1));
-        // horns
-        for (final s in [-1.0, 1.0]) {
-          final hp = Path()
-            ..moveTo(headC.dx + s * r * 0.8, headC.dy - r * 0.6)
-            ..quadraticBezierTo(headC.dx + s * r * 1.5, headC.dy - r * 1.3, headC.dx + s * r * 1.15, headC.dy - r * 1.5)
-            ..quadraticBezierTo(headC.dx + s * r * 1.1, headC.dy - r * 1.0, headC.dx + s * r * 0.55, headC.dy - r * 0.75)
-            ..close();
-          canvas.drawPath(hp, outline);
-          canvas.drawPath(hp, Paint()..color = const Color(0xFFFFF6E8)..style = PaintingStyle.fill..strokeWidth = 0);
-        }
-        break;
-      case 4: // fish hat!
-        final fp = Path()
-          ..moveTo(headC.dx - r * 0.9, headC.dy - r * 0.7)
-          ..quadraticBezierTo(headC.dx, headC.dy - r * 1.9, headC.dx + r * 0.9, headC.dy - r * 0.7)
-          ..close();
-        canvas.drawPath(fp, outline);
-        canvas.drawPath(fp, Paint()..color = const Color(0xFF3EC6E0));
-        canvas.drawCircle(headC + Offset(r * 0.35, -r * 1.0), 3.5, outline);
-        break;
-    }
+  void _hut(Canvas canvas) {
+    canvas.drawRect(Rect.fromLTWH(-30, -58, 60, 58), Paint()..color = const Color(0xFFC79A62));
+    final roof = Path()
+      ..moveTo(-46, -58)
+      ..lineTo(0, -96)
+      ..lineTo(46, -58)
+      ..close();
+    canvas.drawPath(roof, Paint()..color = const Color(0xFF7C5A33));
   }
 
-  // -------------------------------------------------------------------------
+  void _rock(Canvas canvas) {
+    canvas.drawPath(
+      Path()
+        ..moveTo(-56, 4)
+        ..quadraticBezierTo(-40, -40, -6, -38)
+        ..quadraticBezierTo(34, -36, 56, 4)
+        ..close(),
+      Paint()..color = const Color(0xFF9AA3A6),
+    );
+  }
 
-  void _drawDebris(Canvas canvas, PhysBody b) {
-    final color = world.debrisColors[b.id] ?? const Color(0xFFB5793B);
+  void _iceberg(Canvas canvas) {
+    canvas.drawPath(
+      Path()
+        ..moveTo(-58, 4)
+        ..lineTo(-18, -74)
+        ..lineTo(10, -40)
+        ..lineTo(34, -88)
+        ..lineTo(62, 4)
+        ..close(),
+      Paint()..color = const Color(0xFFE3F1F7),
+    );
+  }
+
+  void _wreck(Canvas canvas) {
     canvas.save();
-    canvas.translate(b.pos.dx, b.pos.dy);
-    canvas.rotate(b.angle);
-    final rect = Rect.fromCenter(center: Offset.zero, width: b.size.width, height: b.size.height);
-    canvas.drawRect(rect, Paint()..color = RT.ink);
-    canvas.drawRect(rect.deflate(1.8), Paint()..color = color);
+    canvas.rotate(-0.18);
+    canvas.drawRRect(
+      RRect.fromRectAndRadius(Rect.fromLTWH(-64, -30, 128, 30), const Radius.circular(8)),
+      Paint()..color = const Color(0xFF6E4B2C),
+    );
+    canvas.drawRRect(
+      RRect.fromRectAndRadius(Rect.fromLTWH(-6, -96, 10, 70), const Radius.circular(5)),
+      Paint()..color = const Color(0xFF5A3D24),
+    );
     canvas.restore();
   }
 
-  void _drawProjectile(Canvas canvas, Projectile p, double time) {
-    // trail
-    for (int i = 0; i < p.trail.length; i++) {
-      final t = i / p.trail.length;
+  void _cactus(Canvas canvas) {
+    final g = Paint()..color = const Color(0xFF4F8C4A);
+    canvas.drawRRect(
+        RRect.fromRectAndRadius(Rect.fromLTWH(-9, -104, 18, 104), const Radius.circular(9)), g);
+    canvas.drawRRect(
+        RRect.fromRectAndRadius(Rect.fromLTWH(-34, -74, 25, 12), const Radius.circular(6)), g);
+    canvas.drawRRect(
+        RRect.fromRectAndRadius(Rect.fromLTWH(-34, -74, 12, 34), const Radius.circular(6)), g);
+  }
+
+  void _emberStack(Canvas canvas, double time, double phase) {
+    _rock(canvas);
+    for (int i = 0; i < 3; i++) {
+      final t = (time * 0.5 + phase + i * 0.33) % 1.0;
       canvas.drawCircle(
-          p.trail[i],
-          p.radius * 0.6 * t,
-          Paint()..color = p.weapon.color.withOpacity(0.35 * t));
+        Offset(-14 + i * 14, -40 - t * 70),
+        3.2,
+        Paint()..color = const Color(0xFFFF8A3D).withOpacity((1 - t) * 0.85),
+      );
     }
-    canvas.save();
-    canvas.translate(p.pos.dx, p.pos.dy);
-    final ang = atan2(p.vel.dy, p.vel.dx);
-    canvas.rotate(ang);
-    // body
-    canvas.drawCircle(Offset.zero, p.radius, Paint()..color = RT.ink);
-    canvas.drawCircle(Offset.zero, p.radius - 2.5, Paint()..color = p.weapon.color);
-    canvas.drawCircle(Offset(-p.radius * 0.3, -p.radius * 0.3), p.radius * 0.3, Paint()..color = Colors.white.withOpacity(0.6));
-    // rocket flame
-    if (p.weapon.behavior == 'rocket') {
-      final flick = 1 + sin(time * 30) * 0.3;
-      final flame = Path()
-        ..moveTo(-p.radius, 0)
-        ..lineTo(-p.radius - 14 * flick, -5)
-        ..lineTo(-p.radius - 20 * flick, 0)
-        ..lineTo(-p.radius - 14 * flick, 5)
-        ..close();
-      canvas.drawPath(flame, Paint()..color = const Color(0xFFFFD32A));
-      if (!_lowQuality) {
-        canvas.drawPath(flame, Paint()..color = const Color(0xFFFF8C1A).withOpacity(0.7)..maskFilter = const MaskFilter.blur(BlurStyle.normal, 3));
+  }
+
+  void _buoy(Canvas canvas, double time, double phase) {
+    final bob = sin(time * 1.6 + phase) * 4;
+    canvas.translate(0, bob);
+    canvas.drawRRect(
+      RRect.fromRectAndRadius(Rect.fromLTWH(-11, -34, 22, 40), const Radius.circular(10)),
+      Paint()..color = RT.red,
+    );
+    canvas.drawRect(Rect.fromLTWH(-11, -20, 22, 8), Paint()..color = Colors.white);
+  }
+
+  void _rig(Canvas canvas) {
+    final steel = Paint()..color = const Color(0xFF5E7381);
+    canvas.drawRect(Rect.fromLTWH(-52, -20, 104, 14), steel);
+    for (final dx in [-40.0, -12.0, 16.0, 40.0]) {
+      canvas.drawRect(Rect.fromLTWH(dx, -20, 8, 26), steel);
+    }
+    canvas.drawRect(Rect.fromLTWH(-20, -74, 40, 54), Paint()..color = const Color(0xFF445965));
+  }
+
+  void _crane(Canvas canvas) {
+    final steel = Paint()..color = const Color(0xFF4E6472);
+    canvas.drawRect(Rect.fromLTWH(-8, -132, 16, 132), steel);
+    canvas.drawRect(Rect.fromLTWH(-8, -132, 84, 12), steel);
+    canvas.drawRect(Rect.fromLTWH(64, -120, 4, 40), steel);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Rafts + crew
+  // ---------------------------------------------------------------------------
+
+  void _drawRafts(Canvas canvas, double time) {
+    for (final raft in world.rafts) {
+      final bob = world.bobOf(raft);
+      canvas.save();
+      canvas.translate(raft.x, bob);
+
+      _ripple(canvas, raft, time);
+      if (raft.loadout.hull.hasMast) _mast(canvas, raft);
+      _hull(canvas, raft);
+
+      for (int i = 0; i < raft.crew.length; i++) {
+        final c = raft.crew[i];
+        if (c.gone) continue;
+        canvas.save();
+        canvas.translate(raft.loadout.crewOffset(i), 0);
+        // Defeated crew slide down into the water and fade out.
+        if (!c.alive) {
+          canvas.translate(0, c.sinkT * 44);
+          canvas.saveLayer(
+            Rect.fromLTWH(-60, -140, 120, 200),
+            Paint()..color = Colors.white.withOpacity(1 - c.sinkT),
+          );
+        }
+        _crewMember(canvas, raft, c, i, time);
+        if (!c.alive) canvas.restore();
+        canvas.restore();
+      }
+
+      canvas.restore();
+
+      if (raft.playerIndex != 0 && raft.alive) _enemyLabel(canvas, raft, bob);
+    }
+  }
+
+  void _ripple(Canvas canvas, Raft raft, double time) {
+    final w = raft.loadout.width;
+    final t = (time * 0.55 + raft.x * 0.01) % 1.0;
+    canvas.drawOval(
+      Rect.fromCenter(
+        center: Offset(0, BattleConst.waterY + 4),
+        width: w * (0.75 + t * 0.5),
+        height: 13 * (0.75 + t * 0.5),
+      ),
+      Paint()..color = Colors.white.withOpacity(0.3 * (1 - t)),
+    );
+  }
+
+  void _hull(Canvas canvas, Raft raft) {
+    final lo = raft.loadout;
+    final w = lo.width;
+    final h = w * lo.hull.thickness;
+    final top = BattleConst.waterY - h * 0.55;
+    final rect = Rect.fromLTWH(-w / 2, top, w, h);
+    final radius = Radius.circular(h * lo.hull.rounding.clamp(0.0, 1.0) * 0.5 + 3);
+
+    canvas.drawRRect(
+      RRect.fromRectAndRadius(rect, radius),
+      Paint()..color = lo.color,
+    );
+    // Inner shade along the bottom, matching the mockup's inset shadow.
+    canvas.drawRRect(
+      RRect.fromRectAndRadius(
+        Rect.fromLTWH(-w / 2, top + h * 0.58, w, h * 0.42),
+        radius,
+      ),
+      Paint()..color = Colors.black.withOpacity(0.14),
+    );
+    // Plank seam on timber-style hulls.
+    if (lo.hull.rounding < 0.5) {
+      canvas.drawRect(
+        Rect.fromLTWH(-w / 2 + 6, top + h * 0.36, w - 12, 3),
+        Paint()..color = Colors.black.withOpacity(0.12),
+      );
+    }
+  }
+
+  void _mast(Canvas canvas, Raft raft) {
+    final lo = raft.loadout;
+    final baseY = BattleConst.waterY - lo.width * lo.hull.thickness * 0.5;
+    final dir = raft.facing.toDouble();
+    canvas.drawRRect(
+      RRect.fromRectAndRadius(
+        Rect.fromLTWH(-4 - dir * 26, baseY - 118, 9, 118),
+        const Radius.circular(4),
+      ),
+      Paint()..color = const Color(0xFF8A5F35),
+    );
+    final sail = Path()
+      ..moveTo(-dir * 26, baseY - 104)
+      ..lineTo(-dir * 26 + dir * 46, baseY - 78)
+      ..lineTo(-dir * 26 + dir * 30, baseY - 26)
+      ..lineTo(-dir * 26, baseY - 26)
+      ..close();
+    canvas.drawPath(sail, Paint()..color = const Color(0xFFF2ECC8));
+  }
+
+  void _crewMember(Canvas canvas, Raft raft, Crew crew, int index, double time) {
+    final lo = raft.loadout;
+    final deck = BattleConst.waterY - lo.width * lo.hull.thickness * 0.55;
+    final headR = 22.0;
+    final headC = Offset(0, deck - 34 + sin(time * 1.7 + crew.bobPhase) * 1.4);
+    final dir = raft.facing.toDouble();
+
+    // Torso
+    canvas.drawRRect(
+      RRect.fromRectAndCorners(
+        Rect.fromLTWH(-13, headC.dy + headR - 4, 26, 22),
+        topLeft: const Radius.circular(8),
+        topRight: const Radius.circular(8),
+        bottomLeft: const Radius.circular(3),
+        bottomRight: const Radius.circular(3),
+      ),
+      Paint()..color = raft.playerIndex == 0 ? const Color(0xFF2D4F8F) : lo.color,
+    );
+
+    // Head
+    final skin = _skinFor(raft.look);
+    canvas.drawCircle(headC, headR, Paint()..color = skin);
+    canvas.drawArc(
+      Rect.fromCircle(center: headC, radius: headR),
+      0.3, pi * 0.75, false,
+      Paint()..color = Colors.black.withOpacity(0.06)..style = PaintingStyle.stroke..strokeWidth = 7,
+    );
+
+    // Brows
+    final brow = Paint()
+      ..color = const Color(0xFF8A7448)
+      ..strokeWidth = 4
+      ..strokeCap = StrokeCap.round;
+    canvas.drawLine(headC + const Offset(-13, -8), headC + const Offset(-4, -11), brow);
+    canvas.drawLine(headC + const Offset(4, -11), headC + const Offset(13, -8), brow);
+
+    // Eyes
+    for (final ex in [-7.0, 7.0]) {
+      canvas.drawOval(
+        Rect.fromCenter(center: headC + Offset(ex, 0), width: 12, height: 14),
+        Paint()..color = Colors.white,
+      );
+      if (crew.alive) {
+        canvas.drawCircle(headC + Offset(ex + dir * 1.5, 2), 3.4, Paint()..color = RT.ink);
+      } else {
+        final xp = Paint()
+          ..color = RT.ink
+          ..strokeWidth = 2.4
+          ..strokeCap = StrokeCap.round;
+        canvas.drawLine(headC + Offset(ex - 3, -3), headC + Offset(ex + 3, 3), xp);
+        canvas.drawLine(headC + Offset(ex + 3, -3), headC + Offset(ex - 3, 3), xp);
       }
     }
-    if (p.weapon.behavior == 'grenade' && p.fuse > 0) {
-      // spark
-      canvas.drawCircle(Offset(0, -p.radius - 4), 3.5 + sin(time * 40) * 1.5, Paint()..color = RT.yellow);
+
+    // Nose + mouth
+    canvas.drawOval(
+      Rect.fromCenter(center: headC + const Offset(0, 9), width: 8, height: 6),
+      Paint()..color = const Color(0xFFDCC48B),
+    );
+    canvas.drawRRect(
+      RRect.fromRectAndRadius(
+        Rect.fromCenter(center: headC + const Offset(0, 16), width: 15, height: 4),
+        const Radius.circular(3),
+      ),
+      Paint()..color = const Color(0xFFB9955C),
+    );
+
+    _headgear(canvas, raft.look, headC, headR, dir);
+  }
+
+  Color _skinFor(CrewLook look) => switch (look) {
+        CrewLook.player => const Color(0xFFEFD79F),
+        CrewLook.raider => const Color(0xFFE8C98C),
+        CrewLook.ducker => const Color(0xFFEFD79F),
+        CrewLook.pirate => const Color(0xFFE0BD7C),
+        CrewLook.captain => const Color(0xFFDCB877),
+      };
+
+  void _headgear(Canvas canvas, CrewLook look, Offset headC, double r, double dir) {
+    switch (look) {
+      case CrewLook.player:
+      case CrewLook.ducker:
+        break;
+      case CrewLook.raider:
+        // Red bandana
+        canvas.drawRRect(
+          RRect.fromRectAndCorners(
+            Rect.fromCenter(center: headC + Offset(0, -r * 0.72), width: r * 2.1, height: r * 0.62),
+            topLeft: Radius.circular(r * 0.6),
+            topRight: Radius.circular(r * 0.6),
+          ),
+          Paint()..color = const Color(0xFFC9483C),
+        );
+        break;
+      case CrewLook.pirate:
+      case CrewLook.captain:
+        // Black tricorn + beard
+        canvas.drawRRect(
+          RRect.fromRectAndRadius(
+            Rect.fromCenter(center: headC + Offset(0, -r * 0.86), width: r * 2.7, height: r * 0.62),
+            Radius.circular(r * 0.3),
+          ),
+          Paint()..color = const Color(0xFF1D1D20),
+        );
+        canvas.drawPath(
+          Path()
+            ..moveTo(headC.dx - r * 0.62, headC.dy + r * 0.42)
+            ..quadraticBezierTo(headC.dx, headC.dy + r * 1.35, headC.dx + r * 0.62, headC.dy + r * 0.42)
+            ..close(),
+          Paint()..color = const Color(0xFF3B2A1C),
+        );
+        break;
+    }
+  }
+
+  void _enemyLabel(Canvas canvas, Raft raft, double bob) {
+    final lo = raft.loadout;
+    final top = BattleConst.waterY - lo.width * lo.hull.thickness * 0.55 - 92 + bob;
+
+    final tp = TextPainter(
+      text: TextSpan(text: raft.label, style: RT.body(size: 10, color: RT.ink, weight: FontWeight.w800, letterSpacing: 1.2)),
+      textDirection: TextDirection.ltr,
+    )..layout();
+    tp.paint(canvas, Offset(raft.x - tp.width / 2, top - 14));
+
+    // HP bar
+    const barW = 62.0;
+    final barRect = Rect.fromLTWH(raft.x - barW / 2, top, barW, 7);
+    canvas.drawRRect(
+      RRect.fromRectAndRadius(barRect, const Radius.circular(4)),
+      Paint()..color = Colors.white.withOpacity(0.66),
+    );
+    canvas.drawRRect(
+      RRect.fromRectAndRadius(
+        Rect.fromLTWH(barRect.left, barRect.top, barW * raft.hpFrac, 7),
+        const Radius.circular(4),
+      ),
+      Paint()..color = raft.hpFrac > 0.5 ? RT.green : (raft.hpFrac > 0.25 ? RT.orange : RT.red),
+    );
+  }
+
+  // ---------------------------------------------------------------------------
+  // Projectile + effects
+  // ---------------------------------------------------------------------------
+
+  void _drawShot(Canvas canvas) {
+    final s = world.shot;
+    if (s == null) return;
+    for (int i = 0; i < s.trail.length; i++) {
+      final t = i / max(1, s.trail.length);
+      canvas.drawCircle(
+        s.trail[i],
+        2 + t * 3,
+        Paint()..color = s.weapon.color.withOpacity(t * 0.4),
+      );
+    }
+    final r = 9 * s.weapon.weight;
+    canvas.drawCircle(s.pos, r + 2, Paint()..color = Colors.black.withOpacity(0.18));
+    canvas.drawCircle(s.pos, r, Paint()..color = s.weapon.color);
+  }
+
+  void _drawEffects(Canvas canvas) {
+    for (final fx in world.effects) {
+      final p = fx.progress;
+      switch (fx.kind) {
+        case 'boom':
+          final radius = fx.size * (0.25 + p * 1.35);
+          canvas.drawCircle(
+            fx.pos,
+            radius,
+            Paint()
+              ..shader = RadialGradient(
+                colors: [
+                  Colors.white.withOpacity(1 - p),
+                  const Color(0xFFFFB347).withOpacity((1 - p) * 0.85),
+                  const Color(0x00FF7A3C),
+                ],
+                stops: const [0.0, 0.55, 1.0],
+              ).createShader(Rect.fromCircle(center: fx.pos, radius: radius)),
+          );
+          break;
+        case 'splash':
+          canvas.drawOval(
+            Rect.fromCenter(
+              center: fx.pos,
+              width: fx.size * (0.4 + p * 1.1),
+              height: fx.size * 0.34 * (0.4 + p * 0.8),
+            ),
+            Paint()
+              ..color = Colors.white.withOpacity((1 - p) * 0.7)
+              ..style = PaintingStyle.stroke
+              ..strokeWidth = 3,
+          );
+          break;
+      }
+    }
+  }
+
+  /// Trajectory preview dots, drawn by the aim overlay rather than the world
+  /// pass so they sit above the rafts.
+  void drawTrajectory(Canvas canvas, Size size, List<TrajectoryDot> dots, {required bool charging}) {
+    if (dots.isEmpty) return;
+    final scale = size.height / BattleConst.worldH;
+    canvas.save();
+    canvas.scale(scale);
+    canvas.translate(-world.cam, 0);
+    for (final d in dots) {
+      canvas.drawCircle(
+        d.pos,
+        charging ? 4.0 : 3.0,
+        Paint()..color = RT.red.withOpacity((1 - d.index / 180).clamp(0.15, 1.0)),
+      );
     }
     canvas.restore();
   }
+}
+
+class _Prop {
+  final SceneProp kind;
+  final double x;
+  final double scale;
+  final double phase;
+  const _Prop({required this.kind, required this.x, required this.scale, required this.phase});
+}
+
+class _Cloud {
+  final double x;
+  final double y;
+  final double w;
+  final double opacity;
+  final double speed;
+  const _Cloud({
+    required this.x,
+    required this.y,
+    required this.w,
+    required this.opacity,
+    required this.speed,
+  });
 }

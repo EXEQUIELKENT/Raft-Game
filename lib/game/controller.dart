@@ -1,111 +1,131 @@
 import 'dart:async';
-import 'dart:math';
-import 'dart:ui';
+
 import 'package:flutter/foundation.dart';
+
 import 'ai.dart';
 import 'audio.dart';
+import 'battle.dart';
 import 'maps.dart';
 import 'models.dart';
 import 'net.dart';
-import 'physics.dart';
+import 'raft.dart';
 import 'save.dart';
 
-enum GamePhase { building, aiming, firing, settling, turnTransition, gameOver }
+/// Turn-based phases. There is no build phase and no physics settling any
+/// more — a shot flies, resolves, and the turn passes.
+enum GamePhase { aiming, firing, resolving, turnTransition, gameOver }
 
 enum GameMode { vsAi, local, hotspot }
 
-/// Why a build piece can't be placed at a given spot right now — lets the
-/// UI explain the specific reason (outside area vs. overlapping something
-/// vs. out of pieces) instead of just refusing silently.
-enum PlacementBlocker { none, outsideArea, overlapping, noPiecesLeft }
-
 class PlayerConfig {
   final String name;
-  final int colorIndex;
-  final int hatIndex;
   final bool isAi;
   final AiDifficulty aiDifficulty;
-  final int? netId; // for hotspot: which network peer controls this player
+
+  /// Raft hull/size/colour and crew count for this seat.
+  final RaftLoadout loadout;
+
+  /// Cosmetic archetype used by the renderer and the label above the raft.
+  final CrewLook look;
+
+  /// Which network peer controls this player, for hotspot play.
+  final int? netId;
+
+  /// Campaign "Power Shots" upgrade — multiplies launch speed. 1.0 = stock.
+  final double powerMultiplier;
+
+  /// Innate aim sloppiness for AI seats (design's per-type `jitter`).
+  final double aimJitter;
 
   PlayerConfig({
     required this.name,
-    this.colorIndex = 0,
-    this.hatIndex = 0,
+    required this.loadout,
+    this.look = CrewLook.player,
     this.isAi = false,
     this.aiDifficulty = AiDifficulty.normal,
     this.netId,
+    this.powerMultiplier = 1.0,
+    this.aimJitter = 10,
   });
 }
 
 class MatchSettings {
   MapDef map;
-  int buildLimit;
   double startHp;
   double turnSeconds;
-  double windStrength; // 0..1 multiplier
   List<String> enabledWeapons;
+
+  /// Per-player starting HP by index; falls back to [startHp].
+  List<double>? startHpPerPlayer;
+
+  /// Ammo the human player carries into this battle, by weapon id. Weapons
+  /// absent from the map fall back to their [WeaponDef.startAmmo].
+  Map<String, int>? ammo;
 
   MatchSettings({
     MapDef? map,
-    this.buildLimit = 10,
     this.startHp = 100,
     this.turnSeconds = 30,
-    this.windStrength = 0.5,
     List<String>? enabledWeapons,
+    this.startHpPerPlayer,
+    this.ammo,
   })  : map = map ?? GameMaps.all.first,
         enabledWeapons = enabledWeapons ?? Weapons.all.map((w) => w.id).toList();
+
+  double startHpFor(int playerIndex) {
+    final list = startHpPerPlayer;
+    if (list != null && playerIndex < list.length) return list[playerIndex];
+    return startHp;
+  }
 }
 
 class GameController extends ChangeNotifier {
-  late PhysicsWorld world;
+  late BattleWorld world;
   MatchSettings settings;
   List<PlayerConfig> players;
   GameMode mode;
   NetService? net;
 
-  GamePhase phase = GamePhase.building;
+  GamePhase phase = GamePhase.aiming;
   int currentPlayer = 0;
-  double wind = 0;
   double turnTimeLeft = 0;
   int round = 1;
 
-  // aiming state (for human current player)
-  double aimAngle = -pi / 4; // radians world
-  double aimPower = 0.6;
-  String selectedWeaponId = 'cannon';
+  /// Aim state for the current shooter, in the design's units.
+  double aimAngle = 45;
+  double aimPower = 70;
+  bool aimFine = false;
+  String selectedWeaponId = 'tennis';
   bool isCharging = false;
 
-  // building state
-  int buildingPlayer = 0;
-  int piecesLeft = 0;
+  /// Remaining rounds by weapon id for the human side. Infinite weapons are
+  /// absent from this map entirely.
+  final Map<String, int> ammo = {};
 
-  // camera
-  Offset camPos = Offset.zero;
-  double camZoom = 1.0;
-  Offset _camTarget = Offset.zero;
-  double _camZoomTarget = 1.0;
-  Projectile? _followedProjectile;
-
-  // results
   int? winner;
   int damageDealtByHuman = 0;
-
-  // AI
-  AiShot? _pendingAiShot;
-  double _aiThinkTime = 0;
+  int shotsFired = 0;
+  int shotsHit = 0;
 
   Timer? _ticker;
-  double _accum = 0;
   DateTime _lastTick = DateTime.now();
+  double _accum = 0;
   bool _disposed = false;
-  double time = 0;
-  int settleCountdown = 0;
   bool _gameEnded = false;
+  double time = 0;
   String statusMessage = '';
-  void Function(String kind, Map<String, dynamic> data)? onEvent;
 
-  static const double worldW = 1100;
-  static const double worldH = 760;
+  /// Set the instant a shot is committed for this turn, cleared by
+  /// [_beginTurn]. The single guard that stops a double-tap, a racing network
+  /// message and the AI from all queueing a shot for the same turn.
+  bool _shotCommitted = false;
+
+  double _aiThinkTime = 0;
+  bool _aiShotQueued = false;
+  double _resolveTimer = 0;
+  double _transitionTimer = 0;
+
+  void Function(String kind, Map<String, dynamic> data)? onEvent;
 
   GameController({
     required this.settings,
@@ -113,118 +133,99 @@ class GameController extends ChangeNotifier {
     required this.mode,
     this.net,
     int? seed,
-    bool skipBuildPhase = false,
   }) {
-    final s = seed ?? DateTime.now().millisecondsSinceEpoch;
-    world = PhysicsWorld(
-      width: worldW,
-      height: worldH,
-      waterLevel: worldH - 150,
-      seed: s,
-      mapHazard: settings.map.hazard,
-      environment: settings.map.terrain,
-    );
-    _setupWorld(s, skipBuildPhase: skipBuildPhase);
+    _setup(seed ?? DateTime.now().millisecondsSinceEpoch);
   }
 
-  void _setupWorld(int seed, {bool skipBuildPhase = false}) {
-    MapBuilder.build(world, settings.map, players.length);
-    // wind: each map has its own base wind (e.g. Frosty Peaks is gustier
-    // than Coconut Cove), randomized around by the player's wind setting.
-    wind = (settings.map.windBase + world.rng.range(-1, 1) * settings.windStrength).clamp(-1.0, 1.0);
-    world.wind = wind;
+  // ---------------------------------------------------------------------------
+  // Setup
+  // ---------------------------------------------------------------------------
 
-    // spawn characters
+  void _setup(int seed) {
+    world = BattleWorld(map: settings.map, seed: seed);
+
     for (int i = 0; i < players.length; i++) {
-      final spawn = MapBuilder.spawnFor(world, i, players.length);
-      world.addCharacter(pos: spawn, playerIndex: i, hp: settings.startHp);
+      final p = players[i];
+      final isPlayerSide = i == 0;
+      final x = isPlayerSide
+          ? BattleConst.playerX
+          : BattleConst.enemySlots[(i - 1).clamp(0, BattleConst.enemySlots.length - 1)];
+      final hp = settings.startHpFor(i) + p.loadout.hpBonus;
+      world.addRaft(Raft(
+        playerIndex: i,
+        x: x,
+        loadout: p.loadout,
+        look: p.look,
+        label: p.name.toUpperCase(),
+        facing: isPlayerSide ? 1 : -1,
+        crew: List.generate(
+          p.loadout.crewCount,
+          (c) => Crew(hp: hp, maxHp: hp, bobPhase: c * 0.7),
+        ),
+      ));
     }
 
-    piecesLeft = settings.buildLimit;
-    buildingPlayer = 0;
-
-    if (skipBuildPhase || settings.buildLimit == 0) {
-      phase = GamePhase.aiming;
-      _beginTurn(0, initial: true);
-    } else {
-      phase = GamePhase.building;
-      statusMessage = '${players[0].name}: fortify your raft! ($piecesLeft left)';
+    ammo.clear();
+    for (final w in Weapons.all) {
+      if (w.infinite) continue;
+      if (!settings.enabledWeapons.contains(w.id)) continue;
+      ammo[w.id] = settings.ammo?[w.id] ?? w.startAmmo;
     }
+    selectedWeaponId = Weapons.starter.id;
 
-    // Camera target: player 0's normal in-turn framing (zoom 1.0, centered
-    // on them) — unchanged from before.
-    final c = world.charactersOf(0);
-    _camTarget = c.isNotEmpty ? c.first.pos : Offset(worldW / 2, worldH / 2);
-    _fitZoom();
-
-    // Camera *starting position*: a brief wide establishing shot framing
-    // every player's spawn instead of snapping straight to player 0's
-    // close-up. Since camPos/camZoom already ease toward _camTarget/
-    // _camZoomTarget every tick (see _tick), setting only the starting
-    // values here means the view smoothly zooms in from "here's the whole
-    // battlefield" to "here's your character" over the next second or so,
-    // with no extra timer/state needed — now that players spawn much
-    // farther apart, jumping straight to a tight zoom on player 0 would
-    // otherwise hide where the rest of the arena and opponent(s) are.
-    final allChars = world.bodies.where((b) => b.type == BodyType.character).toList();
-    if (allChars.length > 1) {
-      final xs = allChars.map((b) => b.pos.dx);
-      final minX = xs.reduce(min), maxX = xs.reduce(max);
-      final spread = maxX - minX;
-      camPos = Offset((minX + maxX) / 2, worldH * 0.44);
-      camZoom = (760 / (spread + 320)).clamp(0.5, 1.0);
-    } else {
-      camPos = _camTarget;
-      camZoom = _camZoomTarget;
-    }
-
+    world.snapCam(BattleConst.playerX + world.viewWidth * 0.25);
+    _beginTurn(0, initial: true);
     _hookNet();
     _startTicker();
   }
 
-  // -------------------------------------------------------------------------
+  // ---------------------------------------------------------------------------
   // Net wiring
-  // -------------------------------------------------------------------------
+  // ---------------------------------------------------------------------------
 
   void _hookNet() {
     if (net == null) return;
     net!.onMessage = (msg) {
       switch (msg['t']) {
         case 'fire':
-          // remote player fired
-          final w = Weapons.byId(msg['w']);
-          _doFire(msg['a'], msg['p'], w, fromNetwork: true);
-          break;
-        case 'block':
-          final piece = PieceDef.catalogue.firstWhere((e) => e.id == msg['id'], orElse: () => PieceDef.catalogue.first);
-          _placeBlock(msg['x'], msg['y'], msg['r'], piece, players[msg['pl']], fromNetwork: true);
-          break;
-        case 'buildDone':
-          _advanceBuilding(fromNetwork: true);
+          _handleRemoteFire(msg);
           break;
         case 'endTurn':
           if (phase == GamePhase.aiming) _endTurn(fromNetwork: true);
           break;
         case 'rematch':
-          resetMatch(seed: msg['seed']);
+          final seed = msg['seed'];
+          resetMatch(seed: seed is int ? seed : null);
           break;
       }
     };
   }
 
-  /// Host -> applies incoming actions for remote players. Client -> sends local actions.
-  bool get _isClient => net != null && !net!.isHost;
+  /// Deserialized network JSON is never trusted: a malformed, stale or
+  /// out-of-turn message must be ignored rather than crash or fire a shot
+  /// that doesn't belong to whoever is currently acting. [_doFire]
+  /// re-validates everything again regardless.
+  void _handleRemoteFire(Map<String, dynamic> msg) {
+    final a = msg['a'], p = msg['p'], w = msg['w'], pl = msg['pl'];
+    if (a is! num || p is! num || w is! String) {
+      if (kDebugMode) debugPrint('[net] rejected malformed fire message: $msg');
+      return;
+    }
+    if (pl is int && pl != currentPlayer) {
+      if (kDebugMode) debugPrint('[net] rejected stale fire for player=$pl, current=$currentPlayer');
+      return;
+    }
+    _doFire(a.toDouble(), p.toDouble(), Weapons.byId(w), fromNetwork: true);
+  }
 
   int get myPlayerIndex {
-    if (mode == GameMode.hotspot && net != null) {
-      return net!.isHost ? 0 : 1;
-    }
+    if (mode == GameMode.hotspot && net != null) return net!.isHost ? 0 : 1;
     return currentPlayer;
   }
 
-  // -------------------------------------------------------------------------
+  // ---------------------------------------------------------------------------
   // Ticker
-  // -------------------------------------------------------------------------
+  // ---------------------------------------------------------------------------
 
   void _startTicker() {
     _lastTick = DateTime.now();
@@ -235,135 +236,79 @@ class GameController extends ChangeNotifier {
   void _tick() {
     if (_disposed) return;
     final now = DateTime.now();
-    var dt = (now.difference(_lastTick).inMilliseconds / 1000.0).clamp(0.0, 0.05);
+    final dt = (now.difference(_lastTick).inMilliseconds / 1000.0).clamp(0.0, 0.05);
     _lastTick = now;
     time += dt;
 
-    // fixed step physics at 60Hz
-    if (phase == GamePhase.firing || phase == GamePhase.settling || phase == GamePhase.aiming || phase == GamePhase.building || phase == GamePhase.gameOver) {
-      _accum += dt;
-      const step = 1 / 60;
-      int guard = 0;
-      while (_accum >= step && guard < 4) {
-        world.step(step);
-        _accum -= step;
-        guard++;
-      }
-      _processWorldEvents();
-    }
+    world.update(dt);
 
-    // phase logic
     switch (phase) {
+      case GamePhase.aiming:
+        _updateAiming(dt);
+        break;
       case GamePhase.firing:
         _updateFiring(dt);
         break;
-      case GamePhase.settling:
-        _updateSettling(dt);
-        break;
-      case GamePhase.aiming:
-        _updateAiming(dt);
+      case GamePhase.resolving:
+        _updateResolving(dt);
         break;
       case GamePhase.turnTransition:
         _updateTransition(dt);
         break;
       case GamePhase.gameOver:
         break;
-      case GamePhase.building:
-        break;
     }
-
-    // camera easing (clamped so it can never outrun the renderer's extended
-    // background art and expose the raw world boundary — see _clampCamera)
-    _camTarget = _clampCamera(_camTarget);
-    camPos = Offset.lerp(camPos, _camTarget, (dt * 4.5).clamp(0.0, 1.0))!;
-    camPos = _clampCamera(camPos);
-    camZoom = camZoom + (_camZoomTarget - camZoom) * (dt * 3).clamp(0.0, 1.0);
 
     notifyListeners();
   }
 
-  void _processWorldEvents() {
-    for (final e in world.events) {
-      switch (e.kind) {
-        case 'explosion':
-          AudioService.instance.sfx(switch (e.data['effect']) {
-            'ice' => 'freeze',
-            'shockwave' => 'shockwave',
-            _ => 'explosion',
-          });
-          break;
-        case 'blockDestroyed':
-          final mat = e.data['material'] as String;
-          AudioService.instance.sfx(switch (mat) {
-            'wood' || 'raft' => 'break_wood',
-            'stone' => 'break_stone',
-            'metal' => 'break_metal',
-            'glass' => 'break_glass',
-            _ => 'break_wood',
-          });
-          break;
-        case 'charHit':
-          AudioService.instance.sfx('hit');
-          if (e.data['by'] == 0 || (e.data['by'] is int && players[e.data['by'] as int].isAi == false)) {
-            damageDealtByHuman += (e.data['dmg'] as num).round();
-          }
-          break;
-        case 'eliminated':
-          AudioService.instance.sfx('eliminate');
-          _checkGameOver();
-          break;
-        case 'splash':
-          AudioService.instance.sfx('splash');
-          break;
-        case 'bounce':
-          AudioService.instance.sfx('bounce', volume: 0.6);
-          break;
-        case 'drill':
-          AudioService.instance.sfx('drill', volume: 0.7);
-          break;
-        case 'fuse':
-          AudioService.instance.sfx('burn', volume: 0.7);
-          break;
-        case 'fire':
-          AudioService.instance.sfx('fire');
-          break;
-      }
-      onEvent?.call(e.kind, e.data);
-    }
-  }
-
-  // -------------------------------------------------------------------------
+  // ---------------------------------------------------------------------------
   // Turn flow
-  // -------------------------------------------------------------------------
+  // ---------------------------------------------------------------------------
 
   void _beginTurn(int player, {bool initial = false}) {
     currentPlayer = player;
-    // vary wind slightly each turn, drifting back toward the map's base wind
-    // so a gusty map (e.g. Frosty Peaks) stays gusty over a long match
-    if (!initial) {
-      wind = (wind + world.rng.range(-0.25, 0.25) + (settings.map.windBase - wind) * 0.15).clamp(-1.0, 1.0);
-      world.wind = wind;
-    }
     turnTimeLeft = settings.turnSeconds;
     phase = GamePhase.aiming;
-    final chars = world.charactersOf(player);
-    if (chars.isNotEmpty) {
-      _camTarget = chars.first.pos;
-      _camZoomTarget = 1.0;
-    }
-    _fitZoom();
-    statusMessage = "${players[player].name}'s turn";
-    AudioService.instance.sfx('turn');
+    _shotCommitted = false;
+    _aiShotQueued = false;
 
-    final p = players[player];
-    if (p.isAi) {
-      _aiThinkTime = 1.0 + world.rng.range(0, 1.2);
-      _pendingAiShot = null;
+    final raft = world.raftOf(player);
+    raft?.ensureActiveAlive();
+    if (raft != null) world.easeCam(raft.x + raft.facing * 160, 1.0);
+
+    // A weapon the player has run out of must not stay selected into the next
+    // turn, or the fire button would silently do nothing.
+    if (!_hasAmmoFor(selectedWeaponId)) selectedWeaponId = Weapons.starter.id;
+
+    statusMessage = players[player].isAi
+        ? '${players[player].name} is aiming…'
+        : (initial ? 'Pull back and release' : 'Your turn');
+
+    if (!initial) AudioService.instance.sfx('turn');
+
+    if (players[player].isAi) {
+      _aiThinkTime = 0.9 + world.rng.range(0, 0.9);
     }
   }
 
   void _updateAiming(double dt) {
-    // turn timer
+    // Frame the shot: while the human aims, follow where the shot would land.
+    final raft = world.raftOf(currentPlayer);
+    if (raft != null && !isCharging) {
+      world.easeCam(raft.x + raft.facing * 200, dt);
+    } else if (raft != null) {
+      final landing = world.landingX(
+        from: raft.muzzle,
+        angleDeg: aimAngle,
+        power: aimPower,
+        facing: raft.facing,
+        weapon: Weapons.byId(selectedWeaponId),
+        powerMultiplier: players[currentPlayer].powerMultiplier,
+      );
+      world.easeCam(landing, dt);
+    }
+
     turnTimeLeft -= dt;
     if (turnTimeLeft <= 0) {
       _endTurn();
@@ -371,76 +316,99 @@ class GameController extends ChangeNotifier {
     }
 
     final p = players[currentPlayer];
-    if (p.isAi) {
-      _aiThinkTime -= dt;
-      if (_aiThinkTime <= 0 && _pendingAiShot == null) {
-        final me = world.charactersOf(currentPlayer);
-        final enemies = <PhysBody>[];
-        for (int i = 0; i < players.length; i++) {
-          if (i != currentPlayer) enemies.addAll(world.charactersOf(i));
-        }
-        if (me.isEmpty || enemies.isEmpty) return;
-        final arsenal = players[currentPlayer].isAi
-            ? Weapons.unlockedAt(3 + currentPlayer) // AI gets decent weapons
-            : SaveService.instance.data.unlockedWeapons;
-        final enabled = arsenal.where((w) => settings.enabledWeapons.contains(w.id)).toList();
-        final ai = AiController(p.aiDifficulty);
-        _pendingAiShot = ai.plan(world, me.first, enemies, enabled.isEmpty ? [Weapons.all.first] : enabled);
-      }
-      if (_pendingAiShot != null) {
-        // animate aim toward target then fire
-        final shot = _pendingAiShot!;
-        aimAngle = shot.angle;
-        aimPower = shot.power;
-        selectedWeaponId = shot.weapon.id;
-        _doFire(shot.angle, shot.power, shot.weapon);
-        _pendingAiShot = null;
-      }
-    }
+    if (!p.isAi || _aiShotQueued) return;
+
+    _aiThinkTime -= dt;
+    if (_aiThinkTime > 0) return;
+
+    final me = world.raftOf(currentPlayer);
+    final targets = world.enemiesOf(currentPlayer);
+    if (me == null || !me.alive || targets.isEmpty) return;
+
+    // Aim at a living crew member on the nearest enemy raft.
+    targets.sort((a, b) => (a.x - me.x).abs().compareTo((b.x - me.x).abs()));
+    final targetRaft = targets.first;
+    final liveIdx = [
+      for (int i = 0; i < targetRaft.crew.length; i++)
+        if (targetRaft.crew[i].alive) i
+    ];
+    if (liveIdx.isEmpty) return;
+    final targetPos = targetRaft.crewPos(liveIdx[world.rng.nextInt(liveIdx.length)]);
+
+    final arsenal = Weapons.all
+        .where((w) => settings.enabledWeapons.contains(w.id))
+        .toList();
+    final shot = AiController(p.aiDifficulty).plan(
+      from: me.muzzle,
+      targetPos: targetPos,
+      facing: me.facing,
+      arsenal: arsenal.isEmpty ? [Weapons.starter] : arsenal,
+      baseJitter: p.aimJitter,
+      powerMultiplier: p.powerMultiplier,
+    );
+
+    _aiShotQueued = true;
+    aimAngle = shot.angle;
+    aimPower = shot.power;
+    selectedWeaponId = shot.weapon.id;
+    _doFire(shot.angle, shot.power, shot.weapon);
   }
 
   void _updateFiring(double dt) {
-    // camera follows projectile
-    if (world.projectiles.isNotEmpty) {
-      final p = world.projectiles.first;
-      _followedProjectile = p;
-      _camTarget = p.pos;
-      _camZoomTarget = 0.72;
-    }
-    if (!world.hasActiveProjectile) {
-      phase = GamePhase.settling;
-      settleCountdown = 0;
-      _followedProjectile = null;
-    }
-  }
+    final s = world.shot;
+    if (s != null) world.easeCam(s.pos.dx, dt * 2.2);
 
-  void _updateSettling(double dt) {
-    settleCountdown++;
-    // zoom out to see the chaos
-    _camZoomTarget = 0.62;
-    // track fastest moving character (flying ragdolls are fun to watch)
-    PhysBody? fastest;
-    double best = 0;
-    for (final b in world.bodies) {
-      if (b.type == BodyType.character && !b.dead && b.vel.distance > best) {
-        best = b.vel.distance;
-        fastest = b;
+    // Physics steps at a fixed 60Hz so flight is frame-rate independent.
+    _accum += dt;
+    const step = 1 / 60;
+    int guard = 0;
+    while (_accum >= step && guard < 4) {
+      _accum -= step;
+      guard++;
+      final outcome = world.stepShot();
+      if (outcome != null) {
+        _onShotResolved(outcome);
+        return;
       }
     }
-    if (fastest != null && best > 80) {
-      _camTarget = fastest.pos;
-    }
-    if (world.settled || settleCountdown > 60 * 6) {
-      _endTurn();
+    if (world.shot == null) {
+      phase = GamePhase.resolving;
+      _resolveTimer = 0.7;
     }
   }
 
-  double _transitionTimer = 0;
-  void _updateTransition(double dt) {
-    _transitionTimer -= dt;
-    if (_transitionTimer <= 0) {
-      _beginTurn(_nextAlivePlayer());
+  void _onShotResolved(ShotOutcome outcome) {
+    phase = GamePhase.resolving;
+    _resolveTimer = 0.75;
+
+    if (outcome.hitSomething) {
+      AudioService.instance.sfx('hit');
+      shotsHit++;
+    } else {
+      AudioService.instance.sfx('splash');
     }
+    if (outcome.damage > 0) {
+      AudioService.instance.sfx('explosion');
+      if (!players[currentPlayer].isAi) {
+        damageDealtByHuman += outcome.damage.round();
+      }
+    }
+
+    statusMessage = outcome.hitSomething
+        ? (outcome.hitPlayerSide ? 'You got splashed!' : 'Direct hit!')
+        : 'Splash — missed';
+
+    onEvent?.call('shotResolved', {
+      'hit': outcome.hitSomething,
+      'damage': outcome.damage,
+    });
+  }
+
+  void _updateResolving(double dt) {
+    _resolveTimer -= dt;
+    if (_resolveTimer > 0) return;
+    if (_checkGameOver()) return;
+    _endTurn();
   }
 
   void _endTurn({bool fromNetwork = false}) {
@@ -449,18 +417,24 @@ class GameController extends ChangeNotifier {
     if (mode == GameMode.hotspot && net != null && !fromNetwork) {
       net!.send({'t': 'endTurn'});
     }
-    world.clearDynamicRemnants();
+    // The raft that just shot rotates to its next crew member, so a two-person
+    // crew alternates who takes the shot rather than one doing all the work.
+    world.raftOf(currentPlayer)?.advanceCrew();
     if (_nextAlivePlayer() == 0) round++;
-    // transition for local multiplayer privacy / clarity
     phase = GamePhase.turnTransition;
-    _transitionTimer = mode == GameMode.local ? 1.6 : 0.6;
+    _transitionTimer = mode == GameMode.local ? 1.2 : 0.45;
     statusMessage = '';
+  }
+
+  void _updateTransition(double dt) {
+    _transitionTimer -= dt;
+    if (_transitionTimer <= 0) _beginTurn(_nextAlivePlayer());
   }
 
   int _nextAlivePlayer() {
     for (int k = 1; k <= players.length; k++) {
       final idx = (currentPlayer + k) % players.length;
-      if (world.charactersOf(idx).isNotEmpty) return idx;
+      if (world.raftOf(idx)?.alive ?? false) return idx;
     }
     return currentPlayer;
   }
@@ -469,283 +443,207 @@ class GameController extends ChangeNotifier {
     if (_gameEnded) return true;
     final alive = <int>[];
     for (int i = 0; i < players.length; i++) {
-      if (world.charactersOf(i).isNotEmpty) alive.add(i);
+      if (world.raftOf(i)?.alive ?? false) alive.add(i);
     }
-    if (alive.length <= 1 && players.length > 1) {
-      _gameEnded = true;
-      winner = alive.isEmpty ? -1 : alive.first;
-      phase = GamePhase.gameOver;
-      statusMessage = winner == null || winner == -1 ? 'DRAW!' : '${players[winner!].name} WINS!';
-      // In hot-seat "Local 2P" (mode == GameMode.local) both seats are human
-      // and share this device's single account — there's no separate profile
-      // per local player. So a win for either seat should count as a win for
-      // the account, not just a win for player 0. Other modes (vs AI, hotspot)
-      // still key off player 0 specifically, since that's the local player.
-      final winningPlayerIsHuman = winner != null && winner! >= 0 && !players[winner!].isAi;
-      final humanWon = mode == GameMode.local ? winningPlayerIsHuman : (winner == 0 && !players[0].isAi);
-      AudioService.instance.sfx(humanWon ? 'victory' : 'defeat');
-      // record progression for the local human account. In local hot-seat
-      // mode this applies as long as at least one seat is human (always true
-      // today); in other modes it's specifically player 0.
-      final shouldRecordProgression =
-          mode == GameMode.local ? players.any((p) => !p.isAi) : !players[0].isAi;
-      if (shouldRecordProgression) {
-        SaveService.instance.recordMatch(
-          won: humanWon,
-          damageDealt: damageDealtByHuman,
-          mode: mode.name,
-          map: settings.map.name,
-        );
-      }
-      return true;
-    }
-    return false;
-  }
+    if (alive.length > 1 || players.length <= 1) return false;
 
-  // -------------------------------------------------------------------------
-  // Firing (human input or AI or network)
-  // -------------------------------------------------------------------------
+    _gameEnded = true;
+    winner = alive.isEmpty ? -1 : alive.first;
+    phase = GamePhase.gameOver;
+    statusMessage = winner == -1 ? 'DRAW!' : '${players[winner!].name} WINS!';
 
-  Offset get muzzlePos {
-    final chars = world.charactersOf(currentPlayer);
-    if (chars.isEmpty) return Offset.zero;
-    final c = chars.first.pos;
-    return c + Offset(cos(aimAngle), sin(aimAngle)) * 30;
-  }
+    // In hot-seat local play both seats share this device's single account, so
+    // a win for either human seat counts for the account. Other modes key off
+    // player 0 specifically, since that's the local player.
+    final winnerIsHuman = winner != null && winner! >= 0 && !players[winner!].isAi;
+    final humanWon = mode == GameMode.local ? winnerIsHuman : (winner == 0 && !players[0].isAi);
+    AudioService.instance.sfx(humanWon ? 'victory' : 'defeat');
 
-  bool get canHumanAct {
-    if (phase != GamePhase.aiming) return false;
-    final p = players[currentPlayer];
-    if (p.isAi) return false;
-    if (mode == GameMode.hotspot && net != null) {
-      return currentPlayer == myPlayerIndex;
+    final shouldRecord = mode == GameMode.local
+        ? players.any((p) => !p.isAi)
+        : !players[0].isAi;
+    if (shouldRecord) {
+      SaveService.instance.recordMatch(
+        won: humanWon,
+        damageDealt: damageDealtByHuman,
+        mode: mode.name,
+        map: settings.map.name,
+      );
     }
     return true;
   }
 
+  // ---------------------------------------------------------------------------
+  // Aiming + firing
+  // ---------------------------------------------------------------------------
+
+  bool get canHumanAct {
+    if (phase != GamePhase.aiming || _shotCommitted) return false;
+    if (currentPlayer < 0 || currentPlayer >= players.length) return false;
+    if (players[currentPlayer].isAi) return false;
+    if (mode == GameMode.hotspot && net != null) return currentPlayer == myPlayerIndex;
+    return true;
+  }
+
+  Raft? get currentRaft => world.raftOf(currentPlayer);
+
+  WeaponDef get selectedWeapon => Weapons.byId(selectedWeaponId);
+
+  /// Weapons offered on the HUD: enabled for this match and either infinite
+  /// or actually stocked.
+  List<WeaponDef> get availableWeapons => Weapons.all
+      .where((w) => settings.enabledWeapons.contains(w.id))
+      .where((w) => w.infinite || (ammo[w.id] ?? 0) > 0 || w.id == selectedWeaponId)
+      .toList();
+
+  int ammoFor(String weaponId) {
+    final w = Weapons.byId(weaponId);
+    if (w.infinite) return -1; // sentinel: renders as ∞
+    return ammo[weaponId] ?? 0;
+  }
+
+  bool _hasAmmoFor(String weaponId) {
+    final w = Weapons.byId(weaponId);
+    return w.infinite || (ammo[weaponId] ?? 0) > 0;
+  }
+
+  bool selectWeapon(String weaponId) {
+    if (!_hasAmmoFor(weaponId)) return false;
+    selectedWeaponId = weaponId;
+    notifyListeners();
+    return true;
+  }
+
+  /// Applies a pull-back drag. [dx]/[dy] are the pull vector (origin minus
+  /// current finger), so pulling back and down aims forward and up.
+  void applyPullAim(double dx, double dy) {
+    if (!canHumanAct) return;
+    final target = shapeAim(dx, dy);
+    if (target == null) return;
+    final eased = easeAim(aimAngle, aimPower, target);
+    aimAngle = eased.angle.clamp(BattleConst.angleMin, BattleConst.angleMax);
+    aimPower = eased.power.clamp(BattleConst.powerMin, BattleConst.powerMax);
+    aimFine = target.fine;
+    notifyListeners();
+  }
+
+  /// Fine adjustment from the ▾▴−+ buttons.
+  void nudgeAngle(double delta) {
+    if (!canHumanAct) return;
+    aimAngle = (aimAngle + delta).clamp(BattleConst.angleMin, BattleConst.angleMax);
+    notifyListeners();
+  }
+
+  void nudgePower(double delta) {
+    if (!canHumanAct) return;
+    aimPower = (aimPower + delta).clamp(BattleConst.powerMin, BattleConst.powerMax);
+    notifyListeners();
+  }
+
   void humanFire() {
-    if (!canHumanAct || phase != GamePhase.aiming) return;
-    final w = Weapons.byId(selectedWeaponId);
-    if (mode == GameMode.hotspot && net != null && !_isClientLocalTurn()) {
-      return;
-    }
+    if (!canHumanAct) return;
+    if (!_hasAmmoFor(selectedWeaponId)) return;
+    final w = selectedWeapon;
     if (mode == GameMode.hotspot && net != null) {
-      net!.send({'t': 'fire', 'a': aimAngle, 'p': aimPower, 'w': w.id});
+      if (currentPlayer != myPlayerIndex) return;
+      net!.send({'t': 'fire', 'a': aimAngle, 'p': aimPower, 'w': w.id, 'pl': currentPlayer});
     }
     _doFire(aimAngle, aimPower, w);
   }
 
-  bool _isClientLocalTurn() => currentPlayer == myPlayerIndex;
-
+  /// The single choke point every shot passes through — human release, AI plan
+  /// or network message. None of those callers are trusted: UI maths can
+  /// produce a stray NaN, and network JSON is attacker-adjacent even on a
+  /// friendly hotspot link. The firing lock flips before any projectile work
+  /// starts, so this can never create two shots for one turn.
   void _doFire(double angle, double power, WeaponDef weapon, {bool fromNetwork = false}) {
-    aimAngle = angle;
-    aimPower = power;
-    final from = muzzlePos;
-    world.fire(from: from, angleRad: angle, power: power, weapon: weapon, owner: currentPlayer);
-    SaveService.instance.data.shotsFired++;
-    phase = GamePhase.firing;
-    AudioService.instance.sfx('fire');
-    if (weapon.behavior == 'rocket') AudioService.instance.sfx('whoosh', volume: 0.6);
-  }
-
-  // -------------------------------------------------------------------------
-  // Building phase
-  // -------------------------------------------------------------------------
-
-  PlayerConfig get buildingPlayerConfig => players[buildingPlayer];
-
-  bool get canHumanBuild {
-    if (phase != GamePhase.building) return false;
-    if (mode == GameMode.hotspot && net != null) {
-      return buildingPlayer == myPlayerIndex;
-    }
-    return !players[buildingPlayer].isAi;
-  }
-
-  /// Build area: near the player's spawn. Width is capped by how much room
-  /// is actually available between neighbouring players (accounting for the
-  /// spawn platform's own position jitter) so build areas never overlap —
-  /// a fixed 300px worked for 2 players but could overlap in 3-4 player
-  /// matches, where slots sit much closer together.
-  Rect buildAreaFor(int player) {
-    final spawn = MapBuilder.spawnFor(world, player, players.length);
-    final spacing = MapBuilder.slotSpacing(world.width, players.length);
-    final width = (spacing - 100).clamp(180.0, 300.0);
-    return Rect.fromCenter(center: Offset(spawn.dx, spawn.dy - 40), width: width, height: 280);
-  }
-
-  /// Why (if at all) [piece] can't be placed at (x, y) right now — shared by
-  /// the actual placement call and the UI's ghost-preview so both always
-  /// agree on what's valid.
-  PlacementBlocker checkPlacement(double x, double y, PieceDef piece) {
-    if (piecesLeft <= 0) return PlacementBlocker.noPiecesLeft;
-    final area = buildAreaFor(buildingPlayer);
-    if (!area.contains(Offset(x, y))) return PlacementBlocker.outsideArea;
-    final testRect = Rect.fromCenter(center: Offset(x, y), width: piece.size.width, height: piece.size.height);
-    for (final b in world.bodies) {
-      if (b.dead) continue;
-      if (b.aabb.inflate(-4).overlaps(testRect)) return PlacementBlocker.overlapping;
-    }
-    return PlacementBlocker.none;
-  }
-
-  bool canPlaceAt(double x, double y, PieceDef piece) => checkPlacement(x, y, piece) == PlacementBlocker.none;
-
-  bool placeBuildingPiece(double x, double y, double rot, PieceDef piece) {
-    if (!canHumanBuild || piecesLeft <= 0) return false;
-    if (mode == GameMode.hotspot && net != null) {
-      net!.send({'t': 'block', 'id': piece.id, 'x': x, 'y': y, 'r': rot, 'pl': buildingPlayer});
-    }
-    return _placeBlock(x, y, rot, piece, players[buildingPlayer]);
-  }
-
-  bool _placeBlock(double x, double y, double rot, PieceDef piece, PlayerConfig player, {bool fromNetwork = false}) {
-    if (checkPlacement(x, y, piece) != PlacementBlocker.none) return false;
-    world.addBlock(
-      pos: Offset(x, y),
-      size: piece.size,
-      material: piece.material,
-      angle: rot,
-      playerIndex: buildingPlayer,
-    );
-    piecesLeft--;
-    SaveService.instance.data.blocksPlaced++;
-    AudioService.instance.sfx('place');
-    statusMessage = '${players[buildingPlayer].name}: fortify! ($piecesLeft left)';
-    if (piecesLeft <= 0) _advanceBuilding(fromNetwork: fromNetwork);
-    return true;
-  }
-
-  void finishBuilding({bool fromNetwork = false}) {
-    if (mode == GameMode.hotspot && net != null && !fromNetwork) {
-      net!.send({'t': 'buildDone'});
-    }
-    _advanceBuilding(fromNetwork: fromNetwork);
-  }
-
-  void _advanceBuilding({bool fromNetwork = false}) {
-    // AI builds automatically
-    final next = buildingPlayer + 1;
-    if (next >= players.length) {
-      // done building — auto-build for AI already handled; start battle
-      phase = GamePhase.aiming;
-      _beginTurn(0, initial: true);
+    if (_shotCommitted) {
+      if (kDebugMode) debugPrint('[fire] rejected: already committed (network=$fromNetwork)');
       return;
     }
-    buildingPlayer = next;
-    piecesLeft = settings.buildLimit;
-    if (players[buildingPlayer].isAi) {
-      _aiBuild(buildingPlayer);
-      _advanceBuilding(fromNetwork: fromNetwork);
-    } else {
-      statusMessage = '${players[buildingPlayer].name}: fortify your raft! ($piecesLeft left)';
-      final spawn = MapBuilder.spawnFor(world, buildingPlayer, players.length);
-      _camTarget = spawn;
-      _camZoomTarget = 0.8;
+    if (phase != GamePhase.aiming) {
+      if (kDebugMode) debugPrint('[fire] rejected: phase=$phase (network=$fromNetwork)');
+      return;
     }
-  }
+    if (!angle.isFinite || !power.isFinite) {
+      if (kDebugMode) debugPrint('[fire] rejected: non-finite angle=$angle power=$power');
+      return;
+    }
+    final raft = world.raftOf(currentPlayer);
+    if (raft == null || !raft.alive) {
+      if (kDebugMode) debugPrint('[fire] rejected: no living shooter for player=$currentPlayer');
+      return;
+    }
+    final safeWeapon = Weapons.all.contains(weapon) ? weapon : Weapons.starter;
+    final safeAngle = angle.clamp(BattleConst.angleMin, BattleConst.angleMax);
+    final safePower = power.clamp(BattleConst.powerMin, BattleConst.powerMax);
 
-  void _aiBuild(int player) {
-    final spawn = MapBuilder.spawnFor(world, player, players.length);
-    final dir = spawn.dx < worldW / 2 ? -1 : 1;
-    final rnd = Random(player * 999);
-    int placed = 0;
-    int guard = 0;
-    while (placed < settings.buildLimit && guard < 60) {
-      guard++;
-      final piece = PieceDef.catalogue[rnd.nextInt(PieceDef.catalogue.length)];
-      final x = spawn.dx + dir * (30 + rnd.nextDouble() * 90) + (rnd.nextDouble() - 0.5) * 30;
-      final y = spawn.dy - 20 - rnd.nextDouble() * 130;
-      final rot = piece.size.width > piece.size.height ? 0.0 : (rnd.nextBool() ? 0.0 : pi / 2);
-      final testRect = Rect.fromCenter(center: Offset(x, y), width: piece.size.width + 8, height: piece.size.height + 8);
-      bool blocked = false;
-      for (final b in world.bodies) {
-        if (!b.dead && b.aabb.overlaps(testRect)) { blocked = true; break; }
+    // Only the human side spends ammo; enemy loadouts are scripted per level.
+    if (!players[currentPlayer].isAi && !safeWeapon.infinite) {
+      final left = ammo[safeWeapon.id] ?? 0;
+      if (left <= 0) {
+        if (kDebugMode) debugPrint('[fire] rejected: out of ${safeWeapon.id}');
+        return;
       }
-      if (blocked) continue;
-      world.addBlock(pos: Offset(x, y), size: piece.size, material: piece.material, angle: rot, playerIndex: player);
-      placed++;
+      ammo[safeWeapon.id] = left - 1;
+      if (ammo[safeWeapon.id] == 0) selectedWeaponId = Weapons.starter.id;
     }
-  }
 
-  // -------------------------------------------------------------------------
-  // Camera helpers
-  // -------------------------------------------------------------------------
+    _shotCommitted = true;
+    phase = GamePhase.firing;
+    _accum = 0;
+    aimAngle = safeAngle;
+    aimPower = safePower;
+    isCharging = false;
 
-  void _fitZoom() {
-    _camZoomTarget = 1.0;
-  }
-
-  // The renderer paints sky/water/ground art well beyond the physics bounds
-  // specifically so the player never sees the world's raw rectangular edge
-  // (see WorldRenderer's edge margin). That only holds if the camera itself
-  // never strays far enough to outrun that extended art — this clamp is the
-  // other half of that contract: it bounds camPos/camTarget to a budget the
-  // renderer's margin comfortably covers at any zoom this game allows
-  // (0.5x-1.6x), even while chasing a wild projectile or an explosion-
-  // launched ragdoll near/past the map's edge.
-  static const double _camMarginX = 480;
-  static const double _camMarginY = 360;
-
-  Offset _clampCamera(Offset p) => Offset(
-        p.dx.clamp(-_camMarginX, worldW + _camMarginX),
-        p.dy.clamp(-_camMarginY, worldH + _camMarginY),
-      );
-
-  void zoomCamera(double delta) {
-    _camZoomTarget = (_camZoomTarget + delta).clamp(0.5, 1.6);
-  }
-
-  void panCamera(Offset delta) {
-    if (phase == GamePhase.aiming) {
-      _camTarget += delta / camZoom;
-      _camTarget = Offset(
-        _camTarget.dx.clamp(0, worldW),
-        _camTarget.dy.clamp(0, worldH),
-      );
+    if (kDebugMode) {
+      debugPrint('[fire] player=$currentPlayer weapon=${safeWeapon.id} '
+          'angle=${safeAngle.toStringAsFixed(1)} power=${safePower.toStringAsFixed(1)} '
+          'network=$fromNetwork');
     }
+
+    world.fire(
+      from: raft.muzzle,
+      angleDeg: safeAngle,
+      power: safePower,
+      facing: raft.facing,
+      weapon: safeWeapon,
+      owner: currentPlayer,
+      powerMultiplier: players[currentPlayer].powerMultiplier,
+    );
+
+    shotsFired++;
+    SaveService.instance.data.shotsFired++;
+    AudioService.instance.sfx('fire');
+    statusMessage = players[currentPlayer].isAi ? 'Return fire!' : 'Shot away!';
   }
 
-  /// Recenters the camera on an arbitrary world point — used by the
-  /// building UI's "recenter" button, since [resetCameraToPlayer] targets
-  /// whoever's turn it is to fire, not necessarily whoever's building.
-  void panCameraTo(Offset pos) {
-    _camTarget = pos;
-    _camZoomTarget = 1.0;
-  }
+  /// Accuracy as a percentage string for the result panel.
+  String get accuracyLabel =>
+      shotsFired == 0 ? '—' : '${(shotsHit / shotsFired * 100).round()}%';
 
-  void resetCameraToPlayer() {
-    final chars = world.charactersOf(currentPlayer);
-    if (chars.isNotEmpty) {
-      _camTarget = chars.first.pos;
-      _camZoomTarget = 1.0;
-    }
-  }
+  /// Living enemy rafts currently off the right edge of the view — drives the
+  /// design's "N FOE AHEAD ▸" marker.
+  int get offscreenFoes => world
+      .enemiesOf(0)
+      .where((r) => world.isOffscreenRight(r.x))
+      .length;
 
-  // -------------------------------------------------------------------------
+  // ---------------------------------------------------------------------------
 
   void resetMatch({int? seed}) {
     _gameEnded = false;
     winner = null;
     round = 1;
     damageDealtByHuman = 0;
-    final s = seed ?? DateTime.now().millisecondsSinceEpoch;
-    world = PhysicsWorld(
-      width: worldW,
-      height: worldH,
-      waterLevel: worldH - 150,
-      seed: s,
-      mapHazard: settings.map.hazard,
-      environment: settings.map.terrain,
-    );
-    _setupWorld(s, skipBuildPhase: settings.buildLimit == 0);
-  }
-
-  List<WeaponDef> get availableWeapons {
-    final base = players[currentPlayer].isAi
-        ? Weapons.all
-        : SaveService.instance.data.unlockedWeapons;
-    return base.where((w) => settings.enabledWeapons.contains(w.id)).toList();
+    shotsFired = 0;
+    shotsHit = 0;
+    _shotCommitted = false;
+    _aiShotQueued = false;
+    _accum = 0;
+    aimAngle = 45;
+    aimPower = 70;
+    _setup(seed ?? DateTime.now().millisecondsSinceEpoch);
   }
 
   @override

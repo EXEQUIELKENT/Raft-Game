@@ -75,7 +75,7 @@ class StatsScreen extends StatelessWidget {
                       children: [
                         _statCard('SHOTS', '${d.shotsFired}', RT.orange, Icons.gps_fixed),
                         _statCard('DAMAGE', '${d.totalDamage}', RT.purple, Icons.flash_on),
-                        _statCard('BLOCKS', '${d.blocksPlaced}', RT.pink, Icons.construction),
+                        _statCard('RAFT TIER', '${d.raftTier + 1}', RT.pink, Icons.sailing),
                       ],
                     ),
                     const SizedBox(height: 16),

@@ -1,51 +1,26 @@
-import 'dart:math';
-import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+
 import '../game/audio.dart';
+import '../game/battle.dart';
+import '../game/campaign.dart';
 import '../game/controller.dart';
-import '../game/maps.dart';
 import '../game/models.dart';
-import '../game/physics.dart';
 import '../game/renderer.dart';
 import '../game/save.dart';
 import '../theme.dart';
-
-/// A [PanGestureRecognizer] that refuses to enter the gesture arena for
-/// touches that start inside a set of excluded screen regions.
-///
-/// [GameScreen] wraps the whole board in a single pan recognizer to drive
-/// aim-dragging, but that recognizer is an *ancestor* of the horizontally
-/// scrolling weapon wheel and build-piece palette. Because Flutter adds
-/// every recognizer along the hit-test path to the same gesture arena, the
-/// full-screen pan recognizer would otherwise race the lists' own drag
-/// recognizers on every touch, making the lists feel janky. Rejecting the
-/// pointer up front (via [isPointerAllowed]) keeps the aim recognizer out
-/// of the arena entirely for those regions, leaving the lists' scroll
-/// recognizers to win uncontested.
-class _AimPanGestureRecognizer extends PanGestureRecognizer {
-  _AimPanGestureRecognizer({required this.excludedRectsProvider});
-
-  /// Returns the current global-coordinate rects (e.g. the weapon wheel and
-  /// build-piece palette) that should not trigger aim-dragging.
-  List<Rect> Function() excludedRectsProvider;
-
-  @override
-  bool isPointerAllowed(PointerEvent event) {
-    for (final rect in excludedRectsProvider()) {
-      if (rect.contains(event.position)) return false;
-    }
-    return super.isPointerAllowed(event);
-  }
-}
 
 class GameScreen extends StatefulWidget {
   final MatchSettings settings;
   final List<PlayerConfig> players;
   final GameMode mode;
   final int? seed;
-  final bool skipBuildPhase;
   final GameController? controller;
+
+  /// When set, this match is a campaign battle: the result panel shows
+  /// stars/doubloons earned and campaign navigation instead of the generic
+  /// rematch buttons, and a win is recorded exactly once.
+  final CampaignLevel? campaignLevel;
 
   const GameScreen({
     super.key,
@@ -53,8 +28,8 @@ class GameScreen extends StatefulWidget {
     required this.players,
     required this.mode,
     this.seed,
-    this.skipBuildPhase = false,
     this.controller,
+    this.campaignLevel,
   });
 
   @override
@@ -65,58 +40,40 @@ class _GameScreenState extends State<GameScreen> {
   late GameController ctrl;
   late WorldRenderer renderer;
 
-  // ---------------------------------------------------------------------
-  // Aiming: press-drag-release "slingshot" gesture. The drag is anchored to
-  // the shooter's own on-screen position (captured once at drag-start), not
-  // an arbitrary relative delta — pulling the finger away from the
-  // character aims/charges in the opposite direction, exactly like a
-  // slingshot, and lifting the finger fires directly (no separate button
-  // press required, though the FIRE button remains as a fallback).
-  // ---------------------------------------------------------------------
-  Offset? _aimAnchorScreen;
-  Offset? _fingerScreen;
+  // ---------------------------------------------------------------------------
+  // Pull-back aiming.
+  //
+  // Raw Listener pointer events rather than a GestureDetector: a pan
+  // recognizer waits for the pointer to cross Flutter's ~18px slop before it
+  // reports anything, which reads as lag on a gesture that should feel like a
+  // direct slingshot pull. The design's own dead zone (16 world units) is the
+  // only threshold left.
+  // ---------------------------------------------------------------------------
+  Offset? _dragOrigin;
+  Offset? _dragCurrent;
   bool _charging = false;
-  static const double _minDragPx = 16; // ignore tiny jitters — no accidental aims/shots
-  static const double _basePullPx = 165; // drag distance (at sensitivity 1.0) for 100% power
+  int? _activePointerId;
 
-  // Bounds of the horizontally-scrolling lists that must stay usable
-  // underneath the full-screen aim-drag gesture (see _AimPanGestureRecognizer).
-  final GlobalKey _weaponWheelKey = GlobalKey();
-  final GlobalKey _piecePaletteKey = GlobalKey();
+  /// Widgets that own their own taps and must not also drive aiming.
+  final GlobalKey _weaponBarKey = GlobalKey();
+  final GlobalKey _nudgeBarKey = GlobalKey();
+  final GlobalKey _topBarKey = GlobalKey();
 
-  List<Rect> _excludedAimGestureRects() {
-    final rects = <Rect>[];
-    for (final key in [_weaponWheelKey, _piecePaletteKey]) {
-      final box = key.currentContext?.findRenderObject() as RenderBox?;
-      if (box == null || !box.attached) continue;
-      rects.add(box.localToGlobal(Offset.zero) & box.size);
-    }
-    return rects;
-  }
-
-  // building state
-  PieceDef _selectedPiece = PieceDef.catalogue.first;
-  Offset? _ghostPos;
-  double _ghostRot = 0;
-
-  // ---------------------------------------------------------------------
-  // HUD rebuild throttling: the world/aim/ghost canvases repaint every
-  // physics tick on their own (see the AnimatedBuilder in build()), but the
-  // surrounding HUD — player cards, weapon wheel, piece palette, buttons —
-  // has no reason to rebuild 60 times a second when nothing it displays has
-  // actually changed. _onUpdate runs every tick (needed for the renderer
-  // rebind below) but only calls setState when one of these snapshotted
-  // fields is actually different from last time.
-  // ---------------------------------------------------------------------
+  // HUD rebuild throttling: the world canvas repaints every tick on its own,
+  // but the surrounding HUD has no reason to rebuild 60x a second when nothing
+  // it displays has changed.
   GamePhase? _lastPhase;
   int _lastPlayer = -1;
   int _lastTurnSec = -1;
-  double _lastWind = 0;
   String _lastStatus = '';
-  int _lastPieces = -1;
-  int _lastBuildingPlayer = -1;
   int? _lastWinner;
+  int _lastAngle = -1;
+  int _lastPower = -1;
+  String _lastWeapon = '';
   List<int> _lastHp = const [];
+
+  int? _campaignStars;
+  int? _campaignReward;
 
   @override
   void initState() {
@@ -128,63 +85,9 @@ class _GameScreenState extends State<GameScreen> {
           players: widget.players,
           mode: widget.mode,
           seed: widget.seed,
-          skipBuildPhase: widget.skipBuildPhase,
         );
-    renderer = WorldRenderer(
-      ctrl.world,
-      map: ctrl.settings.map,
-      charColors: widget.players.map((p) => RT.playerColors[p.colorIndex % RT.playerColors.length]).toList(),
-      charHats: widget.players.map((p) => p.hatIndex).toList(),
-      quality: SaveService.instance.data.quality,
-    );
+    renderer = WorldRenderer(ctrl.world, map: ctrl.settings.map);
     ctrl.addListener(_onUpdate);
-  }
-
-  void _onUpdate() {
-    if (ctrl.phase == GamePhase.firing || ctrl.phase == GamePhase.settling) {
-      // rebind renderer world (world object persists but be safe)
-      renderer = WorldRenderer(
-        ctrl.world,
-        map: ctrl.settings.map,
-        charColors: widget.players.map((p) => RT.playerColors[p.colorIndex % RT.playerColors.length]).toList(),
-        charHats: widget.players.map((p) => p.hatIndex).toList(),
-        quality: SaveService.instance.data.quality,
-      );
-    }
-    if (!mounted) return;
-
-    final hp = [
-      for (int i = 0; i < ctrl.players.length; i++)
-        ctrl.world.charactersOf(i).fold<int>(0, (s, c) => s + max(0, c.hp).round()),
-    ];
-    final turnSec = ctrl.turnTimeLeft.ceil();
-    var hpChanged = hp.length != _lastHp.length;
-    if (!hpChanged) {
-      for (int i = 0; i < hp.length; i++) {
-        if (hp[i] != _lastHp[i]) { hpChanged = true; break; }
-      }
-    }
-    final dirty = _lastPhase != ctrl.phase ||
-        _lastPlayer != ctrl.currentPlayer ||
-        _lastTurnSec != turnSec ||
-        (_lastWind - ctrl.wind).abs() > 0.005 ||
-        _lastStatus != ctrl.statusMessage ||
-        _lastPieces != ctrl.piecesLeft ||
-        _lastBuildingPlayer != ctrl.buildingPlayer ||
-        _lastWinner != ctrl.winner ||
-        hpChanged;
-    if (dirty) {
-      _lastPhase = ctrl.phase;
-      _lastPlayer = ctrl.currentPlayer;
-      _lastTurnSec = turnSec;
-      _lastWind = ctrl.wind;
-      _lastStatus = ctrl.statusMessage;
-      _lastPieces = ctrl.piecesLeft;
-      _lastBuildingPlayer = ctrl.buildingPlayer;
-      _lastWinner = ctrl.winner;
-      _lastHp = hp;
-      setState(() {});
-    }
   }
 
   @override
@@ -198,177 +101,137 @@ class _GameScreenState extends State<GameScreen> {
     super.dispose();
   }
 
+  void _onUpdate() {
+    if (!mounted) return;
+    final hp = [for (final r in ctrl.world.rafts) r.hp.round()];
+    var hpChanged = hp.length != _lastHp.length;
+    if (!hpChanged) {
+      for (int i = 0; i < hp.length; i++) {
+        if (hp[i] != _lastHp[i]) {
+          hpChanged = true;
+          break;
+        }
+      }
+    }
+    final turnSec = ctrl.turnTimeLeft.ceil();
+    final angle = ctrl.aimAngle.round();
+    final power = ctrl.aimPower.round();
+    final enteringGameOver = _lastPhase != GamePhase.gameOver && ctrl.phase == GamePhase.gameOver;
+
+    final dirty = _lastPhase != ctrl.phase ||
+        _lastPlayer != ctrl.currentPlayer ||
+        _lastTurnSec != turnSec ||
+        _lastStatus != ctrl.statusMessage ||
+        _lastWinner != ctrl.winner ||
+        _lastAngle != angle ||
+        _lastPower != power ||
+        _lastWeapon != ctrl.selectedWeaponId ||
+        _charging ||
+        hpChanged;
+
+    if (dirty) {
+      _lastPhase = ctrl.phase;
+      _lastPlayer = ctrl.currentPlayer;
+      _lastTurnSec = turnSec;
+      _lastStatus = ctrl.statusMessage;
+      _lastWinner = ctrl.winner;
+      _lastAngle = angle;
+      _lastPower = power;
+      _lastWeapon = ctrl.selectedWeaponId;
+      _lastHp = hp;
+      setState(() {});
+    }
+    if (enteringGameOver && widget.campaignLevel != null) _recordCampaignResult();
+  }
+
+  void _recordCampaignResult() {
+    final level = widget.campaignLevel;
+    if (level == null || ctrl.winner != 0) return; // only victories earn stars
+    final me = ctrl.world.raftOf(0);
+    final frac = me?.hpFrac ?? 0.0;
+    final stars = Campaign.starsForHpFraction(frac);
+    final reward = SaveService.instance.recordCampaignLevel(level: level, stars: stars);
+    if (!mounted) return;
+    setState(() {
+      _campaignStars = stars;
+      _campaignReward = reward;
+    });
+  }
+
   // ---------------------------------------------------------------------------
-  // Input handling
+  // Input
   // ---------------------------------------------------------------------------
 
-  void _onPanStart(DragStartDetails d) {
-    if (ctrl.phase == GamePhase.building && ctrl.canHumanBuild) {
-      setState(() => _ghostPos = _snapGhost(_toWorld(d.localPosition)));
-      return;
+  List<Rect> _excludedRects() {
+    final rects = <Rect>[];
+    for (final key in [_weaponBarKey, _nudgeBarKey, _topBarKey]) {
+      final box = key.currentContext?.findRenderObject() as RenderBox?;
+      if (box == null || !box.attached) continue;
+      rects.add(box.localToGlobal(Offset.zero) & box.size);
+    }
+    return rects;
+  }
+
+  void _onPointerDown(PointerDownEvent e) {
+    if (_activePointerId != null) return;
+    for (final rect in _excludedRects()) {
+      if (rect.contains(e.position)) return;
     }
     if (!ctrl.canHumanAct) return;
-    final me = ctrl.world.charactersOf(ctrl.currentPlayer);
-    if (me.isEmpty) return;
+    _activePointerId = e.pointer;
     setState(() {
-      _aimAnchorScreen = _toScreen(me.first.pos);
-      _fingerScreen = d.localPosition;
+      _dragOrigin = e.localPosition;
+      _dragCurrent = e.localPosition;
       _charging = true;
+      ctrl.isCharging = true;
     });
   }
 
-  void _onPanUpdate(DragUpdateDetails d) {
-    if (ctrl.phase == GamePhase.building && ctrl.canHumanBuild) {
-      setState(() => _ghostPos = _snapGhost(_toWorld(d.localPosition)));
-      return;
-    }
-    if (!ctrl.canHumanAct || !_charging || _aimAnchorScreen == null) return;
-    _fingerScreen = d.localPosition;
-
-    // Slingshot model: aim direction is straight from the current finger
-    // position back toward the anchor (pull back, launch forward) — no
-    // relative-delta math, so what you see is exactly where you're
-    // pointing. Small movements below the drag threshold are ignored
-    // entirely (don't even nudge the last committed aim) so a light touch
-    // can't cause a stray angle change or, on release, an accidental shot.
-    final pull = _fingerScreen! - _aimAnchorScreen!;
-    final dist = pull.distance;
-    if (dist < _minDragPx) {
-      setState(() {});
-      return;
-    }
-
-    final me = ctrl.world.charactersOf(ctrl.currentPlayer);
-    if (me.isEmpty) return;
-    final enemies = _enemiesOf(ctrl.currentPlayer);
-    final facingLeft = enemies.isNotEmpty && enemies.first.pos.dx < me.first.pos.dx;
-
-    double newAngle = atan2(-pull.dy, -pull.dx);
-    if (SaveService.instance.data.aimAssist) {
-      newAngle = _applyAimAssist(newAngle, me.first.pos, ctrl.currentPlayer);
-    }
-    // constrain angle to upper hemisphere facing enemies
-    if (facingLeft) {
-      newAngle = newAngle.clamp(pi * 0.5, pi * 0.98);
-      if (newAngle > pi * 0.5 && newAngle < pi * 0.55) newAngle = pi * 0.55;
-    } else {
-      newAngle = newAngle.clamp(-pi * 0.98, -pi * 0.02);
-    }
-
-    // Higher sensitivity = less physical drag distance needed for full
-    // power — the opposite of the old relative-delta scheme, but the same
-    // "bigger number = more sensitive" feel from the settings screen.
-    final sens = SaveService.instance.data.sensitivity.clamp(0.25, 4.0);
-    final maxPull = (_basePullPx / sens).clamp(60.0, 420.0);
-    final newPower = ((dist - _minDragPx) / maxPull).clamp(0.1, 1.0);
-
-    setState(() {
-      ctrl.aimAngle = newAngle;
-      ctrl.aimPower = newPower;
-    });
+  void _onPointerMove(PointerMoveEvent e) {
+    if (e.pointer != _activePointerId || !_charging) return;
+    _dragCurrent = e.localPosition;
+    final origin = _dragOrigin;
+    if (origin == null) return;
+    // Slingshot pull, measured against the shooter's facing: dragging *away*
+    // from the direction of fire builds power, and dragging down lifts the
+    // arc. A raft firing left is mirrored so the gesture feels identical from
+    // either side.
+    final facing = ctrl.currentRaft?.facing ?? 1;
+    final pullBack = (origin.dx - e.localPosition.dx) * facing;
+    final pullDown = e.localPosition.dy - origin.dy;
+    ctrl.applyPullAim(pullBack, pullDown);
+    setState(() {});
   }
 
-  void _onPanEnd(DragEndDetails d) {
-    if (ctrl.phase == GamePhase.building && ctrl.canHumanBuild) {
-      if (_ghostPos != null) _placeGhost();
-      return;
-    }
+  void _onPointerUp(PointerUpEvent e) {
+    if (e.pointer != _activePointerId) return;
+    _activePointerId = null;
+    final origin = _dragOrigin;
+    final current = _dragCurrent;
     final wasCharging = _charging;
-    final anchor = _aimAnchorScreen;
-    final finger = _fingerScreen;
     setState(() {
       _charging = false;
-      _aimAnchorScreen = null;
-      _fingerScreen = null;
+      ctrl.isCharging = false;
+      _dragOrigin = null;
+      _dragCurrent = null;
     });
-    if (!wasCharging || !ctrl.canHumanAct || anchor == null || finger == null) return;
-    // Release-to-fire: only a deliberate drag (past the same threshold that
-    // gates aim updates) actually launches a shot, so a light tap or tiny
-    // wobble can never fire by accident.
-    if ((finger - anchor).distance >= _minDragPx) {
-      if (SaveService.instance.data.vibration) HapticFeedback.heavyImpact();
-      ctrl.humanFire();
-    }
+    if (!wasCharging || origin == null || current == null) return;
+    // Only a deliberate pull past the dead zone fires — a stray tap never does.
+    if ((current - origin).distance < BattleConst.deadzone) return;
+    if (SaveService.instance.data.vibration) HapticFeedback.heavyImpact();
+    ctrl.humanFire();
   }
 
-  /// Nudges [rawAngle] onto a direct line-of-sight shot at the nearest enemy
-  /// when the player is already aiming close to it, giving forgiving "snap"
-  /// magnetism for a shot that would otherwise just miss.
-  double _applyAimAssist(double rawAngle, Offset origin, int player) {
-    final enemies = _enemiesOf(player);
-    if (enemies.isEmpty) return rawAngle;
-    const assistCone = 0.05; // ~3 degrees of magnetism
-    double bestAngle = rawAngle;
-    double bestDiff = assistCone;
-    for (final e in enemies) {
-      final toEnemy = e.pos - origin;
-      final angleToEnemy = atan2(toEnemy.dy, toEnemy.dx);
-      var diff = (angleToEnemy - rawAngle).abs();
-      if (diff > pi) diff = 2 * pi - diff;
-      if (diff < bestDiff) {
-        bestDiff = diff;
-        bestAngle = angleToEnemy;
-      }
-    }
-    return bestAngle;
-  }
-
-  List<PhysBody> _enemiesOf(int player) {
-    final list = <PhysBody>[];
-    for (int i = 0; i < ctrl.players.length; i++) {
-      if (i != player) list.addAll(ctrl.world.charactersOf(i));
-    }
-    return list;
-  }
-
-  Offset _toWorld(Offset local) {
-    final size = MediaQuery.of(context).size;
-    return (local - Offset(size.width / 2, size.height / 2)) / ctrl.camZoom + ctrl.camPos;
-  }
-
-  /// Inverse of [_toWorld] — where a world point currently is on screen.
-  /// Used to anchor the slingshot-style aim drag to the shooter's actual
-  /// rendered position.
-  Offset _toScreen(Offset world) {
-    final size = MediaQuery.of(context).size;
-    return (world - ctrl.camPos) * ctrl.camZoom + Offset(size.width / 2, size.height / 2);
-  }
-
-  /// Snaps a raw touch-derived world position to a clean placement: a
-  /// coarse horizontal grid for tidy alignment, plus — if the piece's
-  /// bottom edge is close to an existing block's top surface it already
-  /// overlaps horizontally — locking onto that surface so it visibly rests
-  /// on top instead of needing pixel-perfect placement.
-  Offset _snapGhost(Offset raw) {
-    final piece = _selectedPiece;
-    double x = (raw.dx / 8).roundToDouble() * 8;
-    double y = raw.dy;
-    final halfW = piece.size.width / 2, halfH = piece.size.height / 2;
-    double? snapY;
-    double bestDist = 16;
-    for (final b in ctrl.world.bodies) {
-      if (b.dead) continue;
-      final bb = b.aabb;
-      if (x + halfW < bb.left - 6 || x - halfW > bb.right + 6) continue;
-      final dTop = (y + halfH - bb.top).abs();
-      if (dTop < bestDist) {
-        bestDist = dTop;
-        snapY = bb.top - halfH;
-      }
-    }
-    if (snapY != null) y = snapY;
-    return Offset(x, y);
-  }
-
-  void _placeGhost() {
-    if (_ghostPos == null) return;
-    final ok = ctrl.placeBuildingPiece(_ghostPos!.dx, _ghostPos!.dy, _ghostRot, _selectedPiece);
-    if (ok) {
-      if (SaveService.instance.data.vibration) HapticFeedback.mediumImpact();
-      setState(() => _ghostPos = null);
-    } else {
-      AudioService.instance.sfx('bounce');
-    }
+  /// A gesture the OS interrupts mid-drag must not fire — reset cleanly.
+  void _onPointerCancel(PointerCancelEvent e) {
+    if (e.pointer != _activePointerId) return;
+    _activePointerId = null;
+    setState(() {
+      _charging = false;
+      ctrl.isCharging = false;
+      _dragOrigin = null;
+      _dragCurrent = null;
+    });
   }
 
   // ---------------------------------------------------------------------------
@@ -378,66 +241,24 @@ class _GameScreenState extends State<GameScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      body: Container(
-        decoration: BoxDecoration(
-          gradient: LinearGradient(
-            begin: Alignment.topCenter,
-            end: Alignment.bottomCenter,
-            colors: widget.settings.map.sky,
-          ),
-        ),
-        child: RawGestureDetector(
-          gestures: {
-          _AimPanGestureRecognizer: GestureRecognizerFactoryWithHandlers<_AimPanGestureRecognizer>(
-              () => _AimPanGestureRecognizer(excludedRectsProvider: _excludedAimGestureRects),
-              (instance) {
-                instance
-                  ..excludedRectsProvider = _excludedAimGestureRects
-                  ..onStart = _onPanStart
-                  ..onUpdate = _onPanUpdate
-                  ..onEnd = _onPanEnd;
-              },
-            ),
-          },
-          child: Stack(
-            children: [
-              // World/ghost/aim canvases, wrapped in their own
-              // AnimatedBuilder so they repaint on every controller tick
-              // (camera easing, projectile motion, ragdoll physics) without
-              // rebuilding the HUD below — that's throttled separately in
-              // _onUpdate to only when something it actually shows changes.
-              Positioned.fill(
-                child: AnimatedBuilder(
-                  animation: ctrl,
-                  builder: (context, _) => Stack(
-                    fit: StackFit.expand,
-                    children: [
-                      CustomPaint(painter: _GamePainter(ctrl, renderer)),
-                      if (ctrl.phase == GamePhase.building && ctrl.canHumanBuild && _ghostPos != null)
-                        CustomPaint(painter: _GhostPainter(ctrl, _selectedPiece, _ghostPos!, _ghostRot)),
-                      if (ctrl.phase == GamePhase.aiming && ctrl.world.charactersOf(ctrl.currentPlayer).isNotEmpty)
-                        CustomPaint(
-                          painter: _AimPainter(
-                            ctrl,
-                            charging: _charging,
-                            anchorScreen: _aimAnchorScreen,
-                            fingerScreen: _fingerScreen,
-                          ),
-                        ),
-                    ],
-                  ),
-                ),
+      body: Listener(
+        behavior: HitTestBehavior.opaque,
+        onPointerDown: _onPointerDown,
+        onPointerMove: _onPointerMove,
+        onPointerUp: _onPointerUp,
+        onPointerCancel: _onPointerCancel,
+        child: Stack(
+          children: [
+            Positioned.fill(
+              child: AnimatedBuilder(
+                animation: ctrl,
+                builder: (_, __) => CustomPaint(painter: _ScenePainter(ctrl, renderer)),
               ),
-              // HUD
-              SafeArea(child: _buildHud()),
-              // building UI
-              if (ctrl.phase == GamePhase.building) SafeArea(child: _buildBuildUi()),
-              // turn transition overlay
-              if (ctrl.phase == GamePhase.turnTransition) _buildTransition(),
-              // game over
-              if (ctrl.phase == GamePhase.gameOver) _buildGameOver(),
-            ],
-          ),
+            ),
+            SafeArea(child: _buildHud()),
+            if (_charging && _dragCurrent != null) _pullReadout(),
+            if (ctrl.phase == GamePhase.gameOver) _buildResult(),
+          ],
         ),
       ),
     );
@@ -446,497 +267,260 @@ class _GameScreenState extends State<GameScreen> {
   Widget _buildHud() {
     return Column(
       children: [
-        // top bar: player health cards + wind + timer
-        Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-          child: Row(
-            children: [
-              _pauseBtn(),
-              const SizedBox(width: 8),
-              Expanded(child: _playerCards()),
-              const SizedBox(width: 8),
-              _windIndicator(),
-            ],
-          ),
-        ),
-        const Spacer(),
-        // status message
-        if (ctrl.statusMessage.isNotEmpty)
-          Container(
-            margin: const EdgeInsets.only(bottom: 6),
-            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
-            decoration: RT.card(color: RT.ink.withOpacity(0.75), radius: 20, border: 0),
-            child: Text(ctrl.statusMessage, style: RT.chunky(size: 15, color: Colors.white)),
-          ),
-        // bottom controls (aiming phase only)
-        if (ctrl.phase == GamePhase.aiming && ctrl.canHumanAct) _buildControls(),
-        if (ctrl.phase == GamePhase.aiming && !ctrl.canHumanAct)
-          Padding(
-            padding: const EdgeInsets.only(bottom: 20),
-            child: Container(
-              padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 10),
-              decoration: RT.card(color: Colors.white, radius: 16, border: 3),
-              child: Text(
-                ctrl.players[ctrl.currentPlayer].isAi ? '🤖 ${ctrl.players[ctrl.currentPlayer].name} is thinking…' : "Opponent's turn…",
-                style: RT.chunky(size: 14, color: RT.ink),
+        _topBar(),
+        if (ctrl.offscreenFoes > 0)
+          Align(
+            alignment: Alignment.centerRight,
+            child: Padding(
+              padding: const EdgeInsets.only(right: 22, top: 6),
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 7),
+                decoration: RT.pill(color: RT.ink, opacity: 0.6, radius: 12),
+                child: Text('${ctrl.offscreenFoes} FOE AHEAD ▸',
+                    style: RT.body(size: 11, color: Colors.white, weight: FontWeight.w800)),
               ),
             ),
           ),
+        const Spacer(),
+        _bottomBar(),
       ],
     );
   }
 
-  Widget _pauseBtn() {
+  Widget _topBar() {
+    final save = SaveService.instance.data;
+    final me = ctrl.world.raftOf(0);
+    return Padding(
+      key: _topBarKey,
+      padding: const EdgeInsets.fromLTRB(16, 10, 16, 0),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          _roundBtn('‹', () => Navigator.pop(context), size: 40),
+          const SizedBox(width: 10),
+          // Player health
+          Container(
+            width: 210,
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+            decoration: RT.pill(opacity: 0.8, radius: 14),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    Text('YOUR RAFT',
+                        style: RT.body(size: 10, color: RT.ink, weight: FontWeight.w800, letterSpacing: 1.2)),
+                    Text('${(me?.hp ?? 0).round()}',
+                        style: RT.body(size: 10, color: RT.ink, weight: FontWeight.w800)),
+                  ],
+                ),
+                const SizedBox(height: 4),
+                ClipRRect(
+                  borderRadius: BorderRadius.circular(6),
+                  child: LinearProgressIndicator(
+                    value: me?.hpFrac ?? 0,
+                    minHeight: 9,
+                    backgroundColor: RT.ink.withOpacity(0.14),
+                    valueColor: AlwaysStoppedAnimation(
+                      (me?.hpFrac ?? 0) > 0.5 ? RT.green : ((me?.hpFrac ?? 0) > 0.25 ? RT.orange : RT.red),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+          const Spacer(),
+          _infoChip('ANGLE ${ctrl.aimAngle.round()}° · PWR ${ctrl.aimPower.round()}%'),
+          const SizedBox(width: 8),
+          _infoChip('${_levelLabel()} · ${ctrl.world.enemiesOf(0).length} LEFT'),
+          const SizedBox(width: 8),
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 9),
+            decoration: RT.pill(color: RT.yellow, opacity: 1, radius: 13),
+            child: Text('◉ ${save.doubloons}',
+                style: RT.body(size: 12, color: const Color(0xFF6B4A00), weight: FontWeight.w800)),
+          ),
+        ],
+      ),
+    );
+  }
+
+  String _levelLabel() {
+    final lv = widget.campaignLevel;
+    return lv == null ? 'QUICK' : 'LV ${lv.indexInWorld + 1}';
+  }
+
+  Widget _infoChip(String text) => Container(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 9),
+        decoration: RT.pill(opacity: 0.82, radius: 13),
+        child: Text(text, style: RT.body(size: 12, color: RT.ink, weight: FontWeight.w800)),
+      );
+
+  Widget _bottomBar() {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 0, 16, 14),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.end,
+        children: [
+          _weaponBar(),
+          const Spacer(),
+          _nudgeBar(),
+        ],
+      ),
+    );
+  }
+
+  Widget _weaponBar() {
+    final weapons = ctrl.availableWeapons;
+    return Row(
+      key: _weaponBarKey,
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        for (final w in weapons) ...[
+          _weaponChip(w),
+          const SizedBox(width: 8),
+        ],
+      ],
+    );
+  }
+
+  Widget _weaponChip(WeaponDef w) {
+    final selected = ctrl.selectedWeaponId == w.id;
+    final count = ctrl.ammoFor(w.id);
+    final label = count < 0 ? '×∞' : '×$count';
+    final enabled = count != 0;
     return GestureDetector(
       onTap: () {
-        AudioService.instance.sfx('click');
-        _showPauseMenu();
+        AudioService.instance.sfx(enabled ? 'click' : 'bounce');
+        if (enabled) setState(() => ctrl.selectWeapon(w.id));
       },
-      child: Container(
-        padding: const EdgeInsets.all(8),
-        decoration: RT.card(color: Colors.white, radius: 12, border: 3),
-        child: const Icon(Icons.pause, color: RT.ink, size: 22),
-      ),
-    );
-  }
-
-  Widget _playerCards() {
-    return Row(
-      mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-      children: [
-        for (int i = 0; i < ctrl.players.length; i++)
-          Expanded(child: _playerCard(i)),
-      ],
-    );
-  }
-
-  Widget _playerCard(int i) {
-    final p = ctrl.players[i];
-    final chars = ctrl.world.charactersOf(i);
-    final total = chars.fold<double>(0, (s, c) => s + max(0, c.hp));
-    final maxTotal = ctrl.settings.startHp * max(1, chars.length);
-    final frac = (total / max(maxTotal, 1)).clamp(0.0, 1.0);
-    final active = i == ctrl.currentPlayer && ctrl.phase == GamePhase.aiming;
-    final eliminated = chars.isEmpty;
-
-    return Container(
-      margin: const EdgeInsets.symmetric(horizontal: 3),
-      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 5),
-      decoration: RT.card(
-        color: eliminated ? Colors.grey.shade400 : (active ? RT.yellow : Colors.white),
-        radius: 12,
-        border: active ? 4 : 3,
-      ),
-      child: Column(
-        children: [
-          Row(
+      child: Opacity(
+        opacity: enabled ? 1 : 0.45,
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 13, vertical: 9),
+          decoration: selected
+              ? RT.card(color: RT.orange, radius: 16, border: 0)
+              : RT.pill(opacity: 0.9, radius: 16),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
             children: [
-              Icon(Icons.circle, size: 10, color: RT.playerColors[p.colorIndex % 4]),
-              const SizedBox(width: 4),
-              Expanded(
-                child: Text(
-                  p.name,
-                  overflow: TextOverflow.ellipsis,
-                  style: RT.chunky(size: 11, color: RT.ink),
-                ),
+              Container(
+                width: 22,
+                height: 22,
+                decoration: BoxDecoration(color: w.color, shape: BoxShape.circle),
               ),
-              if (active)
-                Text('${ctrl.turnTimeLeft.ceil()}s', style: RT.chunky(size: 11, color: RT.red)),
-            ],
-          ),
-          const SizedBox(height: 3),
-          ClipRRect(
-            borderRadius: BorderRadius.circular(6),
-            child: LinearProgressIndicator(
-              value: frac,
-              minHeight: 8,
-              backgroundColor: RT.ink.withOpacity(0.2),
-              valueColor: AlwaysStoppedAnimation(frac > 0.5 ? RT.green : frac > 0.25 ? RT.orange : RT.red),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _windIndicator() {
-    final w = ctrl.wind;
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
-      decoration: RT.card(color: Colors.white, radius: 12, border: 3),
-      child: Row(
-        children: [
-          Icon(w.abs() < 0.05 ? Icons.air : (w > 0 ? Icons.east : Icons.west),
-              size: 18, color: RT.blue),
-          const SizedBox(width: 4),
-          Text(w.abs() < 0.05 ? '—' : '${(w.abs() * 10).round()}',
-              style: RT.chunky(size: 12, color: RT.ink)),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildControls() {
-    final weapons = ctrl.availableWeapons;
-    return Padding(
-      padding: const EdgeInsets.only(bottom: 8),
-      child: Column(
-        children: [
-          // weapon wheel
-          SizedBox(
-            key: _weaponWheelKey,
-            height: 64,
-            child: ListView.builder(
-              scrollDirection: Axis.horizontal,
-              padding: const EdgeInsets.symmetric(horizontal: 12),
-              itemCount: weapons.length,
-              itemBuilder: (_, i) {
-                final w = weapons[i];
-                final sel = ctrl.selectedWeaponId == w.id;
-                return GestureDetector(
-                  onTap: () {
-                    AudioService.instance.sfx('click');
-                    setState(() => ctrl.selectedWeaponId = w.id);
-                  },
-                  child: Container(
-                    width: 56,
-                    margin: const EdgeInsets.symmetric(horizontal: 4),
-                    decoration: RT.card(color: sel ? w.color : Colors.white, radius: 14, border: sel ? 4 : 3),
-                    child: Icon(w.icon, color: sel ? Colors.white : w.color, size: 26),
-                  ),
-                );
-              },
-            ),
-          ),
-          const SizedBox(height: 8),
-          Row(
-            mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-            crossAxisAlignment: CrossAxisAlignment.end,
-            children: [
-              // power meter
-              _powerMeter(),
-              // camera controls
+              const SizedBox(width: 8),
               Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
                 children: [
-                  _miniBtn(Icons.add, () => setState(() => ctrl.zoomCamera(0.12))),
-                  const SizedBox(height: 6),
-                  _miniBtn(Icons.remove, () => setState(() => ctrl.zoomCamera(-0.12))),
-                  const SizedBox(height: 6),
-                  _miniBtn(Icons.my_location, () => setState(() => ctrl.resetCameraToPlayer())),
+                  Text(w.chipLabel,
+                      style: RT.body(
+                          size: 10,
+                          color: selected ? Colors.white : RT.ink,
+                          weight: FontWeight.w800,
+                          letterSpacing: 0.8)),
+                  Text(label,
+                      style: RT.body(
+                          size: 11,
+                          color: (selected ? Colors.white : RT.ink).withOpacity(0.78),
+                          weight: FontWeight.w800)),
                 ],
-              ),
-              // FIRE button
-              _fireButton(),
-            ],
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _powerMeter() {
-    return Column(
-      children: [
-        Text('POWER', style: RT.chunky(size: 11, color: Colors.white, outline: 2)),
-        const SizedBox(height: 4),
-        Container(
-          width: 150,
-          height: 26,
-          decoration: RT.card(color: Colors.white, radius: 13, border: 3),
-          child: Stack(
-            children: [
-              FractionallySizedBox(
-                widthFactor: ctrl.aimPower,
-                child: Container(
-                  decoration: BoxDecoration(
-                    borderRadius: BorderRadius.circular(10),
-                    gradient: const LinearGradient(colors: [RT.green, RT.yellow, RT.red]),
-                  ),
-                ),
-              ),
-              Center(
-                child: Text('${(ctrl.aimPower * 100).round()}%',
-                    style: RT.chunky(size: 12, color: RT.ink)),
               ),
             ],
           ),
         ),
-        const SizedBox(height: 4),
-        Text('pull back & release to fire', style: RT.chunky(size: 10, color: Colors.white70)),
+      ),
+    );
+  }
+
+  Widget _nudgeBar() {
+    return Row(
+      key: _nudgeBarKey,
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        _roundBtn('▾', () => ctrl.nudgeAngle(-1)),
+        const SizedBox(width: 6),
+        _roundBtn('▴', () => ctrl.nudgeAngle(1)),
+        const SizedBox(width: 6),
+        _roundBtn('−', () => ctrl.nudgePower(-1)),
+        const SizedBox(width: 6),
+        _roundBtn('+', () => ctrl.nudgePower(1)),
+        const SizedBox(width: 10),
+        Container(
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 11),
+          decoration: RT.pill(color: RT.ink, opacity: 0.58, radius: 16),
+          child: Text(
+            ctrl.statusMessage.isEmpty ? 'Pull back and release' : ctrl.statusMessage,
+            style: RT.body(size: 13, color: Colors.white, weight: FontWeight.w800),
+          ),
+        ),
       ],
     );
   }
 
-  Widget _miniBtn(IconData icon, VoidCallback onTap) {
+  Widget _roundBtn(String glyph, VoidCallback onTap, {double size = 36}) {
     return GestureDetector(
       onTap: () {
         AudioService.instance.sfx('click');
         onTap();
+        setState(() {});
       },
       child: Container(
-        padding: const EdgeInsets.all(8),
-        decoration: RT.card(color: Colors.white, radius: 10, border: 3),
-        child: Icon(icon, size: 18, color: RT.ink),
+        width: size,
+        height: size,
+        alignment: Alignment.center,
+        decoration: RT.pill(opacity: 0.85, radius: 12),
+        child: Text(glyph, style: RT.chunky(size: size * 0.42, color: RT.ink)),
       ),
     );
   }
 
-  Widget _fireButton() {
-    return GestureDetector(
-      onTap: () {
-        if (SaveService.instance.data.vibration) HapticFeedback.heavyImpact();
-        ctrl.humanFire();
-      },
-      child: Container(
-        width: 86,
-        height: 86,
-        decoration: BoxDecoration(
-          shape: BoxShape.circle,
-          color: RT.red,
-          border: Border.all(color: RT.ink, width: 5),
-          boxShadow: const [BoxShadow(color: Color(0xFF9E1B32), offset: Offset(0, 6))],
-        ),
-        child: Center(
-          child: Text('FIRE!', style: RT.chunky(size: 20, color: Colors.white, outline: 2.5)),
-        ),
-      ),
-    );
-  }
-
-  // ---------------------------------------------------------------------------
-  // Building UI
-  // ---------------------------------------------------------------------------
-
-  Widget _buildBuildUi() {
-    final me = ctrl.buildingPlayerConfig;
-    final blocker = _ghostPos != null ? ctrl.checkPlacement(_ghostPos!.dx, _ghostPos!.dy, _selectedPiece) : null;
-    final blockerReason = switch (blocker) {
-      PlacementBlocker.outsideArea => "Outside your build area",
-      PlacementBlocker.overlapping => "Overlapping something",
-      PlacementBlocker.noPiecesLeft => "No pieces left",
-      _ => null,
-    };
-    return Stack(
-      children: [
-        // camera controls: the build gesture is dragging pieces around, so
-        // there's no free gesture left to pan — zoom + recenter buttons
-        // still let the player inspect their construction area.
-        if (ctrl.canHumanBuild)
-          Positioned(
-            top: 4,
-            right: 8,
-            child: Row(
-              children: [
-                _miniBtn(Icons.remove, () => setState(() => ctrl.zoomCamera(-0.12))),
-                const SizedBox(width: 6),
-                _miniBtn(Icons.add, () => setState(() => ctrl.zoomCamera(0.12))),
-                const SizedBox(width: 6),
-                _miniBtn(Icons.my_location, () {
-                  final spawn = MapBuilder.spawnFor(ctrl.world, ctrl.buildingPlayer, ctrl.players.length);
-                  setState(() => ctrl.panCameraTo(spawn));
-                }),
-              ],
-            ),
-          ),
-        Column(
-      children: [
-        const Spacer(),
-        if (ctrl.canHumanBuild) ...[
-          Container(
-            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 6),
-            decoration: RT.card(color: RT.ink.withOpacity(0.75), radius: 18, border: 0),
-            child: Text(
-              '${me.name} — place ${ctrl.piecesLeft} pieces! Drag onto your area & let go to place',
-              style: RT.chunky(size: 13, color: Colors.white),
-            ),
-          ),
-          if (blockerReason != null) ...[
-            const SizedBox(height: 4),
-            Container(
-              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 5),
-              decoration: RT.card(color: RT.red, radius: 14, border: 0),
-              child: Text("Can't place — $blockerReason", style: RT.chunky(size: 12, color: Colors.white)),
-            ),
-          ],
-          const SizedBox(height: 6),
-          Padding(
-            padding: const EdgeInsets.only(bottom: 8),
-            child: Row(
-              mainAxisAlignment: MainAxisAlignment.center,
-              children: [
-                // piece palette
-                Expanded(
-                  child: SizedBox(
-                    key: _piecePaletteKey,
-                    height: 74,
-                    child: ListView.builder(
-                      scrollDirection: Axis.horizontal,
-                      padding: const EdgeInsets.symmetric(horizontal: 8),
-                      itemCount: PieceDef.catalogue.length,
-                      itemBuilder: (_, i) {
-                        final p = PieceDef.catalogue[i];
-                        final sel = _selectedPiece.id == p.id;
-                        return GestureDetector(
-                          onTap: () {
-                            AudioService.instance.sfx('click');
-                            setState(() {
-                              _selectedPiece = p;
-                              _ghostRot = 0;
-                            });
-                          },
-                          child: Container(
-                            width: 62,
-                            margin: const EdgeInsets.symmetric(horizontal: 3),
-                            decoration: RT.card(color: sel ? RT.orange : Colors.white, radius: 12, border: sel ? 4 : 3),
-                            child: Column(
-                              mainAxisAlignment: MainAxisAlignment.center,
-                              children: [
-                                Icon(p.icon, size: 22, color: sel ? Colors.white : RT.ink),
-                                Text(p.name.split(' ').first,
-                                    style: RT.chunky(size: 9, color: sel ? Colors.white : RT.ink),
-                                    overflow: TextOverflow.ellipsis),
-                              ],
-                            ),
-                          ),
-                        );
-                      },
-                    ),
-                  ),
-                ),
-                Column(
-                  children: [
-                    _miniBtn(Icons.rotate_right, () => setState(() => _ghostRot += pi / 4)),
-                    const SizedBox(height: 6),
-                    GestureDetector(
-                      onTap: _ghostPos == null ? null : _placeGhost,
-                      child: Container(
-                        padding: const EdgeInsets.all(10),
-                        decoration: RT.card(color: RT.green, radius: 12, border: 3),
-                        child: const Icon(Icons.check, color: Colors.white, size: 22),
-                      ),
-                    ),
-                    const SizedBox(height: 6),
-                    GestureDetector(
-                      onTap: _ghostPos == null
-                          ? null
-                          : () {
-                              AudioService.instance.sfx('click');
-                              setState(() => _ghostPos = null);
-                            },
-                      child: Container(
-                        padding: const EdgeInsets.all(10),
-                        decoration: RT.card(color: Colors.white, radius: 12, border: 3),
-                        child: const Icon(Icons.close, color: RT.ink, size: 22),
-                      ),
-                    ),
-                  ],
-                ),
-                const SizedBox(width: 8),
-                GestureDetector(
-                  onTap: () {
-                    AudioService.instance.sfx('click');
-                    ctrl.finishBuilding();
-                  },
-                  child: Container(
-                    padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
-                    decoration: RT.card(color: RT.red, radius: 12, border: 3),
-                    child: Text('DONE', style: RT.chunky(size: 15, color: Colors.white, outline: 2)),
-                  ),
-                ),
-                const SizedBox(width: 10),
-              ],
-            ),
-          ),
-        ] else
-          Padding(
-            padding: const EdgeInsets.only(bottom: 24),
-            child: Container(
-              padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 10),
-              decoration: RT.card(color: Colors.white, radius: 16, border: 3),
-              child: Text('${me.name} is building…', style: RT.chunky(size: 14, color: RT.ink)),
-            ),
-          ),
-      ],
-    ),
-      ],
-    );
-  }
-
-  Widget _buildTransition() {
-    final next = ctrl.players[(ctrl.currentPlayer + 1) % ctrl.players.length];
-    return Container(
-      color: Colors.black.withOpacity(0.75),
-      child: Center(
-        child: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            const SizedBox(
-              width: 240, height: 180,
-              child: CustomPaint(painter: StarburstPainter(color: RT.yellow, points: 14)),
-            ),
-            Transform.translate(
-              offset: const Offset(0, -140),
-              child: Column(
-                children: [
-                  Text('NEXT UP!', style: RT.chunky(size: 30, color: RT.red, outline: 4)),
-                  Text(next.name, style: RT.chunky(size: 34, color: Colors.white, outline: 4)),
-                ],
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-
-  Widget _buildGameOver() {
-    final won = ctrl.winner == 0 && !ctrl.players[0].isAi;
-    return Container(
-      color: Colors.black.withOpacity(0.7),
-      child: Center(
+  /// The design's radial pull readout, drawn at the finger while dragging.
+  Widget _pullReadout() {
+    final p = _dragCurrent!;
+    return Positioned(
+      left: p.dx - 75,
+      top: p.dy - 75,
+      child: IgnorePointer(
         child: Container(
-          width: 320,
-          padding: const EdgeInsets.all(24),
-          decoration: RT.card(color: RT.cream, radius: 26, border: 5),
+          width: 150,
+          height: 150,
+          decoration: BoxDecoration(
+            shape: BoxShape.circle,
+            color: const Color(0xFF0D3C46).withOpacity(0.16),
+            border: Border.all(color: Colors.white.withOpacity(0.45), width: 2),
+          ),
           child: Column(
-            mainAxisSize: MainAxisSize.min,
+            mainAxisAlignment: MainAxisAlignment.center,
             children: [
-              SizedBox(
-                width: 180, height: 120,
-                child: CustomPaint(painter: StarburstPainter(color: won ? RT.yellow : Colors.grey, points: 14)),
-              ),
-              Transform.translate(
-                offset: const Offset(0, -95),
-                child: Icon(won ? Icons.emoji_events : Icons.sentiment_dissatisfied,
-                    size: 60, color: won ? RT.orange : RT.ink),
-              ),
-              Transform.translate(
-                offset: const Offset(0, -30),
-                child: Column(
-                  children: [
-                    Text(ctrl.statusMessage, style: RT.chunky(size: 28, color: won ? RT.orange : RT.ink), textAlign: TextAlign.center),
-                    const SizedBox(height: 8),
-                    Text('Rounds: ${ctrl.round}  •  Damage: ${ctrl.damageDealtByHuman}',
-                        style: RT.chunky(size: 13, color: RT.ink.withOpacity(0.7))),
-                  ],
+              Text('${ctrl.aimPower.round()}%',
+                  style: RT.chunky(size: 26, color: Colors.white)),
+              Text('${ctrl.aimAngle.round()}°',
+                  style: RT.body(size: 11, color: Colors.white, weight: FontWeight.w800, letterSpacing: 1.4)),
+              const SizedBox(height: 4),
+              Container(
+                width: 76,
+                height: 6,
+                decoration: BoxDecoration(
+                  color: Colors.white.withOpacity(0.3),
+                  borderRadius: BorderRadius.circular(4),
+                ),
+                child: FractionallySizedBox(
+                  alignment: Alignment.centerLeft,
+                  widthFactor: (ctrl.aimPower / 100).clamp(0.0, 1.0),
+                  child: Container(
+                    decoration: BoxDecoration(
+                      color: RT.yellow,
+                      borderRadius: BorderRadius.circular(4),
+                    ),
+                  ),
                 ),
               ),
-              const SizedBox(height: 8),
-              ChunkyButton(
-                label: 'REMATCH', icon: Icons.refresh, color: RT.green, width: 220, height: 52, fontSize: 18,
-                onPressed: () {
-                  AudioService.instance.sfx('click');
-                  ctrl.resetMatch();
-                },
-              ),
-              const SizedBox(height: 10),
-              ChunkyButton(
-                label: 'MAIN MENU', icon: Icons.home, color: RT.blue, width: 220, height: 52, fontSize: 18,
-                onPressed: () {
-                  AudioService.instance.sfx('click');
-                  Navigator.pop(context);
-                },
-              ),
+              const SizedBox(height: 4),
+              Text(ctrl.aimFine ? 'FINE TUNE' : 'PULL FURTHER',
+                  style: RT.body(size: 9, color: Colors.white.withOpacity(0.75), weight: FontWeight.w800, letterSpacing: 1.2)),
             ],
           ),
         ),
@@ -944,193 +528,190 @@ class _GameScreenState extends State<GameScreen> {
     );
   }
 
-  void _showPauseMenu() {
-    showDialog(
-      context: context,
-      builder: (_) => AlertDialog(
-        backgroundColor: RT.cream,
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(24), side: const BorderSide(color: RT.ink, width: 4)),
-        title: Text('PAUSED', style: RT.chunky(size: 26, color: RT.ink), textAlign: TextAlign.center),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            ChunkyButton(
-              label: 'RESUME', icon: Icons.play_arrow, color: RT.green, width: 200, height: 50, fontSize: 17,
-              onPressed: () {
-                AudioService.instance.sfx('click');
-                Navigator.pop(context);
-              },
-            ),
-            const SizedBox(height: 10),
-            ChunkyButton(
-              label: 'RESTART', icon: Icons.refresh, color: RT.orange, width: 200, height: 50, fontSize: 17,
-              onPressed: () {
-                AudioService.instance.sfx('click');
-                Navigator.pop(context);
-                ctrl.resetMatch();
-              },
-            ),
-            const SizedBox(height: 10),
-            ChunkyButton(
-              label: 'QUIT', icon: Icons.exit_to_app, color: RT.red, width: 200, height: 50, fontSize: 17,
-              onPressed: () {
-                AudioService.instance.sfx('click');
-                Navigator.pop(context);
-                Navigator.pop(context);
-              },
-            ),
-          ],
+  // ---------------------------------------------------------------------------
+  // Result panel
+  // ---------------------------------------------------------------------------
+
+  Widget _buildResult() {
+    final won = ctrl.winner == 0 && !ctrl.players[0].isAi;
+    final level = widget.campaignLevel;
+    final kicker = level != null
+        ? (won ? 'BATTLE ${level.indexInWorld + 1} CLEARED' : 'RAFT SUNK')
+        : (won ? 'VICTORY' : 'DEFEAT');
+    final title = level != null
+        ? (won ? '${level.captainName} defeated!' : 'Sunk by ${level.captainName}')
+        : (won ? 'You rule the water' : 'Bail out and retry');
+    final showReward = level != null && won && _campaignReward != null;
+
+    return Container(
+      color: Colors.black.withOpacity(0.72),
+      child: Center(
+        child: Container(
+          width: 360,
+          padding: const EdgeInsets.fromLTRB(26, 24, 26, 22),
+          decoration: RT.card(color: Colors.white, radius: 28, border: 0),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(won ? Icons.emoji_events : Icons.sentiment_dissatisfied,
+                  size: 42, color: won ? RT.orange : RT.ink.withOpacity(0.35)),
+              const SizedBox(height: 8),
+              Text(kicker,
+                  style: RT.body(size: 11, color: RT.ink.withOpacity(0.5), weight: FontWeight.w800, letterSpacing: 3)),
+              const SizedBox(height: 4),
+              Text(title, style: RT.chunky(size: 22, color: RT.ink), textAlign: TextAlign.center),
+              if (level != null && won) ...[
+                const SizedBox(height: 10),
+                Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    for (int i = 0; i < 3; i++)
+                      Icon(i < (_campaignStars ?? 0) ? Icons.star : Icons.star_border,
+                          color: RT.yellow, size: 28),
+                  ],
+                ),
+              ],
+              const SizedBox(height: 16),
+              Row(
+                children: [
+                  Expanded(child: _statTile('${ctrl.shotsFired}', 'SHOTS')),
+                  const SizedBox(width: 10),
+                  Expanded(child: _statTile(ctrl.accuracyLabel, 'ACCURACY')),
+                  if (showReward) ...[
+                    const SizedBox(width: 10),
+                    Expanded(child: _statTile('+$_campaignReward', 'COINS', gold: true)),
+                  ],
+                ],
+              ),
+              const SizedBox(height: 18),
+              if (level != null) ..._campaignButtons(level, won) else ..._quickButtons(),
+            ],
+          ),
         ),
       ),
     );
   }
+
+  Widget _statTile(String value, String label, {bool gold = false}) {
+    return Container(
+      padding: const EdgeInsets.symmetric(vertical: 12),
+      decoration: BoxDecoration(
+        color: gold ? RT.yellow.withOpacity(0.2) : RT.ink.withOpacity(0.06),
+        borderRadius: BorderRadius.circular(16),
+      ),
+      child: Column(
+        children: [
+          Text(value, style: RT.chunky(size: 20, color: gold ? const Color(0xFF8A6A06) : RT.ink)),
+          const SizedBox(height: 2),
+          Text(label,
+              style: RT.body(
+                  size: 9,
+                  color: gold ? const Color(0xFFA3872E) : RT.ink.withOpacity(0.55),
+                  weight: FontWeight.w800,
+                  letterSpacing: 1)),
+        ],
+      ),
+    );
+  }
+
+  List<Widget> _quickButtons() => [
+        ChunkyButton(
+          label: 'REMATCH', icon: Icons.refresh, color: RT.orange, width: 240, height: 52, fontSize: 18,
+          onPressed: () {
+            AudioService.instance.sfx('click');
+            setState(() {
+              _campaignStars = null;
+              _campaignReward = null;
+              ctrl.resetMatch();
+            });
+          },
+        ),
+        const SizedBox(height: 10),
+        ChunkyButton(
+          label: 'MAIN MENU', icon: Icons.home, color: RT.blue, width: 240, height: 48, fontSize: 16,
+          onPressed: () {
+            AudioService.instance.sfx('click');
+            Navigator.pop(context);
+          },
+        ),
+      ];
+
+  List<Widget> _campaignButtons(CampaignLevel level, bool won) {
+    final all = Campaign.allLevels;
+    final idx = all.indexWhere((l) => l.id == level.id);
+    final next = won && idx >= 0 && idx + 1 < all.length ? all[idx + 1] : null;
+    return [
+      if (next != null)
+        ChunkyButton(
+          label: 'NEXT BATTLE', icon: Icons.arrow_forward, color: RT.orange, width: 240, height: 52, fontSize: 18,
+          onPressed: () {
+            AudioService.instance.sfx('click');
+            final (settings, players) = Campaign.matchFor(next);
+            Navigator.pushReplacement(
+              context,
+              MaterialPageRoute(
+                builder: (_) => GameScreen(
+                    settings: settings, players: players, mode: GameMode.vsAi, campaignLevel: next),
+              ),
+            );
+          },
+        ),
+      if (next != null) const SizedBox(height: 10),
+      ChunkyButton(
+        label: won ? 'REPLAY' : 'TRY AGAIN', icon: Icons.refresh,
+        color: next == null ? RT.orange : RT.green, width: 240, height: 48, fontSize: 16,
+        onPressed: () {
+          AudioService.instance.sfx('click');
+          final (settings, players) = Campaign.matchFor(level);
+          Navigator.pushReplacement(
+            context,
+            MaterialPageRoute(
+              builder: (_) => GameScreen(
+                  settings: settings, players: players, mode: GameMode.vsAi, campaignLevel: level),
+            ),
+          );
+        },
+      ),
+      const SizedBox(height: 10),
+      ChunkyButton(
+        label: 'WORLD MAP', icon: Icons.map, color: RT.blue, width: 240, height: 48, fontSize: 16,
+        onPressed: () {
+          AudioService.instance.sfx('click');
+          Navigator.pop(context);
+        },
+      ),
+    ];
+  }
 }
 
-// =============================================================================
-// Painters
-// =============================================================================
-
-class _GamePainter extends CustomPainter {
+class _ScenePainter extends CustomPainter {
   final GameController ctrl;
   final WorldRenderer renderer;
-  _GamePainter(this.ctrl, this.renderer);
+  _ScenePainter(this.ctrl, this.renderer);
 
   @override
   void paint(Canvas canvas, Size size) {
-    renderer.render(canvas, size, ctrl.camPos, ctrl.camZoom, ctrl.time);
+    renderer.render(canvas, size, ctrl.time);
+
+    // Trajectory preview for the human shooter, drawn over the scene.
+    if (ctrl.phase != GamePhase.aiming || !ctrl.canHumanAct) return;
+    if (!SaveService.instance.data.showTrajectory && !ctrl.isCharging) return;
+    final raft = ctrl.currentRaft;
+    if (raft == null) return;
+    final dots = ctrl.world.trajectory(
+      from: raft.muzzle,
+      angleDeg: ctrl.aimAngle,
+      power: ctrl.aimPower,
+      facing: raft.facing,
+      weapon: ctrl.selectedWeapon,
+      powerMultiplier: ctrl.players[ctrl.currentPlayer].powerMultiplier,
+      // The "Spotter Scope" upgrade reveals more of the arc; dragging always
+      // shows a longer preview than resting, as in the design.
+      limit: SaveService.instance.data.trajectoryDots + (ctrl.isCharging ? 10 : 0),
+    );
+    renderer.drawTrajectory(canvas, size, dots, charging: ctrl.isCharging);
   }
 
   @override
-  bool shouldRepaint(covariant _GamePainter old) => true;
-}
-
-class _AimPainter extends CustomPainter {
-  final GameController ctrl;
-  final bool charging;
-  final Offset? anchorScreen;
-  final Offset? fingerScreen;
-  _AimPainter(this.ctrl, {this.charging = false, this.anchorScreen, this.fingerScreen});
-
-  @override
-  void paint(Canvas canvas, Size size) {
-    final chars = ctrl.world.charactersOf(ctrl.currentPlayer);
-    if (chars.isEmpty) return;
-    final showTrajectory = SaveService.instance.data.showTrajectory;
-    final weapon = Weapons.byId(ctrl.selectedWeaponId);
-
-    // Slingshot pull-line, drawn in screen space (not affected by the
-    // world/camera transform below) so it tracks the raw finger position
-    // exactly — a stretchy rubber-band from the character to the touch
-    // point, thickening/brightening with power for a clear "how hard am I
-    // pulling" cue.
-    if (charging && anchorScreen != null && fingerScreen != null) {
-      final pull = fingerScreen! - anchorScreen!;
-      if (pull.distance > 4) {
-        final bandPaint = Paint()
-          ..color = weapon.color.withOpacity(0.85)
-          ..strokeWidth = 3 + ctrl.aimPower * 4
-          ..strokeCap = StrokeCap.round;
-        canvas.drawLine(anchorScreen!, fingerScreen!, Paint()..color = RT.ink.withOpacity(0.6)..strokeWidth = bandPaint.strokeWidth + 3..strokeCap = StrokeCap.round);
-        canvas.drawLine(anchorScreen!, fingerScreen!, bandPaint);
-        canvas.drawCircle(fingerScreen!, 9 + ctrl.aimPower * 5, Paint()..color = Colors.white.withOpacity(0.35));
-        canvas.drawCircle(fingerScreen!, 5, Paint()..color = Colors.white.withOpacity(0.8));
-      }
-    }
-
-    canvas.save();
-    canvas.translate(size.width / 2, size.height / 2);
-    canvas.scale(ctrl.camZoom);
-    canvas.translate(-ctrl.camPos.dx, -ctrl.camPos.dy);
-
-    final from = ctrl.muzzlePos;
-
-    // aim arrow — length scales with power, so the launch indicator itself
-    // also doubles as a power cue
-    final dir = Offset(cos(ctrl.aimAngle), sin(ctrl.aimAngle));
-    final arrowLen = 38 + ctrl.aimPower * 55;
-    final arrowEnd = from + dir * arrowLen;
-    final paint = Paint()
-      ..color = weapon.color
-      ..strokeWidth = 5
-      ..strokeCap = StrokeCap.round;
-    canvas.drawLine(from, arrowEnd, paint);
-    canvas.drawLine(from, arrowEnd, Paint()..color = RT.ink..strokeWidth = 8..strokeCap = StrokeCap.round..blendMode = BlendMode.dstOver);
-    // arrowhead
-    canvas.drawCircle(arrowEnd, 7, Paint()..color = RT.ink);
-    canvas.drawCircle(arrowEnd, 5, Paint()..color = weapon.color);
-
-    // trajectory preview (dotted)
-    if (showTrajectory) {
-      var pos = from;
-      final speed = weapon.speed * (280 + ctrl.aimPower * 620);
-      var vel = dir * speed;
-      const dt = 1 / 20;
-      final dotPaint = Paint()..color = Colors.white.withOpacity(0.85);
-      for (int i = 0; i < 16; i++) {
-        vel += Offset(ctrl.world.wind * 260, ctrl.world.gravity * weapon.gravity) * dt;
-        pos += vel * dt;
-        if (pos.dy > ctrl.world.waterLevel) break;
-        canvas.drawCircle(pos, max(2.0, 4.5 - i * 0.18), dotPaint);
-        // stop if hit something
-        var hit = false;
-        for (final b in ctrl.world.bodies) {
-          if (b.dead || b.type == BodyType.debris) continue;
-          if (b.aabb.contains(pos)) { hit = true; break; }
-        }
-        if (hit) break;
-      }
-    }
-    canvas.restore();
-  }
-
-  @override
-  bool shouldRepaint(covariant _AimPainter old) => true;
-}
-
-class _GhostPainter extends CustomPainter {
-  final GameController ctrl;
-  final PieceDef piece;
-  final Offset pos;
-  final double rot;
-  _GhostPainter(this.ctrl, this.piece, this.pos, this.rot);
-
-  @override
-  void paint(Canvas canvas, Size size) {
-    canvas.save();
-    canvas.translate(size.width / 2, size.height / 2);
-    canvas.scale(ctrl.camZoom);
-    canvas.translate(-ctrl.camPos.dx, -ctrl.camPos.dy);
-
-    // build area
-    final area = ctrl.buildAreaFor(ctrl.buildingPlayer);
-    canvas.drawRect(area, Paint()..color = RT.green.withOpacity(0.12));
-    canvas.drawRect(
-        area,
-        Paint()
-          ..color = RT.green.withOpacity(0.5)
-          ..style = PaintingStyle.stroke
-          ..strokeWidth = 3);
-
-    // ghost piece — validity mirrors the actual placement rules (inside the
-    // build area AND not overlapping anything already there), not just the
-    // area check, so red/green is never misleading.
-    final blocker = ctrl.checkPlacement(pos.dx, pos.dy, piece);
-    final valid = blocker == PlacementBlocker.none;
-    canvas.save();
-    canvas.translate(pos.dx, pos.dy);
-    canvas.rotate(rot);
-    final rect = Rect.fromCenter(center: Offset.zero, width: piece.size.width, height: piece.size.height);
-    canvas.drawRect(rect, Paint()..color = (valid ? RT.green : RT.red).withOpacity(0.5));
-    canvas.drawRect(
-        rect,
-        Paint()
-          ..color = valid ? RT.green : RT.red
-          ..style = PaintingStyle.stroke
-          ..strokeWidth = 3);
-    canvas.restore();
-    canvas.restore();
-  }
-
-  @override
-  bool shouldRepaint(covariant _GhostPainter old) => true;
+  bool shouldRepaint(covariant _ScenePainter old) => true;
 }
