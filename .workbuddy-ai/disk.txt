@@ -1,0 +1,15 @@
+=== scan start 9:21:25 am ===
+    0.52 GB  C:\Users\Kent\AppData\Local\Pub
+   -0.00 GB  C:\Users\Kent\AppData\Roaming\Pub
+    7.73 GB  C:\Users\Kent\AppData\Local\Temp
+    0.61 GB  C:\Windows\Temp
+    9.05 GB  C:\Users\Kent\AppData\Local\Android
+    9.84 GB  C:\Users\Kent\.gradle
+    0.06 GB  C:\Windows\SoftwareDistribution
+    1.64 GB  C:\Users\Kent\AppData\Local\Packages
+    0.08 GB  C:\Users\Kent\AppData\Local\CrashDumps
+    3.09 GB  C:\src\flutter
+    5.67 GB  C:\xampp
+    3.05 GB  C:\Users\Kent\AppData\Local\Google
+   12.93 GB  C:\ProgramData
+=== scan done 4:40:12 pm ===

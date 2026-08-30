@@ -173,7 +173,7 @@ class GameController extends ChangeNotifier {
     }
     selectedWeaponId = Weapons.starter.id;
 
-    world.snapCam(BattleConst.playerX + world.viewWidth * 0.25);
+    world.lockCam(0);
     _beginTurn(0, initial: true);
     _hookNet();
     _startTicker();
@@ -191,14 +191,44 @@ class GameController extends ChangeNotifier {
           _handleRemoteFire(msg);
           break;
         case 'endTurn':
-          if (phase == GamePhase.aiming) _endTurn(fromNetwork: true);
+          _handleRemoteEndTurn(msg);
           break;
         case 'rematch':
-          final seed = msg['seed'];
-          resetMatch(seed: seed is int ? seed : null);
+          _handleRemoteRematch(msg);
           break;
       }
     };
+  }
+
+  /// Both devices simulate the same turn and both end it locally, so each
+  /// one's "your turn is over" is really a confirmation of what the other has
+  /// already worked out. It is honoured exactly once, and only if it is about
+  /// the turn actually being played — otherwise a message that arrives late
+  /// (or one describing a turn this device has already moved past) would skip
+  /// the next player's go.
+  void _handleRemoteEndTurn(Map<String, dynamic> msg) {
+    final seq = msg['seq'];
+    if (seq is! int) return;
+    if (_endedTurns.contains(seq)) return;
+    final pl = msg['pl'];
+    if (pl is int && pl != currentPlayer) return;
+    if (phase != GamePhase.aiming) return;
+    _endTurn(fromNetwork: true);
+  }
+
+  /// A rematch carries a seed only from the host, who is the one device that
+  /// gets to decide it. A guest asking for one (no seed) makes the host pick
+  /// and broadcast, so either side can restart the match and both still end
+  /// up on the same world.
+  void _handleRemoteRematch(Map<String, dynamic> msg) {
+    final seed = msg['seed'];
+    if (seed is int) {
+      resetMatch(seed: seed);
+      return;
+    }
+    if (mode == GameMode.hotspot && net != null && net!.isHost) {
+      requestRematch();
+    }
   }
 
   /// Deserialized network JSON is never trusted: a malformed, stale or
@@ -222,6 +252,26 @@ class GameController extends ChangeNotifier {
     if (mode == GameMode.hotspot && net != null) return net!.isHost ? 0 : 1;
     return currentPlayer;
   }
+
+  /// The seat that belongs to this device. The host is player 0 and the
+  /// guest player 1 over a hotspot link; in every other mode the local human
+  /// is player 0 (hot-seat play shares this device, and the campaign is
+  /// single-player).
+  int get localPlayerIndex =>
+      (mode == GameMode.hotspot && net != null) ? (net!.isHost ? 0 : 1) : 0;
+
+  /// True when this device is the one that should be running the turn clock.
+  /// Outside hotspot play that is always true; over the wire only the device
+  /// whose turn it is counts down, for the drift reason in [_updateAiming].
+  bool get _ownsTurnClock =>
+      mode != GameMode.hotspot || net == null || currentPlayer == myPlayerIndex;
+
+  /// Identifies the turn currently being played. Both devices in a hotspot
+  /// match end every turn locally and tell the other about it; the token lets
+  /// each side recognise the echo of a turn it has already ended and ignore
+  /// it, instead of advancing a second time.
+  int _turnSeq = 0;
+  final Set<int> _endedTurns = {};
 
   // ---------------------------------------------------------------------------
   // Ticker
@@ -272,10 +322,16 @@ class GameController extends ChangeNotifier {
     phase = GamePhase.aiming;
     _shotCommitted = false;
     _aiShotQueued = false;
+    _turnSeq++;
 
     final raft = world.raftOf(player);
     raft?.ensureActiveAlive();
-    if (raft != null) world.easeCam(raft.x + raft.facing * 160, 1.0);
+    // The view belongs to whoever is firing — except over a hotspot link,
+    // where each device shows only its own deck, so you watch incoming fire
+    // arrive rather than being teleported to the enemy's side on their turn.
+    // The cut is a hard one on purpose: the rafts are far enough apart that
+    // easing across would just be a long sideways pan past the enemy.
+    world.lockCam(mode == GameMode.hotspot ? localPlayerIndex : player);
 
     // A weapon the player has run out of must not stay selected into the next
     // turn, or the fire button would silently do nothing.
@@ -293,26 +349,23 @@ class GameController extends ChangeNotifier {
   }
 
   void _updateAiming(double dt) {
-    // Frame the shot: while the human aims, follow where the shot would land.
-    final raft = world.raftOf(currentPlayer);
-    if (raft != null && !isCharging) {
-      world.easeCam(raft.x + raft.facing * 200, dt);
-    } else if (raft != null) {
-      final landing = world.landingX(
-        from: raft.muzzle,
-        angleDeg: aimAngle,
-        power: aimPower,
-        facing: raft.facing,
-        weapon: Weapons.byId(selectedWeaponId),
-        powerMultiplier: players[currentPlayer].powerMultiplier,
-      );
-      world.easeCam(landing, dt);
-    }
+    // The camera stays on the shooter's own raft for the whole aiming phase.
+    // It used to ease toward the shot's predicted landing point, which meant
+    // a long drag panned the view all the way across to the enemy deck and
+    // showed the player exactly where their shot was going. Shots are lobbed
+    // blind now — see BattleWorld's camera lock.
+    world.holdCam(dt);
 
-    turnTimeLeft -= dt;
-    if (turnTimeLeft <= 0) {
-      _endTurn();
-      return;
+    // Only the device whose turn it actually is owns the clock. In hotspot
+    // both devices run the same simulation, but their frames never line up
+    // exactly, so a shared countdown here would drift and let one side time
+    // out a turn the other side was still playing.
+    if (_ownsTurnClock) {
+      turnTimeLeft -= dt;
+      if (turnTimeLeft <= 0) {
+        _endTurn();
+        return;
+      }
     }
 
     final p = players[currentPlayer];
@@ -356,7 +409,14 @@ class GameController extends ChangeNotifier {
 
   void _updateFiring(double dt) {
     final s = world.shot;
-    if (s != null) world.easeCam(s.pos.dx, dt * 2.2);
+    // Track the projectile while it is in flight — both for the shooter and
+    // for the opponent on the receiving end. The aiming-phase camera lock is
+    // deliberately abandoned mid-flight: while the ball is in the air,
+    // watching where it goes is the whole show.
+    //
+    // vel is in design units per 60Hz step; the camera works in units per
+    // second, hence the * 60.
+    if (s != null) world.trackShot(s.pos.dx, s.vel.dx * 60, dt);
 
     // Physics steps at a fixed 60Hz so flight is frame-rate independent.
     _accum += dt;
@@ -406,6 +466,16 @@ class GameController extends ChangeNotifier {
 
   void _updateResolving(double dt) {
     _resolveTimer -= dt;
+    // While the splash / damage read-out plays, ease the camera back to
+    // whoever is shooting next. In a single-player / local match that is
+    // the next living opponent; over a hotspot link both devices watch
+    // their own deck, so we ease to the local player's raft if they are
+    // the one coming up.
+    final next = _nextAlivePlayer();
+    final camTarget = mode == GameMode.hotspot && net != null
+        ? localPlayerIndex
+        : next;
+    world.returnCamTo(camTarget, dt);
     if (_resolveTimer > 0) return;
     if (_checkGameOver()) return;
     _endTurn();
@@ -414,8 +484,11 @@ class GameController extends ChangeNotifier {
   void _endTurn({bool fromNetwork = false}) {
     if (phase == GamePhase.gameOver) return;
     if (_checkGameOver()) return;
-    if (mode == GameMode.hotspot && net != null && !fromNetwork) {
-      net!.send({'t': 'endTurn'});
+    if (mode == GameMode.hotspot && net != null) {
+      _endedTurns.add(_turnSeq);
+      if (!fromNetwork) {
+        net!.send({'t': 'endTurn', 'pl': currentPlayer, 'seq': _turnSeq});
+      }
     }
     // The raft that just shot rotates to its next crew member, so a two-person
     // crew alternates who takes the shot rather than one doing all the work.
@@ -618,16 +691,41 @@ class GameController extends ChangeNotifier {
     statusMessage = players[currentPlayer].isAi ? 'Return fire!' : 'Shot away!';
   }
 
+  /// Restarts the match. In hotspot play this is negotiated rather than
+  /// local: both devices must land on the same seed, so the host picks one
+  /// and tells the guest.
+  void requestRematch() {
+    if (mode == GameMode.hotspot && net != null) {
+      if (net!.isHost) {
+        final seed = DateTime.now().millisecondsSinceEpoch;
+        net!.send({'t': 'rematch', 'seed': seed});
+        resetMatch(seed: seed);
+      } else {
+        net!.send({'t': 'rematch'});
+      }
+      return;
+    }
+    resetMatch();
+  }
+
   /// Accuracy as a percentage string for the result panel.
   String get accuracyLabel =>
       shotsFired == 0 ? '—' : '${(shotsHit / shotsFired * 100).round()}%';
 
-  /// Living enemy rafts currently off the right edge of the view — drives the
-  /// design's "N FOE AHEAD ▸" marker.
+  /// Living enemy rafts currently off the edge of the view — drives the
+  /// design's "N FOE AHEAD ▸" marker, which is what tells the player who
+  /// they are lobbing at now that the camera never shows the enemy.
   int get offscreenFoes => world
-      .enemiesOf(0)
-      .where((r) => world.isOffscreenRight(r.x))
+      .enemiesOf(localPlayerIndex)
+      .where((r) => !_isVisible(r.x))
       .length;
+
+  bool _isVisible(double worldX) => worldX >= world.cam - 70 && worldX <= world.camRight + 70;
+
+  /// Enemy crew still afloat — shown on the HUD so a blind battle still says
+  /// what is left to hit.
+  int get foesLeft =>
+      world.enemiesOf(localPlayerIndex).fold(0, (n, r) => n + r.living.length);
 
   // ---------------------------------------------------------------------------
 
@@ -640,6 +738,8 @@ class GameController extends ChangeNotifier {
     shotsHit = 0;
     _shotCommitted = false;
     _aiShotQueued = false;
+    _turnSeq = 0;
+    _endedTurns.clear();
     _accum = 0;
     aimAngle = 45;
     aimPower = 70;

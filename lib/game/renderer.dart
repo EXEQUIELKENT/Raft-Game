@@ -326,7 +326,16 @@ class WorldRenderer {
         final c = raft.crew[i];
         if (c.gone) continue;
         canvas.save();
-        canvas.translate(raft.loadout.crewOffset(i), 0);
+        // The body's own displacement from its station — a knocked-back crew
+        // member is drawn wherever the shove actually put them.
+        canvas.translate(raft.loadout.crewOffset(i) + c.offset.dx, c.offset.dy);
+        if (c.tilt != 0) {
+          // Tumble about the feet, not about the middle of the body.
+          final pivot = raft.deckY;
+          canvas.translate(0, pivot);
+          canvas.rotate(c.tilt);
+          canvas.translate(0, -pivot);
+        }
         // Defeated crew slide down into the water and fade out.
         if (!c.alive) {
           canvas.translate(0, c.sinkT * 44);

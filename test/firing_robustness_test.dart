@@ -183,6 +183,20 @@ void main() {
     }
   });
 
+  test('A forward pull (dx < 0) does not produce a shot', () {
+    // dx is measured as origin.x minus finger.x for a raft facing right, so a
+    // forward pull has dx < 0. That is a drag-out gesture, not an aim — it
+    // would otherwise produce a low-power shot at the angle clamped to 6°
+    // and feel like the controls are "stuck on".
+    expect(shapeAim(-100, 0), isNull,
+        reason: 'pulling forward must not produce an aim');
+    expect(shapeAim(-100, 200), isNull,
+        reason: 'pulling forward and down must not produce an aim');
+    // Exactly at the threshold it is still no-op, just past it it fires.
+    expect(shapeAim(4, 0), isNull);
+    expect(shapeAim(40, 0), isNotNull);
+  });
+
   test('easeAim converges on the target instead of oscillating between clamps', () {
     // Held steady, repeated easing must actually arrive at the target. With a
     // lerp factor above 1 this diverges and slams into the angle clamps, which

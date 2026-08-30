@@ -1,6 +1,8 @@
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'game/audio.dart';
+import 'game/desktop.dart';
 import 'game/save.dart';
 import 'screens/main_menu.dart';
 import 'theme.dart';
@@ -9,10 +11,19 @@ void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await SaveService.instance.load();
   await AudioService.instance.init();
-  SystemChrome.setPreferredOrientations([
-    DeviceOrientation.landscapeLeft,
-    DeviceOrientation.landscapeRight,
-  ]);
+
+  // Orientation is a phone/tablet concept. Desktop and web builds have no
+  // platform channel behind setPreferredOrientations, so asking for it there
+  // only buys a MissingPluginException in the log — and the desktop window
+  // is sized for landscape by [Desktop.configureWindow] anyway.
+  if (Desktop.isMobile) {
+    SystemChrome.setPreferredOrientations([
+      DeviceOrientation.landscapeLeft,
+      DeviceOrientation.landscapeRight,
+    ]);
+  }
+  await Desktop.configureWindow();
+
   runApp(const RaftRumbleApp());
 }
 

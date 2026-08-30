@@ -1,6 +1,11 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:raft_rumble/game/ai.dart';
+import 'package:raft_rumble/game/battle.dart';
+import 'package:raft_rumble/game/controller.dart';
+import 'package:raft_rumble/game/maps.dart';
 import 'package:raft_rumble/game/raft.dart';
+import 'package:raft_rumble/game/save.dart';
 import 'package:raft_rumble/main.dart';
 import 'package:raft_rumble/screens/raft_preview.dart';
 
@@ -67,5 +72,32 @@ void main() {
     expect(tester.takeException(), isNull);
     expect(tester.getSize(find.byType(RaftPreview)).width, 400,
         reason: 'the preview must fill its column, not collapse to zero width');
+  });
+
+  testWidgets('A pull-back drag updates aim angle and power', (tester) async {
+    // End-to-end smoke: a Listener that drives a real GameController and a
+    // pull-back drag changes the angle/power on the controller.
+    SaveService.instance.data = SaveData();
+    final ctrl = GameController(
+      settings: MatchSettings(map: GameMaps.all.first, startHp: 100, turnSeconds: 30),
+      players: [
+        PlayerConfig(name: 'P1', loadout: RaftLoadout.custom(hullId: 'tube', sizeId: 'medium', colorIndex: 0)),
+        PlayerConfig(name: 'P2', loadout: RaftLoadout.custom(hullId: 'log', sizeId: 'medium', colorIndex: 1), isAi: true, aiDifficulty: AiDifficulty.easy),
+      ],
+      mode: GameMode.vsAi,
+      seed: 1,
+    );
+
+    final startAngle = ctrl.aimAngle;
+    final startPower = ctrl.aimPower;
+    // Simulate a deliberate pull back and down — about 200px back, 100px down.
+    ctrl.applyPullAim(200, 100);
+
+    expect(ctrl.aimAngle, isNot(startAngle),
+        reason: 'a directional drag must change the angle');
+    expect(ctrl.aimPower, greaterThan(startPower),
+        reason: 'a longer pull must increase power');
+
+    ctrl.dispose();
   });
 }

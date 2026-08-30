@@ -254,15 +254,20 @@ void main() {
   });
 
   group('Camera', () {
-    test('Camera clamps to the world and never shows past its edges', () {
+    test('Camera clamps to the world, give or take the overhang', () {
       final world = BattleWorld(map: GameMaps.all.first, seed: 1);
       world.viewWidth = 870;
 
-      expect(world.camFor(-9999), 0, reason: 'cannot pan left of the world');
-      expect(world.camFor(99999), BattleConst.worldW - world.viewWidth,
-          reason: 'cannot pan past the right edge');
+      // The ends of the world, plus the overhang the blind-fire lock needs
+      // on a very wide viewport — see BattleConst.camOverhang.
+      expect(world.camFor(-9999), -BattleConst.camOverhang,
+          reason: 'cannot pan arbitrarily far left of the world');
+      expect(world.camFor(99999),
+          BattleConst.worldW - world.viewWidth + BattleConst.camOverhang,
+          reason: 'cannot pan arbitrarily far past the right edge');
       expect(world.camFor(BattleConst.worldW / 2),
-          BattleConst.worldW / 2 - world.viewWidth / 2);
+          BattleConst.worldW / 2 - world.viewWidth / 2,
+          reason: 'the middle of the world is comfortably inside the bounds');
     });
   });
 

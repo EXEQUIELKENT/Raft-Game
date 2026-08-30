@@ -59,6 +59,11 @@ class _GameScreenState extends State<GameScreen> {
   final GlobalKey _nudgeBarKey = GlobalKey();
   final GlobalKey _topBarKey = GlobalKey();
 
+  /// Desktop only: the battle is driven by a pull-back drag, which a mouse
+  /// can do perfectly well, but aiming to the nearest degree with a mouse is
+  /// miserable. These keys drive the same nudge buttons the touch HUD uses.
+  final FocusNode _keyFocus = FocusNode();
+
   // HUD rebuild throttling: the world canvas repaints every tick on its own,
   // but the surrounding HUD has no reason to rebuild 60x a second when nothing
   // it displays has changed.
@@ -92,6 +97,7 @@ class _GameScreenState extends State<GameScreen> {
 
   @override
   void dispose() {
+    _keyFocus.dispose();
     if (widget.controller == null) {
       ctrl.dispose();
     } else {
@@ -99,6 +105,68 @@ class _GameScreenState extends State<GameScreen> {
     }
     AudioService.instance.playMusic('music_menu');
     super.dispose();
+  }
+
+  /// Keyboard play, for the desktop build. A mouse can already perform the
+  /// pull-back drag (it is the same pointer stream), so this only covers what
+  /// a mouse does badly: single-degree aiming, and firing without dragging.
+  void _onKeyEvent(KeyEvent event) {
+    if (event is! KeyDownEvent) return;
+    const fine = 1.0;
+    const coarse = 5.0;
+    final step = HardwareKeyboard.instance.isShiftPressed ? coarse : fine;
+
+    switch (event.logicalKey) {
+      case LogicalKeyboardKey.arrowUp:
+      case LogicalKeyboardKey.keyW:
+        ctrl.nudgeAngle(step);
+        return;
+      case LogicalKeyboardKey.arrowDown:
+      case LogicalKeyboardKey.keyS:
+        ctrl.nudgeAngle(-step);
+        return;
+      case LogicalKeyboardKey.arrowRight:
+      case LogicalKeyboardKey.keyD:
+        ctrl.nudgePower(step);
+        return;
+      case LogicalKeyboardKey.arrowLeft:
+      case LogicalKeyboardKey.keyA:
+        ctrl.nudgePower(-step);
+        return;
+      case LogicalKeyboardKey.space:
+      case LogicalKeyboardKey.enter:
+        if (ctrl.phase == GamePhase.gameOver) {
+          _rematch();
+        } else {
+          ctrl.humanFire();
+        }
+        return;
+      case LogicalKeyboardKey.keyR:
+        if (ctrl.phase == GamePhase.gameOver) _rematch();
+        return;
+      case LogicalKeyboardKey.escape:
+        Navigator.pop(context);
+        return;
+      default:
+        // 1..5 pick a weapon, matching the HUD order.
+        final label = event.logicalKey.keyLabel;
+        if (label.length == 1 && label.codeUnitAt(0) >= 0x31 && label.codeUnitAt(0) <= 0x35) {
+          final i = int.parse(label) - 1;
+          final weapons = ctrl.availableWeapons;
+          if (i < weapons.length) setState(() => ctrl.selectWeapon(weapons[i].id));
+        }
+    }
+  }
+
+  void _rematch() {
+    AudioService.instance.sfx('click');
+    setState(() {
+      _campaignStars = null;
+      _campaignReward = null;
+    });
+    // Over a hotspot link both devices have to land on the same world, so
+    // the rematch is negotiated rather than just local.
+    ctrl.requestRematch();
   }
 
   void _onUpdate() {
@@ -200,6 +268,9 @@ class _GameScreenState extends State<GameScreen> {
     final pullBack = (origin.dx - e.localPosition.dx) * facing;
     final pullDown = e.localPosition.dy - origin.dy;
     ctrl.applyPullAim(pullBack, pullDown);
+    // Force a repaint so the readout circle, angle chip and trajectory dots
+    // all move with the finger. Without this they lag a frame behind the
+    // gesture and feel "stuck" until the controller's notifyListeners fires.
     setState(() {});
   }
 
@@ -240,25 +311,30 @@ class _GameScreenState extends State<GameScreen> {
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      body: Listener(
-        behavior: HitTestBehavior.opaque,
-        onPointerDown: _onPointerDown,
-        onPointerMove: _onPointerMove,
-        onPointerUp: _onPointerUp,
-        onPointerCancel: _onPointerCancel,
-        child: Stack(
-          children: [
-            Positioned.fill(
-              child: AnimatedBuilder(
-                animation: ctrl,
-                builder: (_, __) => CustomPaint(painter: _ScenePainter(ctrl, renderer)),
+    return KeyboardListener(
+      focusNode: _keyFocus,
+      autofocus: true,
+      onKeyEvent: _onKeyEvent,
+      child: Scaffold(
+        body: Listener(
+          behavior: HitTestBehavior.opaque,
+          onPointerDown: _onPointerDown,
+          onPointerMove: _onPointerMove,
+          onPointerUp: _onPointerUp,
+          onPointerCancel: _onPointerCancel,
+          child: Stack(
+            children: [
+              Positioned.fill(
+                child: AnimatedBuilder(
+                  animation: ctrl,
+                  builder: (_, __) => CustomPaint(painter: _ScenePainter(ctrl, renderer)),
+                ),
               ),
-            ),
-            SafeArea(child: _buildHud()),
-            if (_charging && _dragCurrent != null) _pullReadout(),
-            if (ctrl.phase == GamePhase.gameOver) _buildResult(),
-          ],
+              SafeArea(child: _buildHud()),
+              if (_charging && _dragCurrent != null) _pullReadout(),
+              if (ctrl.phase == GamePhase.gameOver) _buildResult(),
+            ],
+          ),
         ),
       ),
     );
@@ -276,7 +352,7 @@ class _GameScreenState extends State<GameScreen> {
               child: Container(
                 padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 7),
                 decoration: RT.pill(color: RT.ink, opacity: 0.6, radius: 12),
-                child: Text('${ctrl.offscreenFoes} FOE AHEAD ▸',
+                child: Text('${ctrl.offscreenFoes} FOE OVER THE HORIZON ▸',
                     style: RT.body(size: 11, color: Colors.white, weight: FontWeight.w800)),
               ),
             ),
@@ -289,7 +365,7 @@ class _GameScreenState extends State<GameScreen> {
 
   Widget _topBar() {
     final save = SaveService.instance.data;
-    final me = ctrl.world.raftOf(0);
+    final me = ctrl.world.raftOf(ctrl.localPlayerIndex);
     return Padding(
       key: _topBarKey,
       padding: const EdgeInsets.fromLTRB(16, 10, 16, 0),
@@ -333,7 +409,7 @@ class _GameScreenState extends State<GameScreen> {
           const Spacer(),
           _infoChip('ANGLE ${ctrl.aimAngle.round()}° · PWR ${ctrl.aimPower.round()}%'),
           const SizedBox(width: 8),
-          _infoChip('${_levelLabel()} · ${ctrl.world.enemiesOf(0).length} LEFT'),
+          _infoChip('${_levelLabel()} · ${ctrl.foesLeft} CREW LEFT'),
           const SizedBox(width: 8),
           Container(
             padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 9),
@@ -533,7 +609,8 @@ class _GameScreenState extends State<GameScreen> {
   // ---------------------------------------------------------------------------
 
   Widget _buildResult() {
-    final won = ctrl.winner == 0 && !ctrl.players[0].isAi;
+    final seat = ctrl.localPlayerIndex;
+    final won = ctrl.winner == seat && !ctrl.players[seat].isAi;
     final level = widget.campaignLevel;
     final kicker = level != null
         ? (won ? 'BATTLE ${level.indexInWorld + 1} CLEARED' : 'RAFT SUNK')
@@ -617,14 +694,7 @@ class _GameScreenState extends State<GameScreen> {
   List<Widget> _quickButtons() => [
         ChunkyButton(
           label: 'REMATCH', icon: Icons.refresh, color: RT.orange, width: 240, height: 52, fontSize: 18,
-          onPressed: () {
-            AudioService.instance.sfx('click');
-            setState(() {
-              _campaignStars = null;
-              _campaignReward = null;
-              ctrl.resetMatch();
-            });
-          },
+          onPressed: _rematch,
         ),
         const SizedBox(height: 10),
         ChunkyButton(

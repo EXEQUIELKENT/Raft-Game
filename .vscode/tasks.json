@@ -1,0 +1,52 @@
+{
+  // Build/run tasks for Raft Rumble, reachable from Terminal > Run Task.
+  //
+  // These wrap the scripts in tool/ so the desktop target is one keystroke
+  // away from anywhere in the editor, without remembering the flutter
+  // command line for it.
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Windows: run (debug)",
+      "type": "shell",
+      "command": "powershell",
+      "args": [
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        "${workspaceFolder}\\tool\\run_windows.ps1"
+      ],
+      "problemMatcher": ["$flutter-build"],
+      "group": { "kind": "build", "isDefault": true }
+    },
+    {
+      "label": "Windows: build (release)",
+      "type": "shell",
+      "command": "powershell",
+      "args": [
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        "${workspaceFolder}\\tool\\build_windows.ps1"
+      ],
+      "problemMatcher": ["$flutter-build"]
+    },
+    {
+      "label": "Flutter: test",
+      "type": "shell",
+      "command": "flutter",
+      "args": ["test"],
+      "problemMatcher": ["$dart-test"],
+      "group": { "kind": "test", "isDefault": true }
+    },
+    {
+      "label": "Flutter: analyze",
+      "type": "shell",
+      "command": "flutter",
+      "args": ["analyze"],
+      "problemMatcher": ["$dart-analyze"]
+    }
+  ]
+}

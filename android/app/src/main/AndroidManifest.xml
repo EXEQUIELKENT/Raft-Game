@@ -1,13 +1,24 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
-    <!-- Required for hotspot multiplayer (lib/game/net.dart): opening the
-         WebSocket host/client sockets needs INTERNET, and reliably reading
-         the device's local Wi-Fi/hotspot IPv4 address via
-         NetworkInterface.list() in NetService.localIp() needs
-         ACCESS_WIFI_STATE — without it, some Android versions/OEMs silently
-         return no addresses and the host screen gets stuck showing "?"
-         instead of a joinable IP. -->
+    <!-- Hotspot / LAN multiplayer (lib/game/net.dart).
+         INTERNET         — the TCP match socket and the UDP room beacon.
+         ACCESS_NETWORK_STATE / ACCESS_WIFI_STATE — reading this device's own
+           IPv4 addresses reliably. Without ACCESS_WIFI_STATE some Android
+           versions and OEMs return no addresses at all from
+           NetworkInterface.list(), which strands the host screen with
+           nothing to tell the other player to join.
+         CHANGE_WIFI_MULTICAST_STATE — lets the beacon/scan hold a
+           WifiManager.MulticastLock (see MainActivity) so the Wi-Fi radio
+           stops filtering inbound broadcast in power-save. Without it the
+           room list sometimes simply never fills in, on a hotspot that is
+           working perfectly.
+         NEARBY_WIFI_DEVICES — Android 13+ splits local-network discovery out
+           of location. Declared neverForLocation so no location permission
+           is implied. -->
     <uses-permission android:name="android.permission.INTERNET"/>
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE"/>
+    <uses-permission android:name="android.permission.NEARBY_WIFI_DEVICES" android:usesPermissionFlags="neverForLocation"/>
+    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE"/>
     <application
         android:label="raft_rumble"
         android:name="${applicationName}"

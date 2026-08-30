@@ -1,0 +1,45 @@
+{
+  // Run configurations for Raft Rumble.
+  //
+  // "Raft Rumble (Windows)" is the desktop target: it builds and launches the
+  // game as a native Win32 window through `flutter run -d windows`, exactly
+  // like a phone run does. Pick it from the Run and Debug panel, or press F5.
+  //
+  // The mobile configurations are unchanged in spirit — they deliberately do
+  // NOT name a deviceId, so VS Code shows the usual device picker when more
+  // than one phone/emulator is attached.
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Raft Rumble (Windows)",
+      "request": "launch",
+      "type": "dart",
+      "deviceId": "windows",
+      "program": "lib/main.dart",
+      "flutterMode": "debug"
+    },
+    {
+      "name": "Raft Rumble (Windows, profile)",
+      "request": "launch",
+      "type": "dart",
+      "deviceId": "windows",
+      "program": "lib/main.dart",
+      "flutterMode": "profile"
+    },
+    {
+      "name": "Raft Rumble (mobile)",
+      "request": "launch",
+      "type": "dart",
+      "program": "lib/main.dart",
+      "flutterMode": "debug"
+    },
+    {
+      "name": "Raft Rumble (web)",
+      "request": "launch",
+      "type": "dart",
+      "deviceId": "chrome",
+      "program": "lib/main.dart",
+      "flutterMode": "debug"
+    }
+  ]
+}
