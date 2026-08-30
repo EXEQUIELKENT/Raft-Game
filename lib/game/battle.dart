@@ -232,6 +232,20 @@ class BattleConst {
   static const double hpBarFade = 0.4;
   static const double hpBarGhostDelay = 0.3;
   static const double hpGhostDrain = 0.9;
+
+  // ---------------------------------------------------------------------------
+  // Facial expressions
+  // ---------------------------------------------------------------------------
+
+  /// How long a survived hit shows a pained wince on the victim's face.
+  static const double hitReactTime = 0.5;
+
+  /// How long a landed shot shows a satisfied grin on the shooter's face.
+  static const double gloatTime = 1.0;
+
+  /// HP fraction below which an alive crew member's default face turns
+  /// worried (and blinks faster) whenever nothing more urgent is happening.
+  static const double lowHpFace = 0.3;
 }
 
 /// One point of the verlet ragdoll. Position is integrated; velocity is
@@ -529,6 +543,19 @@ class Crew {
 
   /// White impact-flash countdown fired by a killing blow.
   double deathFlash = 0;
+
+  // --- Facial expression ------------------------------------------------
+
+  /// Seconds left showing a pained wince — set the instant a hit is
+  /// survived (see [BattleWorld._resolve]), consumed by the renderer and
+  /// counted down in [BattleWorld._stepBodies]. Overrides every other
+  /// expression, including mid-tumble, so a ragdoll reads the same flinch
+  /// that knocked it down.
+  double hitReactT = 0;
+
+  /// Seconds left showing a satisfied grin — set on the shooter's active
+  /// crew member the instant their own shot lands on an enemy.
+  double gloatT = 0;
 
   // --- Dynamic health bar ---------------------------------------------------
 
@@ -1248,6 +1275,16 @@ class BattleWorld {
     double dealt = 0;
     bool hitPlayerSide = false;
 
+    // Whoever fired this shot — captured before anything below can change
+    // their raft's activeIndex, so a landed hit grins on the actual shooter.
+    Crew? shooterCrew;
+    for (final r in rafts) {
+      if (r.playerIndex == s.owner) {
+        shooterCrew = r.activeCrew;
+        break;
+      }
+    }
+
     if (hitRaft != null && crewIndex >= 0) {
       final c = hitRaft.crew[crewIndex];
       final before = c.hp;
@@ -1267,6 +1304,7 @@ class BattleWorld {
       );
       if (c.alive) {
         c.knock(s.vel, Crew.impactForce(s.weapon), hitLocal: hitLocal);
+        c.hitReactT = BattleConst.hitReactTime;
       } else {
         c.startDeath(s.vel, Crew.impactForce(s.weapon),
             railDir: hitRaft.railDir(crewIndex), hitLocal: hitLocal);
@@ -1296,6 +1334,7 @@ class BattleWorld {
           if (c.alive) {
             c.knock(away, Crew.impactForce(s.weapon) * 0.55 * falloff,
                 hitLocal: raft.crewPos(i) - station);
+            c.hitReactT = BattleConst.hitReactTime;
           } else {
             c.startDeath(
               away,
@@ -1316,6 +1355,10 @@ class BattleWorld {
       size: s.weapon.splash > 0 ? s.weapon.splash * 1.1 : 62,
       life: 0.55,
     ));
+
+    // A landed hit earns the shooter a satisfied grin, whether it was a
+    // direct hit or splash damage caught someone in the blast.
+    if (dealt > 0) shooterCrew?.gloatT = BattleConst.gloatTime;
 
     shot = null;
     for (final r in rafts) {
@@ -1393,6 +1436,9 @@ class BattleWorld {
         if (c.deathFlash > 0) {
           c.deathFlash = max(0, c.deathFlash - dt);
         }
+
+        if (c.hitReactT > 0) c.hitReactT = max(0, c.hitReactT - dt);
+        if (c.gloatT > 0) c.gloatT = max(0, c.gloatT - dt);
 
         if (c.ragdoll) {
           _stepBody(raft, i, c);

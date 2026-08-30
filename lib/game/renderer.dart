@@ -704,7 +704,7 @@ class WorldRenderer {
     final deck = BattleConst.waterY - lo.width * lo.hull.thickness * 0.55;
 
     if (crew.pose != null) {
-      _ragdollBody(canvas, raft, crew, dir, weapon);
+      _ragdollBody(canvas, raft, crew, dir, weapon, time);
       return;
     }
 
@@ -905,44 +905,11 @@ class WorldRenderer {
       Paint()..color = Colors.black.withOpacity(0.06)..style = PaintingStyle.stroke..strokeWidth = 5,
     );
 
-    // Brows
-    final brow = Paint()
-      ..color = const Color(0xFF8A7448)
-      ..strokeWidth = 2.6
-      ..strokeCap = StrokeCap.round;
-    canvas.drawLine(headC2 + const Offset(-8, -5), headC2 + const Offset(-2.5, -6.5), brow);
-    canvas.drawLine(headC2 + const Offset(2.5, -6.5), headC2 + const Offset(8, -5), brow);
-
-    // Eyes
-    for (final ex in [-4.4, 4.4]) {
-      canvas.drawOval(
-        Rect.fromCenter(center: headC2 + Offset(ex, 0), width: 7.5, height: 9),
-        Paint()..color = Colors.white,
-      );
-      if (crew.alive) {
-        canvas.drawCircle(headC2 + Offset(ex + dir * 1.0, 1.2), 2.2, Paint()..color = RT.ink);
-      } else {
-        final xp = Paint()
-          ..color = RT.ink
-          ..strokeWidth = 1.6
-          ..strokeCap = StrokeCap.round;
-        canvas.drawLine(headC2 + Offset(ex - 2, -2), headC2 + Offset(ex + 2, 2), xp);
-        canvas.drawLine(headC2 + Offset(ex + 2, -2), headC2 + Offset(ex - 2, 2), xp);
-      }
-    }
-
-    // Nose + mouth
-    canvas.drawOval(
-      Rect.fromCenter(center: headC2 + const Offset(0, 5.5), width: 5, height: 3.6),
-      Paint()..color = const Color(0xFFDCC48B),
-    );
-    canvas.drawRRect(
-      RRect.fromRectAndRadius(
-        Rect.fromCenter(center: headC2 + const Offset(0, 10), width: 9.5, height: 2.6),
-        const Radius.circular(2),
-      ),
-      Paint()..color = const Color(0xFFB9955C),
-    );
+    // Face: expression-driven by combat state — see [_face]. Lining up a
+    // shot (aiming, before the recoil hits) reads as a bit of idle
+    // chatter/taunting; the recoil snap itself grits the teeth instead.
+    _face(canvas, headC2, headR, dir, crew,
+        time: time, talking: aiming && recoil <= 0, firing: recoil > 0.55);
 
     _headgear(canvas, raft.look, headC2, headR, dir);
 
@@ -1000,18 +967,13 @@ class WorldRenderer {
     Crew crew,
     double dir,
     WeaponDef? weapon,
+    double time,
   ) {
     final pose = crew.pose!;
     final skin = _skinFor(raft.look);
     final suit = raft.playerIndex == 0 ? const Color(0xFF2D4F8F) : raft.loadout.color;
     const boot = Color(0xFF23262B);
     const metal = Color(0xFF3B3F45);
-
-    final dead = !crew.alive;
-    final xEye = Paint()
-      ..color = RT.ink
-      ..strokeWidth = 1.6
-      ..strokeCap = StrokeCap.round;
 
     void limbTo(RagdollPoint a, RagdollPoint b, double w, Color color) =>
         _limb(canvas, a.pos, b.pos, w, color);
@@ -1093,39 +1055,186 @@ class WorldRenderer {
       0.3, pi * 0.75, false,
       Paint()..color = Colors.black.withOpacity(0.06)..style = PaintingStyle.stroke..strokeWidth = 5,
     );
-    final brow = Paint()
+    // Face: same expression logic as standing — a knockdown almost always
+    // comes with a live [Crew.hitReactT], so the wince that triggered the
+    // tumble is exactly what's still showing while the body flies.
+    _face(canvas, Offset.zero, headR, dir, crew, time: time, talking: false, firing: false);
+    _headgear(canvas, raft.look, Offset.zero, headR, dir);
+    canvas.restore();
+  }
+
+  /// Draws the face — brows, eyes, nose and mouth — centred at [origin] in
+  /// the caller's current canvas space. Shared by the standing pose and the
+  /// ragdoll so a knocked-down character keeps reading as the exact same
+  /// crew member, expression included, mid-tumble.
+  ///
+  /// The expression is driven entirely by the crew member's live combat
+  /// state, highest priority first:
+  ///  1. dead — X eyes, same as before.
+  ///  2. [Crew.hitReactT] > 0 — a pained wince, set the instant a hit is
+  ///     survived (see [BattleWorld._resolve]); this is what a ragdoll shows
+  ///     while it's still being thrown by the blow that triggered it.
+  ///  3. [firing] — gritted teeth on the sharp end of their own recoil.
+  ///  4. [Crew.gloatT] > 0 — a satisfied grin the instant their own shot
+  ///     lands on an enemy.
+  ///  5. low HP with nothing more urgent happening — a worried look, and a
+  ///     faster, nervier blink.
+  ///  6. otherwise — a neutral idle face: periodic blinking, and (while
+  ///     [talking]) a flapping mouth so lining up a shot doesn't read as a
+  ///     frozen photo.
+  void _face(
+    Canvas canvas,
+    Offset origin,
+    double headR,
+    double dir,
+    Crew crew, {
+    required double time,
+    required bool talking,
+    required bool firing,
+  }) {
+    final dead = !crew.alive;
+    final pain = dead ? 0.0 : (crew.hitReactT / BattleConst.hitReactTime).clamp(0.0, 1.0);
+    final gloat = dead || pain > 0 ? 0.0 : (crew.gloatT / BattleConst.gloatTime).clamp(0.0, 1.0);
+    final lowHp = !dead && pain <= 0 && gloat <= 0 && crew.hpFrac < BattleConst.lowHpFace;
+
+    // Blink: a short, sharp close on a per-character cycle (offset by
+    // [Crew.bobPhase] so the crew doesn't blink in lockstep) rather than any
+    // extra state — low HP roughly doubles the rate, a nervous flutter, and
+    // a pained or dead face never blinks over itself.
+    double blink = 0;
+    if (!dead && pain <= 0) {
+      final period = lowHp ? 1.7 : 3.4;
+      final phase = (time + crew.bobPhase * 2.7) % period;
+      const closeDur = 0.11;
+      if (phase < closeDur) blink = sin((phase / closeDur) * pi);
+    }
+
+    // ---- Brows ----
+    final browPaint = Paint()
       ..color = const Color(0xFF8A7448)
       ..strokeWidth = 2.6
       ..strokeCap = StrokeCap.round;
-    canvas.drawLine(const Offset(-8, -5), const Offset(-2.5, -6.5), brow);
-    canvas.drawLine(const Offset(2.5, -6.5), const Offset(8, -5), brow);
-    // Eyes: white ovals always, with either a tracking pupil (alive) or an
-    // X (dead) — matching the standing face exactly.
+    if (pain > 0) {
+      // Drawn in hard and angled up toward the centre — a wince.
+      canvas.drawLine(origin + const Offset(-8, -3), origin + const Offset(-2.5, -7.5), browPaint);
+      canvas.drawLine(origin + const Offset(2.5, -7.5), origin + const Offset(8, -3), browPaint);
+    } else if (firing) {
+      // Drawn down flat over the eyes — a grimace of effort.
+      canvas.drawLine(origin + const Offset(-8, -6.8), origin + const Offset(-2.5, -5.2), browPaint);
+      canvas.drawLine(origin + const Offset(2.5, -5.2), origin + const Offset(8, -6.8), browPaint);
+    } else if (lowHp) {
+      // Inner ends lift — the classic worried tent.
+      canvas.drawLine(origin + const Offset(-8, -6.5), origin + const Offset(-2.5, -4.2), browPaint);
+      canvas.drawLine(origin + const Offset(2.5, -4.2), origin + const Offset(8, -6.5), browPaint);
+    } else {
+      canvas.drawLine(origin + const Offset(-8, -5), origin + const Offset(-2.5, -6.5), browPaint);
+      canvas.drawLine(origin + const Offset(2.5, -6.5), origin + const Offset(8, -5), browPaint);
+    }
+
+    // ---- Eyes ----
     for (final ex in [-4.4, 4.4]) {
+      final c = origin + Offset(ex, 0);
+      final openH = dead ? 9.0 : max(0.8, 9.0 * (1 - blink * 0.94));
       canvas.drawOval(
-        Rect.fromCenter(center: Offset(ex, 0), width: 7.5, height: 9),
+        Rect.fromCenter(center: c, width: 7.5, height: openH),
         Paint()..color = Colors.white,
       );
       if (dead) {
-        canvas.drawLine(Offset(ex - 2, -2), Offset(ex + 2, 2), xEye);
-        canvas.drawLine(Offset(ex + 2, -2), Offset(ex - 2, 2), xEye);
-      } else {
-        canvas.drawCircle(Offset(ex + dir * 1.0, 1.2), 2.2, Paint()..color = RT.ink);
+        final xp = Paint()
+          ..color = RT.ink
+          ..strokeWidth = 1.6
+          ..strokeCap = StrokeCap.round;
+        canvas.drawLine(c + const Offset(-2, -2), c + const Offset(2, 2), xp);
+        canvas.drawLine(c + const Offset(2, -2), c + const Offset(-2, 2), xp);
+        continue;
       }
+      if (pain > 0) {
+        // Squeezed shut: an arced line stands in for the pupil.
+        canvas.drawArc(
+          Rect.fromCenter(center: c, width: 8, height: 8),
+          pi * 0.15, pi * 0.7, false,
+          Paint()
+            ..color = RT.ink
+            ..style = PaintingStyle.stroke
+            ..strokeWidth = 1.8
+            ..strokeCap = StrokeCap.round,
+        );
+        continue;
+      }
+      if (blink > 0.6) continue; // lids fully down — nothing more to draw
+      canvas.drawCircle(
+        c + Offset(dir * 1.0, 1.2 * (1 - blink)),
+        2.2,
+        Paint()..color = RT.ink,
+      );
     }
+
+    // ---- Nose ----
     canvas.drawOval(
-      Rect.fromCenter(center: const Offset(0, 5.5), width: 5, height: 3.6),
+      Rect.fromCenter(center: origin + const Offset(0, 5.5), width: 5, height: 3.6),
       Paint()..color = const Color(0xFFDCC48B),
     );
-    canvas.drawRRect(
-      RRect.fromRectAndRadius(
-        Rect.fromCenter(center: const Offset(0, 10), width: 9.5, height: 2.6),
-        const Radius.circular(2),
-      ),
-      Paint()..color = const Color(0xFFB9955C),
-    );
-    _headgear(canvas, raft.look, Offset.zero, headR, dir);
-    canvas.restore();
+
+    // ---- Mouth ----
+    const mouthColor = Color(0xFFB9955C);
+    if (pain > 0) {
+      // A small pained grimace.
+      canvas.drawOval(
+        Rect.fromCenter(center: origin + const Offset(0, 10), width: 6, height: 5),
+        Paint()..color = RT.ink.withOpacity(0.7),
+      );
+    } else if (firing) {
+      // Gritted teeth: a white bar with a centre notch.
+      canvas.drawRRect(
+        RRect.fromRectAndRadius(
+          Rect.fromCenter(center: origin + const Offset(0, 9.6), width: 10.5, height: 3.6),
+          const Radius.circular(1.2),
+        ),
+        Paint()..color = Colors.white,
+      );
+      canvas.drawLine(
+        origin + const Offset(0, 8),
+        origin + const Offset(0, 11.4),
+        Paint()
+          ..color = mouthColor
+          ..strokeWidth = 1.2,
+      );
+    } else if (gloat > 0) {
+      // A grin: an upward arc that widens in as it fades.
+      final path = Path()
+        ..moveTo(origin.dx - 5.2, origin.dy + 9)
+        ..quadraticBezierTo(origin.dx, origin.dy + 10.5 + gloat * 3.5, origin.dx + 5.2, origin.dy + 9);
+      canvas.drawPath(
+        path,
+        Paint()
+          ..color = mouthColor
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = 2.4
+          ..strokeCap = StrokeCap.round,
+      );
+    } else if (lowHp) {
+      // A tiny worried "o".
+      canvas.drawOval(
+        Rect.fromCenter(center: origin + const Offset(0, 10), width: 4.4, height: 4.4),
+        Paint()..color = mouthColor,
+      );
+    } else if (talking) {
+      // Flapping open/closed — a bit of idle chatter/taunting while lined
+      // up to fire, so the aiming pause doesn't read as a frozen photo.
+      final open = sin(time * 11 + crew.bobPhase * 5).abs();
+      canvas.drawOval(
+        Rect.fromCenter(center: origin + const Offset(0, 10), width: 8, height: 2.4 + open * 4.2),
+        Paint()..color = RT.ink.withOpacity(0.7),
+      );
+    } else {
+      canvas.drawRRect(
+        RRect.fromRectAndRadius(
+          Rect.fromCenter(center: origin + const Offset(0, 10), width: 9.5, height: 2.6),
+          const Radius.circular(2),
+        ),
+        Paint()..color = mouthColor,
+      );
+    }
   }
 
   /// A single thick, rounded-cap "bone" — the building block for every arm
