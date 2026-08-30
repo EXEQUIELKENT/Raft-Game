@@ -6,6 +6,7 @@ import 'package:flutter/material.dart';
 import '../theme.dart';
 import 'battle.dart';
 import 'maps.dart';
+import 'models.dart';
 
 /// ---------------------------------------------------------------------------
 /// Scene renderer, drawn in the flat-vector style of the Claude Design mockup:
@@ -29,7 +30,20 @@ class WorldRenderer {
 
   WorldRenderer(this.world, {required this.map});
 
-  void render(Canvas canvas, Size size, double time) {
+  /// [currentPlayer]/[isAiming]/[aimAngleDeg]/[weapon] describe the live aim
+  /// state from [GameController] (in `screens/game_screen.dart`). They drive
+  /// the active shooter's arm: raised and tracking the drag while aiming,
+  /// kicking back into a muzzle flash for a beat right after firing, and
+  /// hanging relaxed at every other crew member and at every other time.
+  void render(
+    Canvas canvas,
+    Size size,
+    double time, {
+    int currentPlayer = -1,
+    bool isAiming = false,
+    double aimAngleDeg = 45,
+    WeaponDef? weapon,
+  }) {
     final scale = size.height / BattleConst.worldH;
     world.viewWidth = size.width / scale;
     if (!_decorBuilt) _buildDecor();
@@ -42,7 +56,13 @@ class WorldRenderer {
     _drawClouds(canvas, time);
     _drawProps(canvas, time);
     _drawWater(canvas, time);
-    _drawRafts(canvas, time);
+    _drawRafts(
+      canvas, time,
+      currentPlayer: currentPlayer,
+      isAiming: isAiming,
+      aimAngleDeg: aimAngleDeg,
+      weapon: weapon,
+    );
     _drawShot(canvas);
     _drawEffects(canvas);
 
@@ -56,10 +76,10 @@ class WorldRenderer {
   void _buildDecor() {
     _decorBuilt = true;
     final rng = world.rng;
-    // Keep props clear of the player raft and the enemy slots so nothing ever
-    // draws on top of a crew member.
+    // Keep props clear of the player raft and the enemy slots so nothing
+    // ever draws on top of a crew member (the widest raft is 260 wide).
     final reserved = <double>[BattleConst.playerX, ...BattleConst.enemySlots];
-    bool clear(double x) => reserved.every((r) => (x - r).abs() > 130);
+    bool clear(double x) => reserved.every((r) => (x - r).abs() > 170);
 
     for (int i = 0; i < 7; i++) {
       final kind = map.props[rng.nextInt(map.props.length)];
@@ -312,7 +332,14 @@ class WorldRenderer {
   // Rafts + crew
   // ---------------------------------------------------------------------------
 
-  void _drawRafts(Canvas canvas, double time) {
+  void _drawRafts(
+    Canvas canvas,
+    double time, {
+    required int currentPlayer,
+    required bool isAiming,
+    required double aimAngleDeg,
+    required WeaponDef? weapon,
+  }) {
     for (final raft in world.rafts) {
       final bob = world.bobOf(raft);
       canvas.save();
@@ -321,31 +348,63 @@ class WorldRenderer {
       _ripple(canvas, raft, time);
       if (raft.loadout.hull.hasMast) _mast(canvas, raft);
       _hull(canvas, raft);
+      _platforms(canvas, raft);
 
       for (int i = 0; i < raft.crew.length; i++) {
         final c = raft.crew[i];
         if (c.gone) continue;
         canvas.save();
-        // The body's own displacement from its station — a knocked-back crew
-        // member is drawn wherever the shove actually put them.
-        canvas.translate(raft.loadout.crewOffset(i) + c.offset.dx, c.offset.dy);
-        if (c.tilt != 0) {
-          // Tumble about the feet, not about the middle of the body.
-          final pivot = raft.deckY;
-          canvas.translate(0, pivot);
-          canvas.rotate(c.tilt);
-          canvas.translate(0, -pivot);
+        final pose = c.pose;
+        if (pose != null) {
+          // A ragdoll is drawn straight from its verlet points, which are
+          // stored station-local — the body renders exactly where the
+          // physics put it, no further displacement.
+          canvas.translate(raft.loadout.crewOffset(i), 0);
+        } else {
+          // The standing body's own displacement from its station — a crew
+          // member walking back after a knock-down is drawn wherever the
+          // shuffle actually is.
+          canvas.translate(raft.loadout.crewOffset(i) + c.offset.dx, c.offset.dy);
         }
-        // Defeated crew slide down into the water and fade out.
+        // Defeated crew go through the death sequence: they never fade
+        // while still airborne on the deck — the sink only starts once the
+        // body is actually in the water (see BattleWorld's body stepper).
+        // The fade layer covers the whole body in whatever pose it died.
+        Rect bodyBounds = const Rect.fromLTWH(-130, -150, 260, 230);
         if (!c.alive) {
-          canvas.translate(0, c.sinkT * 44);
+          if (pose != null) bodyBounds = pose.drawBounds;
+          canvas.translate(0, _sinkDrop(c));
           canvas.saveLayer(
-            Rect.fromLTWH(-60, -140, 120, 200),
-            Paint()..color = Colors.white.withOpacity(1 - c.sinkT),
+            bodyBounds.inflate(30),
+            Paint()..color = Colors.white.withOpacity(_sinkOpacity(c.sinkT)),
           );
         }
-        _crewMember(canvas, raft, c, i, time);
-        if (!c.alive) canvas.restore();
+        _crewMember(
+          canvas, raft, c, i, time,
+          currentPlayer: currentPlayer,
+          isAiming: isAiming,
+          aimAngleDeg: aimAngleDeg,
+          weapon: weapon,
+        );
+        if (!c.alive) {
+          // Killing-blow flash: a beat of pure white over the whole body,
+          // blended onto what was just drawn.
+          if (c.deathFlash > 0) {
+            final f = (c.deathFlash / BattleConst.deathFlashTime).clamp(0.0, 1.0);
+            canvas.drawRect(
+              bodyBounds.inflate(30),
+              Paint()
+                ..color = Colors.white.withOpacity(f * 0.85)
+                ..blendMode = BlendMode.srcATop,
+            );
+          }
+          _deathFx(canvas, c, time);
+          canvas.restore();
+        } else if (c.hpBarT > 0) {
+          // Dynamic health bar: hidden by default, summoned by damage, and
+          // gone again once its animation finishes.
+          _crewHealthBar(canvas, c, pose);
+        }
         canvas.restore();
       }
 
@@ -353,6 +412,124 @@ class WorldRenderer {
 
       if (raft.playerIndex != 0 && raft.alive) _enemyLabel(canvas, raft, bob);
     }
+  }
+
+  /// Vertical offset of a sinking body: buoyancy first carries it up to bob
+  /// at the surface, then it slips under on a smooth ease.
+  double _sinkDrop(Crew c) {
+    final t = c.sinkT;
+    if (t <= BattleConst.sinkFloatFrac) {
+      final u = t / BattleConst.sinkFloatFrac;
+      return -(1 - u) * 18 - sin(world.elapsed * 2.6 + c.bobPhase) * 1.4 * u;
+    }
+    final u = ((t - BattleConst.sinkFloatFrac) / (1 - BattleConst.sinkFloatFrac)).clamp(0.0, 1.0);
+    final eased = u * u * (3 - 2 * u);
+    return 8 + eased * 52;
+  }
+
+  /// Opacity of a sinking body: solid while it floats, gone by the time it
+  /// has fully slipped under.
+  double _sinkOpacity(double t) {
+    const startFade = 0.55;
+    if (t <= startFade) return 1;
+    return (1 - (t - startFade) / (1 - startFade)).clamp(0.0, 1.0);
+  }
+
+  /// Bubbles and the pale wisp that lift away while a crew member slips
+  /// under — the tail end of the death sequence.
+  void _deathFx(Canvas canvas, Crew c, double time) {
+    if (c.sinkT > BattleConst.sinkFloatFrac) {
+      for (int k = 0; k < 3; k++) {
+        final ph = (time * 0.5 + k * 0.37 + c.bobPhase) % 1.0;
+        final y = -8 - ph * 30;
+        final x = sin(time * 1.7 + k * 2.1 + c.bobPhase) * 5 + (k - 1) * 6;
+        canvas.drawCircle(
+          Offset(x, y),
+          2.0 + k * 0.7,
+          Paint()..color = Colors.white.withOpacity((1 - ph) * 0.5),
+        );
+      }
+    }
+    const ghostStart = 0.35, ghostEnd = 0.9;
+    if (c.sinkT > ghostStart && c.sinkT < ghostEnd) {
+      final u = (c.sinkT - ghostStart) / (ghostEnd - ghostStart);
+      final opacity = sin(u * pi) * 0.5;
+      final y = -40 - u * 46;
+      canvas.drawCircle(
+        Offset(0, y),
+        5 + u * 3,
+        Paint()..color = Colors.white.withOpacity(opacity * 0.9),
+      );
+      canvas.drawCircle(
+        Offset(0, y),
+        10 + u * 6,
+        Paint()..color = Colors.white.withOpacity(opacity * 0.35),
+      );
+    }
+  }
+
+  /// The per-crew dynamic health bar, drawn just above the character's head
+  /// (standing or ragdoll). Hidden by default; a hit brings it up with a
+  /// quick fade-in, a red ghost bar drains from the HP the character *had*
+  /// down to the live value, and the whole thing fades out once the drain
+  /// completes.
+  void _crewHealthBar(Canvas canvas, Crew c, RagdollPose? pose) {
+    final double cx;
+    final double topY;
+    if (pose != null) {
+      cx = pose.head.pos.dx;
+      topY = pose.head.pos.dy - 14;
+    } else {
+      cx = 0;
+      topY = -BattleConst.bodyHeight;
+    }
+
+    final shownFor = BattleConst.hpBarTime - c.hpBarT;
+    double alpha = 1.0;
+    if (shownFor < 0.12) alpha = shownFor / 0.12;
+    if (c.hpBarT < BattleConst.hpBarFade) {
+      alpha = min(alpha, c.hpBarT / BattleConst.hpBarFade);
+    }
+    alpha = alpha.clamp(0.0, 1.0);
+    if (alpha <= 0) return;
+
+    const barW = 46.0;
+    const barH = 6.0;
+    final y = topY - 15;
+    final rect = Rect.fromLTWH(cx - barW / 2, y, barW, barH);
+    const radius = Radius.circular(3);
+
+    canvas.drawRRect(
+      RRect.fromRectAndRadius(rect, radius),
+      Paint()..color = Colors.white.withOpacity(0.78 * alpha),
+    );
+
+    // The ghost: HP the character had when the bar was summoned, draining
+    // to the live value so the loss reads as motion, not a jump.
+    final ghostW = barW * c.hpDisplay.clamp(0.0, 1.0);
+    if (ghostW > barW * c.hpFrac) {
+      canvas.drawRRect(
+        RRect.fromRectAndRadius(Rect.fromLTWH(rect.left, y, ghostW, barH), radius),
+        Paint()..color = RT.red.withOpacity(0.45 * alpha),
+      );
+    }
+
+    final frac = c.hpFrac;
+    if (frac > 0) {
+      canvas.drawRRect(
+        RRect.fromRectAndRadius(Rect.fromLTWH(rect.left, y, barW * frac, barH), radius),
+        Paint()
+          ..color = (frac > 0.5 ? RT.green : (frac > 0.25 ? RT.orange : RT.red))
+              .withOpacity(alpha),
+      );
+    }
+    canvas.drawRRect(
+      RRect.fromRectAndRadius(rect, radius),
+      Paint()
+        ..color = RT.ink.withOpacity(0.35 * alpha)
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 1.2,
+    );
   }
 
   void _ripple(Canvas canvas, Raft raft, double time) {
@@ -397,8 +574,93 @@ class WorldRenderer {
     }
   }
 
-  void _mast(Canvas canvas, Raft raft) {
+  /// The deck's raised platforms, drawn from the same [DeckProfile] the
+  /// physics collides against — blocks render as solid slabs with a lit top
+  /// and a shaded front wall, ramps as wedges. Coordinates are hull-local,
+  /// rises measured up from the main deck plane (y-down, so negative).
+  void _platforms(Canvas canvas, Raft raft) {
     final lo = raft.loadout;
+    final deckTop = BattleConst.waterY - lo.width * lo.hull.thickness * 0.55;
+    final w = lo.width;
+
+    for (final s in raft.profile.segments) {
+      final isRamp = !s.isFlat;
+      final left = s.x0;
+      final right = s.x1;
+      final topL = deckTop - s.rise0;
+      final topR = deckTop - s.rise1;
+
+      final path = Path()
+        ..moveTo(left, topL)
+        ..lineTo(right, topR)
+        ..lineTo(right, deckTop + 2)
+        ..lineTo(left, deckTop + 2)
+        ..close();
+
+      final shade = Colors.black.withOpacity(isRamp ? 0.04 : 0.10);
+      final planks = isRamp ? lo.color : Color.lerp(lo.color, Colors.white, 0.14)!;
+
+      canvas.drawPath(path, Paint()..color = planks);
+      // Lit walking surface along the top edge.
+      canvas.drawLine(
+        Offset(left, topL),
+        Offset(right, topR),
+        Paint()
+          ..color = Colors.white.withOpacity(0.30)
+          ..strokeWidth = 2.5
+          ..strokeCap = StrokeCap.round,
+      );
+      // Front face shading, deeper for solid blocks than ramps.
+      canvas.drawPath(
+        Path()
+          ..moveTo(left, topL)
+          ..lineTo(right, topR)
+          ..lineTo(right, deckTop + 2)
+          ..lineTo(left, deckTop + 2)
+          ..close(),
+        Paint()..color = shade,
+      );
+      // Plank seams on block tops, matching the hull's timber language.
+      if (!isRamp) {
+        final seam = Paint()..color = Colors.black.withOpacity(0.12);
+        final span = right - left;
+        final seams = (span / 14).floor().clamp(1, 4);
+        for (int k = 1; k < seams; k++) {
+          final x = left + span * k / seams;
+          final y = deckTop - s.riseAt(x) - 0;
+          canvas.drawLine(Offset(x, y), Offset(x, deckTop + 1), seam);
+        }
+        // A block reads solid: darker band along its foot.
+        canvas.drawRect(
+          Rect.fromLTWH(left, deckTop - 3, span, 5),
+          Paint()..color = Colors.black.withOpacity(0.16),
+        );
+      }
+      // Keep the planks' horizontal seam language but bound it to the hull.
+      assert(right <= w / 2 + 0.01 && left >= -w / 2 - 0.01);
+    }
+
+    // Rail lips at both rails — the physical bumper living bodies bounce
+    // off, drawn so the boundary reads before anyone tests it.
+    final lip = Color.lerp(lo.color, const Color(0xFF23262B), 0.5)!;
+    for (final side in [-1.0, 1.0]) {
+      final x = side * raft.deckHalf;
+      canvas.drawRRect(
+        RRect.fromRectAndRadius(
+          Rect.fromLTWH(
+            x - 2.5,
+            deckTop - BattleConst.railWallHeight,
+            5,
+            BattleConst.railWallHeight,
+          ),
+          const Radius.circular(2.5),
+        ),
+        Paint()..color = lip,
+      );
+    }
+  }
+
+  void _mast(Canvas canvas, Raft raft) {    final lo = raft.loadout;
     final baseY = BattleConst.waterY - lo.width * lo.hull.thickness * 0.5;
     final dir = raft.facing.toDouble();
     canvas.drawRRect(
@@ -417,74 +679,396 @@ class WorldRenderer {
     canvas.drawPath(sail, Paint()..color = const Color(0xFFF2ECC8));
   }
 
-  void _crewMember(Canvas canvas, Raft raft, Crew crew, int index, double time) {
+  void _crewMember(
+    Canvas canvas,
+    Raft raft,
+    Crew crew,
+    int index,
+    double time, {
+    required int currentPlayer,
+    required bool isAiming,
+    required double aimAngleDeg,
+    required WeaponDef? weapon,
+  }) {
     final lo = raft.loadout;
-    final deck = BattleConst.waterY - lo.width * lo.hull.thickness * 0.55;
-    final headR = 22.0;
-    final headC = Offset(0, deck - 34 + sin(time * 1.7 + crew.bobPhase) * 1.4);
     final dir = raft.facing.toDouble();
+    final deck = BattleConst.waterY - lo.width * lo.hull.thickness * 0.55;
 
-    // Torso
+    if (crew.pose != null) {
+      _ragdollBody(canvas, raft, crew, dir, weapon);
+      return;
+    }
+
+    // The dead don't bob — they are lying where they fell.
+    final bob = crew.alive ? sin(time * 1.7 + crew.bobPhase) * 1.4 : 0.0;
+
+    canvas.save();
+    canvas.translate(0, bob);
+
+    // Is this the crew member currently lining up (or having just taken)
+    // the shot for their raft?
+    final isShooter = crew.alive && raft.playerIndex == currentPlayer && index == raft.activeIndex;
+    final aiming = isShooter && isAiming;
+
+    // Recoil: a short, sharp window right after this crew member's own shot
+    // leaves the barrel, decaying from 1 (muzzle flash + kickback) to 0.
+    // The whole body reads it, not just the arm: the torso leans away, the
+    // head ducks, and the stance widens to absorb the shove.
+    double recoil = 0;
+    final liveShot = world.shot;
+    if (liveShot != null && liveShot.owner == raft.playerIndex && index == raft.activeIndex) {
+      const recoilDur = 0.26;
+      final dt = world.elapsed - liveShot.firedAt;
+      if (dt >= 0 && dt < recoilDur) {
+        final u = 1 - dt / recoilDur;
+        // Sharp attack, soft decay — a snap, not a slide.
+        recoil = u * u * (3 - 2 * u);
+      }
+    }
+
+    // -------------------------------------------------------------------
+    // Layout: a small head over a chunkier, human-proportioned torso, on
+    // two planted legs. Everything is built from thick rounded-cap "bone"
+    // strokes (see [_limb]) rather than baked shapes, so the gun arm is
+    // free to swing to any angle at runtime instead of needing a sprite
+    // for every pose.
+    // -------------------------------------------------------------------
+    const legLen = 15.0;
+    const torsoH = 27.0;
+    const torsoW = 29.0;
+    const headR = 14.0;
+
+    final footY = deck;
+    // Recoil crouches the body: the hips drop, compressing the legs a touch.
+    final hipY = footY - legLen + recoil * 3.2;
+    final shoulderY = hipY - torsoH;
+    final headC = Offset(0, shoulderY - headR - 2);
+
+    final skin = _skinFor(raft.look);
+    final suit = raft.playerIndex == 0 ? const Color(0xFF2D4F8F) : lo.color;
+    const boot = Color(0xFF23262B);
+    const metal = Color(0xFF3B3F45);
+    final accent = weapon?.color ?? RT.orange;
+
+    final leanBack = recoil * 0.16;
+    final hipBobWalk = sin(crew.walkPhase * pi * 2 * 2).abs() * 1.2 * crew.walkAmp;
+
+    // ---- Legs ----
+    // A wide, planted stance while aiming or absorbing recoil; a swing while
+    // walking back to station; a relaxed idle otherwise.
+    final stance = 8.0 + (aiming ? 2.0 : 0.0) + recoil * 4.0;
+    final swing = sin(crew.walkPhase * pi * 2) * 7.0 * crew.walkAmp;
+    final liftL = crew.walkAmp > 0
+        ? max(0.0, sin(crew.walkPhase * pi * 2)) * 5.0 * crew.walkAmp
+        : 0.0;
+    final liftR = crew.walkAmp > 0
+        ? max(0.0, sin(crew.walkPhase * pi * 2 + pi)) * 5.0 * crew.walkAmp
+        : 0.0;
+    final feet = [
+      Offset(-stance + swing, -liftL),
+      Offset(stance - swing, -liftR),
+    ];
+    for (final foot in feet) {
+      _limb(canvas, Offset(foot.dx * 0.8, hipY + hipBobWalk),
+          Offset(foot.dx, footY + foot.dy), 10, boot);
+      canvas.drawRRect(
+        RRect.fromRectAndRadius(
+          Rect.fromCenter(center: Offset(foot.dx, footY + foot.dy + 3), width: 15, height: 9),
+          const Radius.circular(4.5),
+        ),
+        Paint()..color = boot,
+      );
+    }
+
+    // ---- Support arm (drawn first so it tucks behind the torso/gun arm) ----
+    final gunSide = dir >= 0 ? 1.0 : -1.0;
+    final gunShoulder = Offset(gunSide * (torsoW / 2 - 5), shoulderY + 5);
+    final suppShoulder = Offset(-gunSide * (torsoW / 2 - 5), shoulderY + 5);
+    final sway = sin(time * 1.4 + crew.bobPhase) * 1.6;
+
+    late Offset gunElbow;
+    late Offset gunHand;
+
+    if (aiming || recoil > 0) {
+      // Two-handed grip, levelled along the live aim angle. [recoil] eats
+      // into the reach for a snappy kickback right as the shot goes out.
+      final angleRad = aimAngleDeg * pi / 180;
+      final aimDir = Offset(gunSide * cos(angleRad), -sin(angleRad));
+      final reach = 24.0 - recoil * 7;
+      gunHand = gunShoulder + aimDir * reach;
+      gunElbow = gunShoulder + aimDir * (reach * 0.5) + const Offset(0, 3);
+
+      final suppHand = gunHand - aimDir * 7 + const Offset(0, 3);
+      final suppElbow = suppShoulder + (suppHand - suppShoulder) * 0.5 + const Offset(0, 5);
+      _limb(canvas, suppShoulder, suppElbow, 9, suit);
+      _limb(canvas, suppElbow, suppHand, 8, skin);
+      canvas.drawCircle(suppHand, 5.5, Paint()..color = skin);
+    } else {
+      // Relaxed: both arms hang at the sides with a little idle sway, plus
+      // a counter-swing while walking.
+      final walkSwing = sin(crew.walkPhase * pi * 2 + pi) * 4.0 * crew.walkAmp;
+      final suppElbow = suppShoulder + Offset(-gunSide * 3, 9 + sway * 0.3);
+      final suppHand = suppShoulder + Offset(-gunSide * 2, 18 - sway * 0.3);
+      _limb(canvas, suppShoulder, suppElbow, 9, suit);
+      _limb(canvas, suppElbow, suppHand + Offset(0, walkSwing), 8, skin);
+      canvas.drawCircle(suppHand + Offset(0, walkSwing), 5.5, Paint()..color = skin);
+
+      gunElbow = gunShoulder + Offset(gunSide * 3, 9 - sway * 0.3);
+      gunHand = gunShoulder + Offset(gunSide * 2, 18 + sway * 0.3);
+    }
+
+    // ---- Torso ----
+    canvas.save();
+    // Recoil leans the whole upper body back about the hips; walking adds
+    // a slight forward hunch.
+    canvas.translate(0, hipY);
+    canvas.rotate(-leanBack * gunSide + crew.walkAmp * 0.04 * gunSide);
+    canvas.translate(0, -hipY);
     canvas.drawRRect(
       RRect.fromRectAndCorners(
-        Rect.fromLTWH(-13, headC.dy + headR - 4, 26, 22),
-        topLeft: const Radius.circular(8),
-        topRight: const Radius.circular(8),
-        bottomLeft: const Radius.circular(3),
-        bottomRight: const Radius.circular(3),
+        Rect.fromLTWH(-torsoW / 2, shoulderY, torsoW, torsoH),
+        topLeft: const Radius.circular(11),
+        topRight: const Radius.circular(11),
+        bottomLeft: const Radius.circular(6),
+        bottomRight: const Radius.circular(6),
       ),
-      Paint()..color = raft.playerIndex == 0 ? const Color(0xFF2D4F8F) : lo.color,
+      Paint()..color = suit,
+    );
+    canvas.drawRRect(
+      RRect.fromRectAndRadius(
+        Rect.fromLTWH(-torsoW / 2, shoulderY + torsoH * 0.6, torsoW, torsoH * 0.4),
+        const Radius.circular(6),
+      ),
+      Paint()..color = Colors.black.withOpacity(0.1),
     );
 
-    // Head
-    final skin = _skinFor(raft.look);
-    canvas.drawCircle(headC, headR, Paint()..color = skin);
+    // ---- Gun arm (over the torso, so it always reads in front) ----
+    _limb(canvas, gunShoulder, gunElbow, 9, suit);
+    _limb(canvas, gunElbow, gunHand, 8, skin);
+
+    // ---- Sidearm — always in hand; levelled when aiming, carried angled
+    // down-and-forward at rest so it never reads as drilling for oil
+    // between the boots. ----
+    if (weapon != null && crew.alive) {
+      final bool levelled = aiming || recoil > 0;
+      final Offset u;
+      if (levelled) {
+        // Along the live aim; the muzzle climbs as the shot kicks.
+        final angleRad = aimAngleDeg * pi / 180;
+        u = Offset(gunSide * cos(angleRad), -sin(angleRad));
+      } else {
+        final restAng =
+            pi / 2 - gunSide * (0.42 + sin(crew.walkPhase * pi * 2) * 0.12 * crew.walkAmp);
+        u = Offset(cos(restAng), sin(restAng));
+      }
+      final barrelLen = 12.0 + (weapon.weight - 1) * 6;
+
+      canvas.save();
+      canvas.translate(gunHand.dx, gunHand.dy);
+      canvas.rotate(atan2(u.dy, u.dx));
+      if (levelled) {
+        // The weapon kicks back along the barrel and its muzzle climbs.
+        canvas.rotate(-gunSide * recoil * 0.30);
+        canvas.translate(-recoil * 4.5, 0);
+      }
+      canvas.drawRRect(
+        RRect.fromRectAndRadius(const Rect.fromLTWH(-4, -3.5, 9, 4), const Radius.circular(2)),
+        Paint()..color = metal,
+      );
+      canvas.drawRRect(
+        RRect.fromRectAndRadius(Rect.fromLTWH(5, -2.6, barrelLen, 3.2), const Radius.circular(1.6)),
+        Paint()..color = metal,
+      );
+      canvas.drawRect(Rect.fromLTWH(5 + barrelLen, -2.6, 2.4, 3.2), Paint()..color = accent);
+      // Grip: a short stub below the receiver where the hand wraps.
+      canvas.drawRRect(
+        RRect.fromRectAndRadius(const Rect.fromLTWH(-1.5, 0.5, 5, 6), const Radius.circular(2)),
+        Paint()..color = const Color(0xFF23262B),
+      );
+      canvas.restore();
+      canvas.drawCircle(gunHand, 5.5, Paint()..color = skin);
+
+      // Muzzle flash: only the first sliver of the recoil window, at the
+      // kicked barrel tip.
+      if (recoil > 0.7) {
+        // Clamp: (1.0 - 0.7) / 0.3 rounds to 1.0000000000000002, which the
+        // withOpacity assert rightly rejects.
+        final flashT = ((recoil - 0.7) / 0.3).clamp(0.0, 1.0);
+        final tip = gunHand + rotate(u, -gunSide * recoil * 0.30) * (17 + barrelLen);
+        canvas.drawCircle(
+          tip,
+          7 * flashT,
+          Paint()
+            ..shader = RadialGradient(colors: [
+              Colors.white.withOpacity(flashT),
+              accent.withOpacity(flashT * 0.7),
+              accent.withOpacity(0),
+            ]).createShader(Rect.fromCircle(center: tip, radius: max(0.01, 7 * flashT))),
+        );
+      }
+    }
+
+    // ---- Head ----
+    final headC2 = headC + Offset(-recoil * 2.5 * gunSide, recoil * 2.6);
+    canvas.drawCircle(headC2, headR, Paint()..color = skin);
     canvas.drawArc(
-      Rect.fromCircle(center: headC, radius: headR),
+      Rect.fromCircle(center: headC2, radius: headR),
       0.3, pi * 0.75, false,
-      Paint()..color = Colors.black.withOpacity(0.06)..style = PaintingStyle.stroke..strokeWidth = 7,
+      Paint()..color = Colors.black.withOpacity(0.06)..style = PaintingStyle.stroke..strokeWidth = 5,
     );
 
     // Brows
     final brow = Paint()
       ..color = const Color(0xFF8A7448)
-      ..strokeWidth = 4
+      ..strokeWidth = 2.6
       ..strokeCap = StrokeCap.round;
-    canvas.drawLine(headC + const Offset(-13, -8), headC + const Offset(-4, -11), brow);
-    canvas.drawLine(headC + const Offset(4, -11), headC + const Offset(13, -8), brow);
+    canvas.drawLine(headC2 + const Offset(-8, -5), headC2 + const Offset(-2.5, -6.5), brow);
+    canvas.drawLine(headC2 + const Offset(2.5, -6.5), headC2 + const Offset(8, -5), brow);
 
     // Eyes
-    for (final ex in [-7.0, 7.0]) {
+    for (final ex in [-4.4, 4.4]) {
       canvas.drawOval(
-        Rect.fromCenter(center: headC + Offset(ex, 0), width: 12, height: 14),
+        Rect.fromCenter(center: headC2 + Offset(ex, 0), width: 7.5, height: 9),
         Paint()..color = Colors.white,
       );
       if (crew.alive) {
-        canvas.drawCircle(headC + Offset(ex + dir * 1.5, 2), 3.4, Paint()..color = RT.ink);
+        canvas.drawCircle(headC2 + Offset(ex + dir * 1.0, 1.2), 2.2, Paint()..color = RT.ink);
       } else {
         final xp = Paint()
           ..color = RT.ink
-          ..strokeWidth = 2.4
+          ..strokeWidth = 1.6
           ..strokeCap = StrokeCap.round;
-        canvas.drawLine(headC + Offset(ex - 3, -3), headC + Offset(ex + 3, 3), xp);
-        canvas.drawLine(headC + Offset(ex + 3, -3), headC + Offset(ex - 3, 3), xp);
+        canvas.drawLine(headC2 + Offset(ex - 2, -2), headC2 + Offset(ex + 2, 2), xp);
+        canvas.drawLine(headC2 + Offset(ex + 2, -2), headC2 + Offset(ex - 2, 2), xp);
       }
     }
 
     // Nose + mouth
     canvas.drawOval(
-      Rect.fromCenter(center: headC + const Offset(0, 9), width: 8, height: 6),
+      Rect.fromCenter(center: headC2 + const Offset(0, 5.5), width: 5, height: 3.6),
       Paint()..color = const Color(0xFFDCC48B),
     );
     canvas.drawRRect(
       RRect.fromRectAndRadius(
-        Rect.fromCenter(center: headC + const Offset(0, 16), width: 15, height: 4),
-        const Radius.circular(3),
+        Rect.fromCenter(center: headC2 + const Offset(0, 10), width: 9.5, height: 2.6),
+        const Radius.circular(2),
       ),
       Paint()..color = const Color(0xFFB9955C),
     );
 
-    _headgear(canvas, raft.look, headC, headR, dir);
+    _headgear(canvas, raft.look, headC2, headR, dir);
+
+    canvas.restore();
+    canvas.restore();
+  }
+
+  /// Draws a crew member straight from their live ragdoll pose: limbs are
+  /// stroked between the verlet points, so whatever tangle the physics
+  /// produced is exactly what you see. The gun stays in the nearest hand.
+  void _ragdollBody(
+    Canvas canvas,
+    Raft raft,
+    Crew crew,
+    double dir,
+    WeaponDef? weapon,
+  ) {
+    final pose = crew.pose!;
+    final skin = _skinFor(raft.look);
+    final suit = raft.playerIndex == 0 ? const Color(0xFF2D4F8F) : raft.loadout.color;
+    const boot = Color(0xFF23262B);
+    const metal = Color(0xFF3B3F45);
+
+    final dead = !crew.alive;
+    final xEye = Paint()
+      ..color = RT.ink
+      ..strokeWidth = 1.6
+      ..strokeCap = StrokeCap.round;
+
+    void limbTo(RagdollPoint a, RagdollPoint b, double w, Color color) =>
+        _limb(canvas, a.pos, b.pos, w, color);
+
+    // Legs first (behind the torso).
+    limbTo(pose.hip, pose.footL, 10, boot);
+    limbTo(pose.hip, pose.footR, 10, boot);
+    canvas.drawCircle(pose.footL.pos, 4.5, Paint()..color = boot);
+    canvas.drawCircle(pose.footR.pos, 4.5, Paint()..color = boot);
+
+    // Support arm behind the torso.
+    limbTo(pose.neck, pose.handL, 8.5, suit);
+    canvas.drawCircle(pose.handL.pos, 5.0, Paint()..color = skin);
+
+    // Torso: a rounded slab spanning neck→hip, oriented along the spine.
+    final spine = pose.neck.pos - pose.hip.pos;
+    final spineAng = atan2(spine.dy, spine.dx);
+    canvas.save();
+    canvas.translate(pose.hip.pos.dx, pose.hip.pos.dy);
+    canvas.rotate(spineAng + pi / 2);
+    canvas.drawRRect(
+      RRect.fromRectAndCorners(
+        Rect.fromLTWH(-14.5, -27, 29, 27),
+        topLeft: const Radius.circular(11),
+        topRight: const Radius.circular(11),
+        bottomLeft: const Radius.circular(6),
+        bottomRight: const Radius.circular(6),
+      ),
+      Paint()..color = suit,
+    );
+    canvas.restore();
+
+    // Gun arm in front.
+    limbTo(pose.neck, pose.handR, 8.5, suit);
+    canvas.drawCircle(pose.handR.pos, 5.0, Paint()..color = skin);
+
+    // Head, tilted with the spine so a snapped-back head reads.
+    final hAxis = pose.head.pos - pose.neck.pos;
+    final hAng = atan2(hAxis.dy, hAxis.dx) + pi / 2;
+    canvas.save();
+    canvas.translate(pose.head.pos.dx, pose.head.pos.dy);
+    canvas.rotate(hAng * 0.4);
+    canvas.drawCircle(Offset.zero, 14, Paint()..color = skin);
+    // X eyes when dead; a dazed squint otherwise.
+    if (dead) {
+      for (final ex in [-4.4, 4.4]) {
+        canvas.drawLine(Offset(ex - 2, -2), Offset(ex + 2, 2), xEye);
+        canvas.drawLine(Offset(ex + 2, -2), Offset(ex - 2, 2), xEye);
+      }
+    } else {
+      canvas.drawCircle(Offset(dir * 2.0, 0.5), 2.2, Paint()..color = RT.ink);
+    }
+    canvas.restore();
+
+    // The sidearm stays glued to the gun hand, aimed across the body along
+    // the line between the two hands — a limp wrist reads as a limp gun.
+    if (weapon != null && crew.alive) {
+      final aim = pose.handR.pos - pose.handL.pos;
+      final u = aim.distance > 1 ? aim / aim.distance : Offset(dir, 0);
+      canvas.save();
+      canvas.translate(pose.handR.pos.dx, pose.handR.pos.dy);
+      canvas.rotate(atan2(u.dy, u.dx));
+      canvas.drawRRect(
+        RRect.fromRectAndRadius(const Rect.fromLTWH(-4, -3.5, 9, 4), const Radius.circular(2)),
+        Paint()..color = metal,
+      );
+      canvas.drawRRect(
+        RRect.fromRectAndRadius(const Rect.fromLTWH(5, -2.6, 14, 3.2), const Radius.circular(1.6)),
+        Paint()..color = metal,
+      );
+      canvas.restore();
+    }
+  }
+
+  /// A single thick, rounded-cap "bone" — the building block for every arm
+  /// and leg. Always convex and reads as a limb at any rotation, which is
+  /// what makes the gun arm safe to swing to an arbitrary angle at runtime
+  /// instead of needing a pre-drawn pose per angle.
+  void _limb(Canvas canvas, Offset a, Offset b, double width, Color color) {
+    canvas.drawLine(
+      a, b,
+      Paint()
+        ..color = color
+        ..strokeWidth = width
+        ..strokeCap = StrokeCap.round,
+    );
   }
 
   Color _skinFor(CrewLook look) => switch (look) {
@@ -534,28 +1118,16 @@ class WorldRenderer {
 
   void _enemyLabel(Canvas canvas, Raft raft, double bob) {
     final lo = raft.loadout;
-    final top = BattleConst.waterY - lo.width * lo.hull.thickness * 0.55 - 92 + bob;
+    final top = BattleConst.waterY - lo.width * lo.hull.thickness * 0.55 - 104 + bob;
 
     final tp = TextPainter(
       text: TextSpan(text: raft.label, style: RT.body(size: 10, color: RT.ink, weight: FontWeight.w800, letterSpacing: 1.2)),
       textDirection: TextDirection.ltr,
     )..layout();
     tp.paint(canvas, Offset(raft.x - tp.width / 2, top - 14));
-
-    // HP bar
-    const barW = 62.0;
-    final barRect = Rect.fromLTWH(raft.x - barW / 2, top, barW, 7);
-    canvas.drawRRect(
-      RRect.fromRectAndRadius(barRect, const Radius.circular(4)),
-      Paint()..color = Colors.white.withOpacity(0.66),
-    );
-    canvas.drawRRect(
-      RRect.fromRectAndRadius(
-        Rect.fromLTWH(barRect.left, barRect.top, barW * raft.hpFrac, 7),
-        const Radius.circular(4),
-      ),
-      Paint()..color = raft.hpFrac > 0.5 ? RT.green : (raft.hpFrac > 0.25 ? RT.orange : RT.red),
-    );
+    // HP is no longer shown here: every crew member carries a dynamic health
+    // bar that only appears when they actually take damage (see
+    // [_crewHealthBar]).
   }
 
   // ---------------------------------------------------------------------------

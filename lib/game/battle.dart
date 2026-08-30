@@ -63,8 +63,15 @@ class BattleConst {
   static const double playerX = 210;
   static const List<double> enemySlots = [1500, 1900, 2300, 2700];
 
-  /// A shot within this many units of a crew member counts as a direct hit.
+  /// A shot within this many units of a crew member's body counts as a
+  /// direct hit.
   static const double hitRadius = 34;
+
+  /// Height of a standing crew member, feet to top of head, in world units.
+  /// Matches the proportions the renderer actually draws — see the layout
+  /// block in its `_crewMember` — so the hit capsule wraps the character
+  /// rather than an invisible circle around their middle.
+  static const double bodyHeight = 72;
 
   // ---------------------------------------------------------------------------
   // Camera lock (blind fire)
@@ -75,9 +82,9 @@ class BattleConst {
   static const double camLead = 190;
 
   /// Extra clearance kept between the camera's frame and the near edge of a
-  /// living enemy raft. Bigger than a raft's half-width, so even a wide barge
-  /// cannot poke into view.
-  static const double camEnemyMargin = 90;
+  /// living enemy raft. Bigger than the widest raft's half-width (130), so
+  /// even a barge with its stern castle cannot poke into view.
+  static const double camEnemyMargin = 140;
 
   /// The trajectory preview never draws past this fraction of the shot's
   /// flight. Friv's Raft shows a stub of the arc, not the landing spot, and
@@ -109,35 +116,362 @@ class BattleConst {
 
   /// How much of a hit's shove becomes lift rather than slide. Low on
   /// purpose: a body that spends a long time airborne travels a long way
-  /// sideways, and the tuning target is that an ordinary hit rocks someone
-  /// back on their heels while only heavy ordnance can carry them over the
-  /// side.
-  static const double bodyLift = 0.25;
+  /// sideways — and, worse, reads as launched into the sky — so the lift is
+  /// a fraction of the shove and the rest carries along the deck.
+  static const double bodyLift = 0.16;
 
   /// Below this speed and spin a grounded body is considered to have stopped
   /// tumbling, and starts [bodySettleTime] of "getting up" before it stands.
-  static const double bodySleepSpeed = 0.85;
-  static const double bodySleepSpin = 0.022;
+  /// The thresholds sit above the solver's resting jitter — a body propped
+  /// on bent legs breathes at roughly 1.3 speed / 0.07 spin from gravity
+  /// fighting the constraints — but far below anything that looks like real
+  /// motion. A body that is still *drifting* is caught by the positional
+  /// check in the settle logic regardless.
+  static const double bodySleepSpeed = 1.7;
+  static const double bodySleepSpin = 0.09;
   static const double bodySettleTime = 0.4;
 
-  /// How fast a recovered crew member shuffles back to their station, and how
-  /// quickly an upright body unwinds its tilt (0..1 per frame).
-  static const double bodyRecover = 0.12;
-  static const double bodyUnwind = 0.22;
+  /// During the settle window a grounded body's hips may not wander more
+  /// than this (per frame-since-window-start) — a body sliding down a ramp
+  /// keeps resetting the window instead of standing up mid-slide.
+  static const double bodySettleDrift = 0.8;
 
-  /// How far below the waterline a body's feet must sink before they drown.
+  /// How long the stand-back-up blend takes once a settled ragdoll rises,
+  /// and how fast a recovered crew member shuffles back to their station.
+  static const double bodyGetUpTime = 0.5;
+  static const double bodyRecover = 0.12;
+
+  /// Walk-cycle phase advance per 60Hz step while a crew member is shuffling
+  /// back to their station — the renderer turns this into leg swings.
+  static const double walkCycleSpeed = 0.30;
+
+  /// How far below the waterline a body's hips must sink before they drown.
   static const double drownDepth = 14;
+
+  /// Friction along the deck for a dead body — much slicker than for a
+  /// living one, because a corpse is limp. This is what lets a killing blow
+  /// carry a body all the way to the rail instead of dumping it mid-deck.
+  static const double bodyDeadFriction = 0.96;
+
+  /// A dead body on the deck that has all but stopped is kept sliding toward
+  /// the rail at this speed, so every death ends in the water.
+  static const double bodyDeadDrift = 0.9;
+
+  /// Hard cap on any ragdoll point's speed, per 60Hz frame. Constraint
+  /// solving can inject energy when points pile up (and repeat hits stack
+  /// impulses), which could launch a body into the sky; the cap keeps every
+  /// flight inside the world's scale while gravity brings it back down.
+  static const double bodyMaxSpeed = 9.0;
+
+  /// Separate, much tighter cap on *upward* velocity. Sideways travel reads
+  /// as a knock-back; vertical travel reads as launched into the sky. With
+  /// the cap at 4/frame a body's apex stays within ~20 units of the deck —
+  /// a hop, not a launch.
+  static const double bodyMaxRise = 4.0;
+
+  /// A ragdoll may not stay active longer than this. Real tumbles settle or
+  /// drown within a few seconds; if one is still going (constraint pile-up,
+  /// an edge case, anything), the watchdog force-resolves it — on their feet
+  /// if over the deck, into the water if not — so a body can never hang in
+  /// the air indefinitely.
+  static const double ragdollWatchdog = 8.0;
+
+  /// Floor impacts slower than this land dead — no bounce. Without it a
+  /// resting body never sleeps: gravity re-energizes the points into the
+  /// deck every frame and the bounce returns a slice of that energy,
+  /// producing a permanent micro-bounce that random-walks the body around
+  /// the deck.
+  static const double bodyRestSpeed = 1.0;
+
+  /// Rail lips: living bodies that reach the deck's edge below lip height
+  /// are bounced back aboard instead of washing overboard. The lip extends
+  /// this far past the walkable deck, and only covers bodies up to this far
+  /// above deck level — anything flying higher clears the rail entirely.
+  static const double railWall = 8.0;
+  static const double railWallHeight = 14.0;
+
+  // ---------------------------------------------------------------------------
+  // Ragdoll solver (verlet points + distance constraints)
+  // ---------------------------------------------------------------------------
+
+  /// Constraint relaxation iterations per physics step. More iterations make
+  /// the body stiffer; five keeps a crew member recognisably human at a cost
+  /// the fixed-step loop can afford.
+  static const int ragdollIters = 5;
+
+  /// Fraction of an impact's shove applied as whole-body linear velocity —
+  /// the rest of the energy goes into spin when the blow lands off-centre.
+  static const double ragdollLinear = 0.9;
+
+  /// Multiplier on the torque an off-centre impact generates. The raw
+  /// angular velocity from the point impulse is physically correct but
+  /// reads as sluggish at this art scale, so it is boosted and then capped.
+  static const double ragdollTorque = 4.0;
+  static const double ragdollMaxSpin = 0.22;
+
+  // ---------------------------------------------------------------------------
+  // Death sequence
+  // ---------------------------------------------------------------------------
+
+  /// White impact-flash duration on a killing blow.
+  static const double deathFlashTime = 0.16;
+
+  /// Total time a drowned body takes to slip under, and the fraction of
+  /// that spent bobbing at the surface before the descent begins.
+  static const double sinkTime = 2.6;
+  static const double sinkFloatFrac = 0.3;
+
+  // ---------------------------------------------------------------------------
+  // Dynamic health bars
+  // ---------------------------------------------------------------------------
+
+  /// How long a crew member's HP bar stays up after taking damage, how long
+  /// of that is the fade-out, how long the ghost bar waits before it starts
+  /// draining, and how fast the ghost drains (fractions per second).
+  static const double hpBarTime = 2.6;
+  static const double hpBarFade = 0.4;
+  static const double hpBarGhostDelay = 0.3;
+  static const double hpGhostDrain = 0.9;
+}
+
+/// One point of the verlet ragdoll. Position is integrated; velocity is
+/// implicit (pos − prev), which makes bounce and friction a matter of
+/// nudging [prev] at collision time.
+class RagdollPoint {
+  Offset pos;
+  Offset prev;
+
+  /// 1 / mass. Zero would pin the point — no crew point is ever pinned.
+  final double invMass;
+
+  RagdollPoint(Offset at, {double mass = 1})
+      : pos = at,
+        prev = at,
+        invMass = mass <= 0 ? 0 : 1 / mass;
+
+  Offset get vel => pos - prev;
+
+  void setVel(Offset v) => prev = pos - v;
+}
+
+/// One end of a distance constraint. `min`/`max` null means a rigid stick of
+/// [len]; otherwise the constraint only fires outside the given range (ropes
+/// and struts — arms fold, legs don't pass through each other).
+class _RagConstraint {
+  final RagdollPoint a;
+  final RagdollPoint b;
+  final double len;
+  final double? min;
+  final double? max;
+  const _RagConstraint(this.a, this.b, this.len, {this.min, this.max});
+}
+
+/// A dynamic physics ragdoll for one crew member, built from seven verlet
+/// points (head, neck, hip, two hands, two feet) held together by distance
+/// constraints. Points live in *station-local* coordinates: x relative to
+/// the crew member's slot on the deck, y relative to the deck surface — the
+/// same frame the renderer's standing pose uses, so a body at rest maps 1:1
+/// onto the drawn character and an impact genuinely displaces them through
+/// the world.
+class RagdollPose {
+  final RagdollPoint head;
+  final RagdollPoint neck;
+  final RagdollPoint hip;
+  final RagdollPoint handL;
+  final RagdollPoint handR;
+  final RagdollPoint footL;
+  final RagdollPoint footR;
+
+  final List<RagdollPoint> points;
+  final List<_RagConstraint> _constraints = [];
+
+  RagdollPose._(
+    this.head,
+    this.neck,
+    this.hip,
+    this.handL,
+    this.handR,
+    this.footL,
+    this.footR,
+  ) : points = [head, neck, hip, handL, handR, footL, footR];
+
+  /// A standing body whose feet-origin anchor sits at [origin] — the layout
+  /// mirrors the renderer's proportions (leg 15, torso 27, head at −58) so
+  /// spawning a pose from a standing crew member never pops.
+  factory RagdollPose.standingAt(Offset origin) {
+    Offset at(double dx, double dy) => origin + Offset(dx, dy);
+    final pose = RagdollPose._(
+      RagdollPoint(at(0, -58), mass: 0.9),
+      RagdollPoint(at(0, -42), mass: 1.2),
+      RagdollPoint(at(0, -15), mass: 2.2),
+      RagdollPoint(at(-10, -25), mass: 0.7),
+      RagdollPoint(at(10, -25), mass: 0.7),
+      RagdollPoint(at(-8, 0), mass: 1.1),
+      RagdollPoint(at(8, 0), mass: 1.1),
+    );
+    final c = pose._constraints;
+    // Spine and legs: rigid.
+    c.add(_RagConstraint(pose.head, pose.neck, 16));
+    c.add(_RagConstraint(pose.neck, pose.hip, 27));
+    c.add(_RagConstraint(pose.hip, pose.footL, 15));
+    c.add(_RagConstraint(pose.hip, pose.footR, 15));
+    // Arms: ropes — elbows fold, so the hands may come close but never
+    // stretch past full reach.
+    c.add(_RagConstraint(pose.neck, pose.handL, 26, min: 6, max: 26));
+    c.add(_RagConstraint(pose.neck, pose.handR, 26, min: 6, max: 26));
+    // Feet stay a stride apart but never cross.
+    c.add(_RagConstraint(pose.footL, pose.footR, 16, min: 4, max: 18));
+    // Anti-fold struts: the body may crumple but never fold flat in half.
+    c.add(_RagConstraint(pose.head, pose.hip, 34, min: 34));
+    c.add(_RagConstraint(pose.head, pose.footL, 24, min: 24));
+    c.add(_RagConstraint(pose.head, pose.footR, 24, min: 24));
+    c.add(_RagConstraint(pose.neck, pose.footL, 18, min: 18));
+    c.add(_RagConstraint(pose.neck, pose.footR, 18, min: 18));
+    return pose;
+  }
+
+  /// Advances the sim one 60Hz step: implicit-velocity integration under
+  /// gravity with per-frame drag.
+  void integrate({required double gravity, required double drag}) {
+    for (final p in points) {
+      final v = (p.pos - p.prev) * drag;
+      p.prev = p.pos;
+      p.pos += v + Offset(0, gravity);
+    }
+  }
+
+  /// Relaxation pass over every constraint. Called [BattleConst.ragdollIters]
+  /// times per step, after integration and after any collision response.
+  void solve() {
+    for (int it = 0; it < BattleConst.ragdollIters; it++) {
+      for (final con in _constraints) {
+        final delta = con.b.pos - con.a.pos;
+        final d = delta.distance;
+        if (d <= 1e-6) continue;
+        double diff = 0;
+        if (con.min == null && con.max == null) {
+          diff = (d - con.len) / d;
+        } else if (con.max != null && d > con.max!) {
+          diff = (d - con.max!) / d;
+        } else if (con.min != null && d < con.min!) {
+          diff = (d - con.min!) / d;
+        }
+        if (diff == 0) continue;
+        final wSum = con.a.invMass + con.b.invMass;
+        if (wSum <= 0) continue;
+        final corr = delta * diff;
+        con.a.pos += corr * (con.a.invMass / wSum);
+        con.b.pos -= corr * (con.b.invMass / wSum);
+      }
+    }
+  }
+
+  /// Applies a blow delivered at [hitLocal] (station-local) with per-frame
+  /// velocity [impulse]: every point takes the linear shove, and an
+  /// off-centre hit adds torque around the centre of mass — a shot to the
+  /// head snaps the body head-over-heels while one to the legs sweeps the
+  /// feet out from under them.
+  void applyImpulse(Offset hitLocal, Offset impulse) {
+    final com = hip.pos;
+
+    // Moment of inertia about the centre of mass.
+    var inertia = 0.0;
+    for (final p in points) {
+      final r = p.pos - com;
+      final m = p.invMass > 0 ? 1 / p.invMass : 0.0;
+      inertia += m * (r.dx * r.dx + r.dy * r.dy);
+    }
+
+    final rHit = hitLocal - com;
+    final cross = rHit.dx * impulse.dy - rHit.dy * impulse.dx;
+    var w = inertia > 1e-6 ? cross / inertia * BattleConst.ragdollTorque : 0.0;
+    w = w.clamp(-BattleConst.ragdollMaxSpin, BattleConst.ragdollMaxSpin);
+
+    for (final p in points) {
+      final r = p.pos - com;
+      final lin = impulse * BattleConst.ragdollLinear;
+      final tan = Offset(-r.dy, r.dx) * w;
+      p.setVel(p.vel + lin + tan);
+    }
+  }
+
+  /// Blends every point toward [target]'s layout by [t] (0..1), killing
+  /// momentum as it goes — the stand-back-up animation. Physics is
+  /// suspended while the blend runs.
+  void blendTo(RagdollPose target, double t) {
+    void blend(RagdollPoint p, RagdollPoint q) {
+      p.pos = Offset(
+        p.pos.dx + (q.pos.dx - p.pos.dx) * t,
+        p.pos.dy + (q.pos.dy - p.pos.dy) * t,
+      );
+      p.prev = p.pos;
+    }
+
+    blend(head, target.head);
+    blend(neck, target.neck);
+    blend(hip, target.hip);
+    blend(handL, target.handL);
+    blend(handR, target.handR);
+    blend(footL, target.footL);
+    blend(footR, target.footR);
+  }
+
+  /// Fastest point, in per-frame units — the sleep test.
+  double get maxSpeed {
+    var m = 0.0;
+    for (final p in points) {
+      m = max(m, p.vel.distance);
+    }
+    return m;
+  }
+
+  /// Fastest angular velocity about the hip, in radians per frame.
+  double get maxSpin {
+    final com = hip.pos;
+    var m = 0.0;
+    for (final p in points) {
+      final r = p.pos - com;
+      final d2 = max(1.0, r.dx * r.dx + r.dy * r.dy);
+      final cross = r.dx * p.vel.dy - r.dy * p.vel.dx;
+      m = max(m, (cross / d2).abs());
+    }
+    return m;
+  }
+
+  /// Bounding box of the body in station-local coordinates.
+  Rect get bounds {
+    var left = head.pos.dx;
+    var right = left;
+    var top = head.pos.dy;
+    var bottom = top;
+    for (final p in points) {
+      left = min(left, p.pos.dx);
+      right = max(right, p.pos.dx);
+      top = min(top, p.pos.dy);
+      bottom = max(bottom, p.pos.dy);
+    }
+    return Rect.fromLTRB(left, top, right, bottom);
+  }
+
+  /// The bounds plus head radius and limb thickness — what a fade or flash
+  /// layer must cover to always wrap the drawn body.
+  Rect get drawBounds => bounds
+      .inflate(18)
+      .intersect(const Rect.fromLTWH(-220, -260, 440, 560));
 }
 
 /// One character aboard a raft.
 ///
-/// Besides HP, a crew member carries a small rigid body: an [offset] from
-/// their station on the deck plus a [tilt]. While [ragdoll] is set that body
-/// is airborne or sliding and is integrated by [BattleWorld.update]; once it
-/// goes to sleep the body eases back to its station and stands up. A body
-/// that slides off the deck falls into the sea and drowns — being knocked
-/// overboard is what actually eliminates a crew member in this game, not
-/// merely reaching 0 HP where they stand.
+/// Besides HP, a crew member carries a small physics body: a [RagdollPose]
+/// of verlet points that is spawned the moment they are knocked off their
+/// feet and integrated by [BattleWorld.update]. The impact is applied *at
+/// the point the shot actually struck*, so the body reacts to the blow's
+/// location — head shots tumble, leg shots sweep — and the body's world
+/// position is genuinely displaced by the hit. Once the ragdoll goes to
+/// sleep the crew member blends back onto their feet and walks back to
+/// their station. A body that slides off the deck falls into the sea and
+/// drowns — being knocked overboard is what actually eliminates a crew
+/// member in this game, not merely reaching 0 HP where they stand.
 class Crew {
   double hp;
   final double maxHp;
@@ -148,26 +482,72 @@ class Crew {
   /// 0 while alive; ramps to 1 as a defeated crew member sinks out of view.
   double sinkT = 0;
 
-  /// Offset of the body's feet from its station, in world units. +dx is to
-  /// the right, +dy is *down* (toward and then through the waterline).
+  /// Displacement of the body's feet-origin from its station, in world
+  /// units. Follows the ragdoll's hips while tumbling, and is walked back to
+  /// zero as the crew member returns to their slot. +dx is to the right,
+  /// +dy is *down* (toward and then through the waterline).
   Offset offset = Offset.zero;
 
-  /// Body velocity in world units per 60Hz frame.
+  /// Representative body velocity (the ragdoll's hips), in world units per
+  /// 60Hz frame.
   Offset vel = Offset.zero;
-
-  /// Current lean in radians, and how fast that lean is spinning.
-  double tilt = 0;
-  double spin = 0;
 
   /// True while the body is being thrown around by an impact.
   bool ragdoll = false;
+
+  /// Seconds the current ragdoll has been running. Drives the watchdog that
+  /// force-resolves a body which neither settles nor drowns.
+  double ragdollTime = 0;
+
+  /// True when this crew member can take their turn shot: alive, on their
+  /// feet, and not mid-recovery. A body tumbling across the deck (or in the
+  /// air) cannot fire.
+  bool get ready => alive && !ragdoll && pose == null && getUpT < 0;
+
+  /// The live ragdoll, or null while standing.
+  RagdollPose? pose;
+
+  /// 0..1 progress of standing back up after a settled ragdoll; −1 while
+  /// not getting up.
+  double getUpT = -1;
 
   /// True once the body has come to rest after tumbling. Counts up to
   /// [BattleConst.bodySettleTime] before they stand back up.
   double rest = 0;
 
+  /// Where the hips were when the current settle window began — the drift
+  /// check that keeps a sliding body from "standing up" mid-slide.
+  Offset restHip = Offset.zero;
+
   /// Went into the water. This is fatal and permanent for the round.
   bool drowned = false;
+
+  /// Horizontal direction a dying body falls and drifts in (±1); 0 while
+  /// alive. The body stepper uses it to keep a corpse sliding toward the
+  /// rail until it goes over the side.
+  double deathDir = 0;
+
+  /// White impact-flash countdown fired by a killing blow.
+  double deathFlash = 0;
+
+  // --- Dynamic health bar ---------------------------------------------------
+
+  /// Seconds left to show this crew member's HP bar; 0 = hidden.
+  double hpBarT = 0;
+
+  /// The "ghost" HP fraction the bar drains from after a hit. Reset to the
+  /// live fraction whenever the bar fully hides, so it always reflects the
+  /// most current HP when it reappears.
+  double hpDisplay = 1;
+
+  // --- Walk-back animation --------------------------------------------------
+
+  /// Walk-cycle phase while shuffling back to the station.
+  double walkPhase = 0;
+
+  /// 0..1 weight of the walk animation; eases in while walking and out
+  /// once the station is reached.
+  double walkAmp = 0;
 
   Crew({required this.hp, required this.maxHp, this.bobPhase = 0});
 
@@ -178,21 +558,58 @@ class Crew {
 
   double get hpFrac => (hp / maxHp).clamp(0.0, 1.0);
 
+  /// Flags the dynamic HP bar to appear. [fracBefore] is the HP fraction the
+  /// character had *before* the damage was applied — the ghost bar starts
+  /// there and drains to the live value so the loss is animated, not
+  /// instant. Repeated hits while the bar is up extend it and keep the
+  /// ghost draining from the highest point it reached.
+  void showHpBar(double fracBefore) {
+    final f = fracBefore.clamp(0.0, 1.0);
+    hpDisplay = hpBarT <= 0 ? f : max(hpDisplay, f);
+    hpBarT = BattleConst.hpBarTime;
+  }
+
   /// Knocked off their feet by an impact.
   ///
   /// [dir] is the projectile's travel direction, [force] its shove in world
-  /// units per frame. The body is launched mostly along the shot with a
-  /// little lift, plus spin away from the impact so they tumble rather than
-  /// slide like a crate.
-  void knock(Offset dir, double force) {
+  /// units per frame, and [hitLocal] the station-local point the blow
+  /// actually landed at — where the hit lands decides how the body moves.
+  /// Omitting it treats the blow as landing dead-centre: a clean shove with
+  /// no spin.
+  void knock(Offset dir, double force, {Offset? hitLocal}) {
     final d = dir.distance <= 0 ? const Offset(1, 0) : dir / dir.distance;
     ragdoll = true;
+    ragdollTime = 0;
     rest = 0;
-    vel = Offset(
-      vel.dx + d.dx * force,
-      vel.dy + d.dy * force - force * BattleConst.bodyLift,
+    getUpT = -1;
+    pose ??= RagdollPose.standingAt(Offset(offset.dx, offset.dy));
+    final impulse = Offset(d.dx * force, d.dy * force - force * BattleConst.bodyLift);
+    pose!.applyImpulse(hitLocal ?? pose!.hip.pos, impulse);
+    vel = pose!.hip.vel;
+  }
+
+  /// A killing blow. Unlike a hit someone survives, a dead body never stands
+  /// back up: it tumbles the way the impact pointed, goes limp, and — nudged
+  /// along by the death drift in [_stepBody] — slides off the deck and into
+  /// the sea. [railDir] is the way off the nearest rail, used when the
+  /// impact itself has little horizontal say in where they fall.
+  void startDeath(Offset hitDir, double force, {double railDir = 1, Offset? hitLocal}) {
+    final d = hitDir.distance <= 0 ? const Offset(1, 0) : hitDir / hitDir.distance;
+    deathDir = d.dx.abs() >= 0.4
+        ? (d.dx < 0 ? -1.0 : 1.0)
+        : (railDir < 0 ? -1.0 : 1.0);
+    deathFlash = BattleConst.deathFlashTime;
+    ragdoll = true;
+    ragdollTime = 0;
+    rest = 0;
+    getUpT = -1;
+    pose ??= RagdollPose.standingAt(Offset(offset.dx, offset.dy));
+    final f = max(force, 3.0);
+    pose!.applyImpulse(
+      hitLocal ?? pose!.hip.pos,
+      Offset(d.dx * f, d.dy * f - 2.2),
     );
-    spin += (d.dx >= 0 ? 1 : -1) * force * 0.045;
+    vel = pose!.hip.vel;
   }
 
   /// Force of a hit from [weapon], scaled by how heavy it is.
@@ -226,6 +643,11 @@ class Raft {
   /// Index of the crew member whose turn it is to shoot on this raft.
   int activeIndex = 0;
 
+  /// The deck's platform layout, oriented so the raised stern work sits
+  /// behind this raft's crew (see [DeckProfile.forLoadout]).
+  late final DeckProfile profile =
+      DeckProfile.forLoadout(loadout, facing: facing);
+
   Raft({
     required this.playerIndex,
     required this.x,
@@ -252,7 +674,16 @@ class Raft {
   double get deckY => BattleConst.waterY - loadout.width * loadout.hull.thickness * 0.55;
 
   /// Half the walkable deck. Past this a crew member is over open water.
-  double get deckHalf => loadout.width * 0.5 - 10;
+  double get deckHalf => loadout.deckHalf;
+
+  /// The walkable surface at hull-local [x], as a y-offset from [deckY]
+  /// (0 on the main deck, negative up on a raised platform), or null past
+  /// the rails. This is the height-field the body physics and the walk-back
+  /// both follow — platforms, ramps and deck are one continuous surface.
+  double? surfaceY(double x) {
+    if (x.abs() > deckHalf) return null;
+    return -profile.riseAt(x);
+  }
 
   /// World position of crew member [i]'s feet, following their body.
   Offset feetPos(int i) => Offset(x + loadout.crewOffset(i) + crew[i].offset.dx, deckY + crew[i].offset.dy);
@@ -260,6 +691,25 @@ class Raft {
   /// World position of crew member [i]'s body centre — the point a shot has
   /// to land near. Sits a torso-and-a-bit above the feet.
   Offset crewPos(int i) => feetPos(i) - const Offset(0, 24);
+
+  /// The two endpoints of crew member [i]'s hit capsule in world space,
+  /// following their live pose. A tumbling body is hit where it actually
+  /// is, not where it would be standing.
+  (Offset, Offset) crewCapsule(int i) {
+    final pose = crew[i].pose;
+    if (pose == null) {
+      final feet = feetPos(i);
+      return (feet, feet - const Offset(0, BattleConst.bodyHeight));
+    }
+    final b = pose.bounds;
+    final cx = x + loadout.crewOffset(i) + b.center.dx;
+    return (Offset(cx, deckY + b.bottom), Offset(cx, deckY + b.top));
+  }
+
+  /// Which way leads off the nearest rail from crew member [i]'s current
+  /// position: +1 toward the bow-side rail, -1 toward the stern-side one.
+  double railDir(int i) =>
+      (loadout.crewOffset(i) + crew[i].offset.dx) >= 0 ? 1.0 : -1.0;
 
   /// The crew member currently taking this raft's shot, or null if none left.
   Crew? get activeCrew {
@@ -286,6 +736,25 @@ class Raft {
     }
   }
 
+  /// Makes sure [activeIndex] points at a crew member who can actually take
+  /// the shot: alive **and** on their feet. A shooter mid-ragdoll cannot
+  /// fire — the body is wherever the physics left it, not at the station.
+  /// Prefers a ready member; falls back to any living one (the turn then
+  /// waits for them to recover). Returns false only when nobody aboard can
+  /// act at all.
+  bool ensureActiveReady() {
+    if (activeCrew != null && activeCrew!.ready) return true;
+    for (int k = 1; k <= crew.length; k++) {
+      final idx = (activeIndex + k) % crew.length;
+      if (crew[idx].ready) {
+        activeIndex = idx;
+        return true;
+      }
+    }
+    ensureActiveAlive();
+    return activeCrew != null && activeCrew!.ready;
+  }
+
   /// Makes sure [activeIndex] points at somebody who is still alive.
   void ensureActiveAlive() {
     if (activeCrew != null) return;
@@ -301,7 +770,18 @@ class Shot {
   final int owner;
   final List<Offset> trail = [];
 
-  Shot({required this.pos, required this.vel, required this.weapon, required this.owner});
+  /// [BattleWorld.elapsed] at the moment this shot left the barrel. Lets the
+  /// renderer time the shooter's recoil kick and muzzle flash without the
+  /// simulation itself needing to know anything about how it's drawn.
+  final double firedAt;
+
+  Shot({
+    required this.pos,
+    required this.vel,
+    required this.weapon,
+    required this.owner,
+    required this.firedAt,
+  });
 }
 
 /// A short-lived visual: the design's expanding `boom`, a water splash, or the
@@ -489,6 +969,13 @@ class BattleWorld {
   void followCam(double worldX, double dt) =>
       easeCam(clampToLock(worldX), dt);
 
+  /// Hard cut to centre on [worldX] — the camera jump from the shooter to
+  /// the projectile a beat after firing. A cut, not an ease: by the time the
+  /// view switches the shot is already a long way out, and panning across
+  /// that distance reads as lag where a cut reads as coverage. [trackShot]
+  /// takes over from here and eases alongside the ball.
+  void cutCam(double worldX) => cam = camFor(worldX);
+
   /// How fast the camera closes on a tracked projectile, per second.
   ///
   /// This is a *lag* constant, not a speed limit: see [trackShot].
@@ -655,6 +1142,7 @@ class BattleWorld {
       ),
       weapon: weapon,
       owner: owner,
+      firedAt: elapsed,
     );
   }
 
@@ -664,20 +1152,28 @@ class BattleWorld {
     final s = shot;
     if (s == null) return null;
 
+    final prev = s.pos;
     s.trail.add(s.pos);
     if (s.trail.length > 18) s.trail.removeAt(0);
 
     s.pos += s.vel;
     s.vel = Offset(s.vel.dx, s.vel.dy + BattleConst.gravity);
 
-    // Direct hit on any crew member not belonging to the shooter.
+    // Direct hit on any crew member not belonging to the shooter. The shot
+    // is tested as the segment it swept this frame against a body-shaped
+    // capsule, so a fast projectile cannot step over a head, torso or pair
+    // of legs in a single frame and phase through a character it visibly
+    // clipped — the old point-in-circle test did exactly that. The closest
+    // point on the capsule is kept so the ragdoll knows exactly where the
+    // blow landed.
     for (final raft in rafts) {
       if (raft.playerIndex == s.owner || !raft.alive) continue;
       for (int i = 0; i < raft.crew.length; i++) {
         final c = raft.crew[i];
         if (!c.alive) continue;
-        if ((s.pos - raft.crewPos(i)).distance < BattleConst.hitRadius) {
-          return _resolve(s, raft, i);
+        final sweep = _sweepCrew(prev, s.pos, raft, i);
+        if (sweep.hit) {
+          return _resolve(s, raft, i, hitPoint: sweep.point);
         }
       }
     }
@@ -691,8 +1187,64 @@ class BattleWorld {
     return null;
   }
 
-  ShotOutcome? _resolve(Shot s, Raft? hitRaft, int crewIndex) {
-    final impact = Offset(s.pos.dx, min(s.pos.dy, BattleConst.waterY + 12));
+  /// Whether the shot's sweep from [from] to [to] comes close enough to crew
+  /// member [i] of [raft] to count as a direct hit — and if so, the exact
+  /// point on the body it struck.
+  ///
+  /// A crew member is a vertical capsule — the line from their feet to the
+  /// top of their head, inflated by [BattleConst.hitRadius] — not the old
+  /// circle floating at torso height, which never covered the head or the
+  /// legs at all. The capsule endpoints follow the live ragdoll pose, so a
+  /// body mid-tumble is hit where it actually lies.
+  ({bool hit, Offset point}) _sweepCrew(Offset from, Offset to, Raft raft, int i) {
+    final (a, b) = raft.crewCapsule(i);
+    final (dist, point) = _segSegClosest(from, to, a, b);
+    return (hit: dist < BattleConst.hitRadius, point: point);
+  }
+
+  /// Distance between the segments [p1]–[q1] and [p2]–[q2], plus the closest
+  /// point on the second segment.
+  (double, Offset) _segSegClosest(Offset p1, Offset q1, Offset p2, Offset q2) {
+    final d1 = q1 - p1;
+    final d2 = q2 - p2;
+    final r = p1 - p2;
+    final a = d1.dx * d1.dx + d1.dy * d1.dy;
+    final e = d2.dx * d2.dx + d2.dy * d2.dy;
+    final f = d2.dx * r.dx + d2.dy * r.dy;
+
+    double s;
+    double t;
+    if (a <= 1e-9 && e <= 1e-9) {
+      return (r.distance, p2);
+    }
+    if (a <= 1e-9) {
+      s = 0;
+      t = (f / e).clamp(0.0, 1.0);
+    } else {
+      final c2 = d1.dx * r.dx + d1.dy * r.dy;
+      if (e <= 1e-9) {
+        t = 0;
+        s = (-c2 / a).clamp(0.0, 1.0);
+      } else {
+        final b = d1.dx * d2.dx + d1.dy * d2.dy;
+        final denom = a * e - b * b;
+        s = denom > 1e-9 ? ((b * f - c2 * e) / denom).clamp(0.0, 1.0) : 0.0;
+        t = (b * s + f) / e;
+        if (t < 0) {
+          t = 0;
+          s = (-c2 / a).clamp(0.0, 1.0);
+        } else if (t > 1) {
+          t = 1;
+          s = ((b - c2) / a).clamp(0.0, 1.0);
+        }
+      }
+    }
+    final closest = p2 + d2 * t;
+    return ((p1 + d1 * s - closest).distance, closest);
+  }
+
+  ShotOutcome? _resolve(Shot s, Raft? hitRaft, int crewIndex, {Offset? hitPoint}) {
+    final impact = hitPoint ?? Offset(s.pos.dx, min(s.pos.dy, BattleConst.waterY + 12));
     double dealt = 0;
     bool hitPlayerSide = false;
 
@@ -702,9 +1254,23 @@ class BattleWorld {
       c.hp = max(0, c.hp - s.weapon.damage);
       dealt += before - c.hp;
       hitPlayerSide = hitRaft.playerIndex == 0;
+      // The dynamic HP bar comes up the moment damage lands, animating the
+      // loss from where the HP was.
+      c.showHpBar(before / c.maxHp);
       // The shove is what sells the hit — they kick back the way the shot
-      // was travelling and tumble, rather than standing there soaking it up.
-      if (c.alive) c.knock(s.vel, Crew.impactForce(s.weapon));
+      // was travelling and tumble, reacting to the exact spot the blow
+      // landed. A crew member the shot kills goes limp instead: they never
+      // stand back up, and the body drifts off the deck into the water.
+      final hitLocal = impact - Offset(
+        hitRaft.x + hitRaft.loadout.crewOffset(crewIndex),
+        hitRaft.deckY,
+      );
+      if (c.alive) {
+        c.knock(s.vel, Crew.impactForce(s.weapon), hitLocal: hitLocal);
+      } else {
+        c.startDeath(s.vel, Crew.impactForce(s.weapon),
+            railDir: hitRaft.railDir(crewIndex), hitLocal: hitLocal);
+      }
     }
 
     // Splash damage: everyone (on any raft but the shooter's) inside radius,
@@ -724,9 +1290,19 @@ class BattleWorld {
           final before = c.hp;
           c.hp = max(0, c.hp - s.weapon.damage * 0.6 * falloff);
           dealt += before - c.hp;
+          c.showHpBar(before / c.maxHp);
+          final away = raft.crewPos(i) - impact;
+          final station = Offset(raft.x + raft.loadout.crewOffset(i), raft.deckY);
           if (c.alive) {
-            final away = raft.crewPos(i) - impact;
-            c.knock(away, Crew.impactForce(s.weapon) * 0.55 * falloff);
+            c.knock(away, Crew.impactForce(s.weapon) * 0.55 * falloff,
+                hitLocal: raft.crewPos(i) - station);
+          } else {
+            c.startDeath(
+              away,
+              max(2.5, Crew.impactForce(s.weapon) * 0.55 * falloff),
+              railDir: raft.railDir(i),
+              hitLocal: raft.crewPos(i) - station,
+            );
           }
           if (raft.playerIndex == 0) hitPlayerSide = true;
         }
@@ -783,73 +1359,223 @@ class BattleWorld {
 
   /// One 60Hz tick of every crew body on the water.
   void _stepBodies() {
+    const dt = 1 / 60;
     for (final raft in rafts) {
       for (int i = 0; i < raft.crew.length; i++) {
         final c = raft.crew[i];
 
-        if (!c.alive && c.sinkT < 1) {
-          c.sinkT = (c.sinkT + 1 / 60 * 1.4).clamp(0.0, 1.0);
-          // A body killed where it stands goes limp and sinks; one that was
-          // already in the water is handled by the drowned path instead.
-          if (!c.drowned) c.ragdoll = false;
+        // A body in the water slips under as the second half of the death
+        // sequence: a surface bob first, then a slow sink and fade (the
+        // renderer draws the bubbles and the wisp that lift away). A dead
+        // one on the deck is a ragdoll instead — it tumbles off the raft
+        // and into the sea (see [_stepBody]) and only starts sinking once
+        // it is actually in the water.
+        if (c.drowned) {
+          c.sinkT = (c.sinkT + dt / BattleConst.sinkTime).clamp(0.0, 1.0);
+        } else if (!c.alive && !c.ragdoll) {
+          // Safety net: a crew member killed without an impact shove still
+          // keels over and goes in like any other death.
+          c.startDeath(const Offset(1, 0), 3.0, railDir: raft.railDir(i));
+        }
+
+        // Dynamic health bar lifecycle: hold up, ghost drains toward the
+        // live HP, fade out — and reset the ghost so the next appearance
+        // always starts from the most current value.
+        if (c.hpBarT > 0) {
+          c.hpBarT = max(0, c.hpBarT - dt);
+          final shownFor = BattleConst.hpBarTime - c.hpBarT;
+          if (shownFor > BattleConst.hpBarGhostDelay) {
+            c.hpDisplay = max(c.hpFrac, c.hpDisplay - BattleConst.hpGhostDrain * dt);
+          }
+          if (c.hpBarT == 0) c.hpDisplay = c.hpFrac;
+        }
+
+        if (c.deathFlash > 0) {
+          c.deathFlash = max(0, c.deathFlash - dt);
         }
 
         if (c.ragdoll) {
           _stepBody(raft, i, c);
         } else if (c.alive && c.offset != Offset.zero) {
-          // Recovered: shuffle back to the station they were knocked off.
-          c.offset = c.offset * (1 - BattleConst.bodyRecover);
-          c.tilt *= (1 - BattleConst.bodyUnwind);
-          if (c.tilt.abs() < 0.01) c.tilt = 0;
+          // Recovered: walk back to the station they were knocked off. The
+          // renderer turns walkPhase/walkAmp into a proper leg swing, and
+          // the feet follow the deck surface — down a platform ramp, across
+          // the main deck — rather than gliding through it.
+          c.walkAmp = min(1.0, c.walkAmp + dt * 5);
+          c.walkPhase += BattleConst.walkCycleSpeed;
+          final dx = c.offset.dx * (1 - BattleConst.bodyRecover);
+          final surface = raft.surfaceY(raft.loadout.crewOffset(i) + dx) ?? 0.0;
+          c.offset = Offset(dx, surface);
           if (c.offset.distance < 0.4) c.offset = Offset.zero;
+        } else if (c.alive) {
+          // Arrived (or never left): ease the walk out.
+          if (c.walkAmp > 0) {
+            c.walkAmp = max(0.0, c.walkAmp - dt * 5);
+            c.walkPhase += BattleConst.walkCycleSpeed * c.walkAmp;
+            if (c.walkAmp == 0) c.walkPhase = 0;
+          }
         }
       }
     }
   }
 
   void _stepBody(Raft raft, int index, Crew c) {
-    var p = c.offset;
-    var v = c.vel;
+    final pose = c.pose;
+    if (pose == null) {
+      c.ragdoll = false;
+      c.ragdollTime = 0;
+      return;
+    }
+    final stationX = raft.loadout.crewOffset(index);
 
-    v = Offset(v.dx * BattleConst.bodyDrag, v.dy + BattleConst.bodyGravity);
-    p += v;
-
-    // Feet are at the body's origin, so the deck stops them at offset 0 —
-    // but only while they are still over the planks. Their station is not
-    // necessarily the middle of the raft, hence the absolute check.
-    final overDeck = (raft.loadout.crewOffset(index) + p.dx).abs() < raft.deckHalf;
-    final onDeck = p.dy >= 0 && overDeck;
-
-    if (onDeck) {
-      p = Offset(p.dx, 0);
-      if (v.dy > 0) {
-        // Land: bounce a little, and bleed the tumble off on impact.
-        v = Offset(v.dx, -v.dy * BattleConst.bodyBounce);
-        c.spin *= 0.55;
-        if (v.dy.abs() < 0.6) v = Offset(v.dx, 0);
+    // Watchdog: a ragdoll that has been running far longer than any real
+    // tumble — or whose hips have left the world's sane band entirely — is
+    // force-resolved instead of being left hanging in the air: over the
+    // deck they stand up where they are, over open water the sea takes
+    // them. Nothing can stay airborne, ever.
+    final hip = pose.hip.pos;
+    final stalled = !c.ragdollTime.isFinite ||
+        c.ragdollTime > BattleConst.ragdollWatchdog ||
+        !hip.isFinite ||
+        hip.dy.abs() > 400 ||
+        hip.dx.abs() > 800;
+    if (stalled) {
+      if (raft.surfaceY(stationX + hip.dx) != null) {
+        c.getUpT = 0;
+        c.rest = 0;
+        c.restHip = hip;
+        c.ragdollTime = 0;
+      } else {
+        c.drowned = true;
+        c.ragdoll = false;
+        c.ragdollTime = 0;
+        c.hp = 0;
+        c.vel = Offset.zero;
+        effects.add(Fx(
+          pos: Offset(
+            (raft.x + stationX + hip.dx).clamp(-60.0, BattleConst.worldW + 60.0),
+            BattleConst.waterY,
+          ),
+          kind: 'splash',
+          color: const Color(0xFFBFE9F2),
+          size: 88,
+          life: 0.7,
+        ));
       }
-      v = Offset(v.dx * BattleConst.bodyFriction, v.dy);
-      c.spin *= BattleConst.bodyFriction;
+      return;
     }
 
-    // Overboard there is no deck to stop them at all — they just keep
-    // falling until the waterline takes them.
+    // Standing back up: physics is suspended while the settled body blends
+    // from wherever it ended up onto its feet at the same spot — on
+    // whatever surface it settled on, platform or deck. When the blend
+    // finishes the pose hands over to the normal standing renderer, which
+    // walks them back down to their station along the deck surface.
+    if (c.getUpT >= 0) {
+      c.getUpT = min(1.0, c.getUpT + (1 / 60) / BattleConst.bodyGetUpTime);
+      final feet = raft.surfaceY(stationX + pose.hip.pos.dx) ?? 0.0;
+      pose.blendTo(RagdollPose.standingAt(Offset(pose.hip.pos.dx, feet)), c.getUpT);
+      if (c.getUpT >= 1) {
+        c.offset = Offset(pose.hip.pos.dx, feet);
+        c.vel = Offset.zero;
+        c.pose = null;
+        c.getUpT = -1;
+        c.ragdoll = false;
+        c.ragdollTime = 0;
+      }
+      return;
+    }
 
-    c.offset = p;
-    c.vel = v;
-    c.tilt += c.spin;
-    c.spin *= BattleConst.bodyDrag;
+    c.ragdollTime += 1 / 60;
 
-    // Drowning: feet this far under the waterline ends them for the round.
-    final feetY = raft.deckY + p.dy;
-    if (!c.drowned && feetY > BattleConst.waterY + BattleConst.drownDepth) {
+    final dead = !c.alive && !c.drowned;
+
+    pose.integrate(gravity: BattleConst.bodyGravity, drag: BattleConst.bodyDrag);
+
+    // Deck collision against the raft's height-field. Contact is per point
+    // — a limb may hang past the rail without the body going over — and the
+    // surface is continuous (platforms, ramps and deck are one profile), so
+    // there is no crack a body can fall through mid-raft. A grounded body is
+    // damped as a whole, because a body is one thing, not a bag of loose
+    // points: the constraint drag of dangling limbs would otherwise creep an
+    // ordinary hit all the way to the rail.
+    final fric = dead ? BattleConst.bodyDeadFriction : BattleConst.bodyFriction;
+    final hipSurface = raft.surfaceY(stationX + pose.hip.pos.dx);
+    final grounded = hipSurface != null && pose.hip.pos.dy > hipSurface - 3;
+    for (final p in pose.points) {
+      final floor = raft.surfaceY(stationX + p.pos.dx);
+      if (floor != null && p.pos.dy > floor) {
+        final v = p.vel;
+        p.pos = Offset(p.pos.dx, floor);
+        // Hard impacts bounce; slow contact settles dead so a resting body
+        // can actually come to rest.
+        final bounce = v.dy > BattleConst.bodyRestSpeed ? BattleConst.bodyBounce : 0.0;
+        p.prev = Offset(p.pos.dx - v.dx * fric, floor + v.dy * bounce);
+      } else if (grounded) {
+        p.setVel(p.vel * fric);
+      } else if (!dead && floor == null) {
+        // Rail lip: a living body still at deck level and still over the
+        // edge line is bounced back aboard. Corpses skip the lip entirely —
+        // the death drift carries them over, and the water takes them.
+        final over = (stationX + p.pos.dx).abs() - raft.deckHalf;
+        if (over > 0 &&
+            over < BattleConst.railWall &&
+            p.pos.dy > -BattleConst.railWallHeight &&
+            p.pos.dy < 4) {
+          final inward = (stationX + p.pos.dx) > 0 ? -1.0 : 1.0;
+          final v = p.vel;
+          if (v.dx * inward < 0) {
+            p.setVel(Offset(-v.dx * 0.5, v.dy));
+            p.pos = Offset(
+              (raft.deckHalf * (stationX + p.pos.dx > 0 ? 1 : -1)) - stationX,
+              p.pos.dy,
+            );
+          }
+        }
+      }
+    }
+    pose.solve();
+
+    // Energy cap: constraint relaxation and stacked impulses can otherwise
+    // fling points absurdly far — the "ragdoll into the sky" bug. Upward
+    // velocity is capped far tighter than overall speed: sideways reads as
+    // a knock-back, a high launch reads as a bug.
+    for (final p in pose.points) {
+      var v = p.vel;
+      if (v.dy < -BattleConst.bodyMaxRise) {
+        v = Offset(v.dx, -BattleConst.bodyMaxRise);
+      }
+      final speed = v.distance;
+      if (speed > BattleConst.bodyMaxSpeed) {
+        v = v / speed * BattleConst.bodyMaxSpeed;
+      }
+      p.setVel(v);
+    }
+
+    // Every death has to end in the water: a body that has all but stopped
+    // on the deck keeps drifting toward the rail it fell toward.
+    if (dead) {
+      if (c.deathDir == 0) c.deathDir = raft.railDir(index);
+      final hip = pose.hip;
+      final hipFloor = raft.surfaceY(stationX + hip.pos.dx);
+      final onDeck = hipFloor != null && hip.pos.dy <= hipFloor + 2;
+      if (onDeck && hip.vel.dx.abs() < BattleConst.bodyDeadDrift) {
+        hip.setVel(Offset(c.deathDir * BattleConst.bodyDeadDrift, hip.vel.dy));
+      }
+    }
+
+    // Follow the body: the crew member's reported position tracks the ragdoll
+    // hips so the camera, splash falloff and hit capsules stay honest.
+    c.offset = Offset(pose.hip.pos.dx, pose.hip.pos.dy + 15);
+    c.vel = pose.hip.vel;
+
+    // Drowning: hips this far under the waterline ends them for the round.
+    if (!c.drowned && raft.deckY + pose.hip.pos.dy > BattleConst.waterY + BattleConst.drownDepth) {
       c.drowned = true;
       c.ragdoll = false;
       c.hp = 0;
       c.vel = Offset.zero;
-      c.spin = 0;
       effects.add(Fx(
-        pos: Offset(raft.feetPos(index).dx, BattleConst.waterY),
+        pos: Offset(raft.x + stationX + pose.hip.pos.dx, BattleConst.waterY),
         kind: 'splash',
         color: const Color(0xFFBFE9F2),
         size: 88,
@@ -858,14 +1584,26 @@ class BattleWorld {
       return;
     }
 
-    // Settling: down on the deck, barely moving — stop tumbling and stand.
-    if (onDeck && v.distance < BattleConst.bodySleepSpeed && c.spin.abs() < BattleConst.bodySleepSpin) {
-      c.rest += 1 / 60;
-      c.vel = Offset.zero;
-      c.spin = 0;
+    // Settling: down on the deck (or a platform), barely moving — stop
+    // tumbling and stand. Only the living get up; a body at 0 HP stays down
+    // until the water takes it. Speed and spin sit above the resting
+    // jitter; the drift check catches a body still sliding (down a ramp,
+    // say), which keeps resetting the window instead of rising mid-slide.
+    final hipFloor = raft.surfaceY(stationX + pose.hip.pos.dx);
+    final settled = hipFloor != null && pose.hip.pos.dy <= hipFloor + 2;
+    if (c.alive &&
+        settled &&
+        pose.maxSpeed < BattleConst.bodySleepSpeed &&
+        pose.maxSpin < BattleConst.bodySleepSpin) {
+      if (c.rest <= 0 || (pose.hip.pos - c.restHip).distance > BattleConst.bodySettleDrift) {
+        c.restHip = pose.hip.pos;
+        c.rest = 1 / 60;
+      } else {
+        c.rest += 1 / 60;
+      }
       if (c.rest >= BattleConst.bodySettleTime) {
-        c.ragdoll = false;
         c.rest = 0;
+        c.getUpT = 0;
       }
     } else {
       c.rest = 0;

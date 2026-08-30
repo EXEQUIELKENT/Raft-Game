@@ -313,6 +313,46 @@ void main() {
       expect((world.cam - (me.x - world.viewWidth / 2)).abs(), lessThan(1.0),
           reason: 'the camera should have eased to a position that centres the shooter');
     });
+
+    test('cutCam cuts straight to the tracked point in frame', () {
+      final ctrl = newMatch();
+      final world = ctrl.world;
+
+      world.cutCam(1200);
+      expect((world.cam + world.viewWidth / 2 - 1200).abs(), lessThan(1.0),
+          reason: 'the cut centres the projectile the way an ease would trail');
+      ctrl.dispose();
+    });
+
+    test('Firing holds on the shooter for a beat, then cuts to the projectile', () async {
+      final ctrl = newMatch();
+      final world = ctrl.world;
+
+      ctrl.aimAngle = 45;
+      ctrl.aimPower = 70;
+      final camAtFire = world.cam;
+      ctrl.humanFire();
+      expect(ctrl.phase, GamePhase.firing);
+
+      // The opening beat: the view stays on the shooter while the shot
+      // leaves the barrel. 100ms cannot possibly reach the end of the hold
+      // (the ticker's dt is clamped at 50ms and the hold is 450ms), so this
+      // asserts the hold rather than racing it.
+      await Future<void>.delayed(const Duration(milliseconds: 100));
+      expect(ctrl.phase, GamePhase.firing, reason: 'the shot is still in flight');
+      expect((world.cam - camAtFire).abs(), lessThan(40),
+          reason: 'the camera has not cut away yet — the shooter gets their beat');
+
+      // Past the hold window the view has cut to the projectile and is
+      // travelling with it toward the target. The cut alone clears this:
+      // by then the ball is a few hundred units out, so centring on it
+      // moves the camera well past the shooter.
+      await Future<void>.delayed(const Duration(milliseconds: 900));
+      expect(world.cam, greaterThan(camAtFire + 100),
+          reason: 'the camera has cut to the projectile and followed it out');
+
+      ctrl.dispose();
+    });
   });
 
   group('Raft spacing', () {
@@ -364,6 +404,100 @@ void main() {
   });
 
   group('Hit and death physics', () {
+    BattleWorld oneCrewWorld() {
+      final world = BattleWorld(map: GameMaps.all.first, seed: 11);
+      world.addRaft(Raft(
+        playerIndex: 0, x: BattleConst.playerX, loadout: loadout(),
+        look: CrewLook.player, label: 'P1', facing: 1,
+        crew: [Crew(hp: 100, maxHp: 100)],
+      ));
+      world.addRaft(Raft(
+        playerIndex: 1, x: BattleConst.enemySlots.first, loadout: loadout(hull: 'log'),
+        look: CrewLook.raider, label: 'AI', facing: -1,
+        crew: [Crew(hp: 100, maxHp: 100)],
+      ));
+      return world;
+    }
+
+    /// Fires flat from just outside the body at [heightAboveFeet] and steps
+    /// until it resolves. At full power the ball covers ~32 units a frame,
+    /// so its sampled positions straddle the crew member entirely — only a
+    /// swept test can catch it.
+    ShotOutcome? flatShot(BattleWorld world, double heightAboveFeet) {
+      final feet = world.raftOf(1)!.feetPos(0);
+      world.fire(
+        from: Offset(feet.dx - 40, feet.dy - heightAboveFeet),
+        angleDeg: 6, power: 100, facing: 1,
+        weapon: Weapons.byId('tennis'), owner: 0,
+      );
+      ShotOutcome? outcome;
+      for (int i = 0; i < 50 && outcome == null; i++) {
+        outcome = world.stepShot();
+      }
+      return outcome;
+    }
+
+    test('A fast shot through the head registers a hit, not a phase-through', () {
+      final world = oneCrewWorld();
+      final foe = world.raftOf(1)!;
+
+      // Head height sits above the old torso-centred circle entirely, and a
+      // full-power flat shot crosses the whole body between two frames — the
+      // point test used to sail clean through a character it visibly hit.
+      final outcome = flatShot(world, 60);
+
+      expect(outcome, isNotNull, reason: 'the shot resolves');
+      expect(outcome!.hitSomething, true, reason: 'a shot through the head is a direct hit');
+      expect(foe.crew.first.hp, lessThan(100));
+    });
+
+    test('A fast shot through the legs registers a hit too', () {
+      final world = oneCrewWorld();
+
+      final outcome = flatShot(world, 4);
+
+      expect(outcome, isNotNull, reason: 'the shot resolves');
+      expect(outcome!.hitSomething, true, reason: 'a shot through the legs is a direct hit');
+    });
+
+    test('A killed crew member tumbles off the deck and into the water', () {
+      final ctrl = newMatch();
+      final world = ctrl.world;
+      final foe = world.raftOf(1)!;
+      final c = foe.crew.first;
+      c.hp = 40; // one bomb is enough to finish them outright
+
+      world.fire(
+        from: foe.crewPos(0) - const Offset(30, 0),
+        angleDeg: 10, power: 40, facing: 1,
+        weapon: Weapons.byId('bomb'), owner: 0,
+      );
+      ShotOutcome? outcome;
+      for (int i = 0; i < 200 && outcome == null; i++) {
+        outcome = world.stepShot();
+      }
+      expect(outcome, isNotNull);
+      expect(c.alive, false, reason: 'the bomb killed them');
+
+      // The death is a fall, not a fade: the body leaves the deck, the
+      // water marks where it lands, and only then does it sink away.
+      var leftDeck = false;
+      var sawSplash = false;
+      for (int i = 0; i < 900 && !(c.drowned && c.sinkT >= 1); i++) {
+        world.update(1 / 60);
+        if ((foe.loadout.crewOffset(0) + c.offset.dx).abs() >= foe.deckHalf) {
+          leftDeck = true;
+        }
+        if (world.effects.any((f) => f.kind == 'splash')) sawSplash = true;
+      }
+
+      expect(leftDeck, true, reason: 'the corpse goes over the rail rather than sinking in place');
+      expect(c.drowned, true, reason: 'the fall ends in the water');
+      expect(sawSplash, true, reason: 'the water marks the landing');
+      expect(c.gone, true, reason: 'and the body finishes sinking once it is in the sea');
+      ctrl.dispose();
+    });
+
     test('A hit ragdolls the crew member: they kick back, tumble, then recover', () {
       final ctrl = newMatch();
       final world = ctrl.world;
@@ -402,7 +536,10 @@ void main() {
       for (final c in foe.crew) {
         expect(c.drowned, false, reason: 'the starter ball must not sweep the deck');
         expect(c.alive, true);
-        expect(c.offset.dy, lessThan(BattleConst.drownDepth),
+        // The body — tracked through its ragdoll hips while down, its
+        // feet-origin once back on them — never hangs below the waterline.
+        final hipY = c.pose?.hip.pos.dy ?? (c.offset.dy - 15);
+        expect(foe.deckY + hipY, lessThan(BattleConst.waterY + BattleConst.drownDepth),
             reason: 'nobody is left hanging under the waterline');
       }
     });
@@ -425,7 +562,7 @@ void main() {
       // Lift them clear off the planks and out past the rail, the way a
       // heavy hit on someone standing near the edge would.
       c.ragdoll = true;
-      c.offset = const Offset(4000, 0);
+      c.pose = RagdollPose.standingAt(const Offset(4000, 0));
 
       // Tick until the water takes them. The splash is a short-lived effect,
       // so it has to be looked for at the moment it happens.
@@ -451,14 +588,14 @@ void main() {
       // Drown everyone bar one — the raft is still in the fight.
       for (int i = 0; i < foe.crew.length - 1; i++) {
         foe.crew[i].ragdoll = true;
-        foe.crew[i].offset = const Offset(4000, 0);
+        foe.crew[i].pose = RagdollPose.standingAt(const Offset(4000, 0));
       }
       tick(ctrl, 400);
       expect(foe.alive, true, reason: 'one crew member left means the raft still fights');
 
       // And the last one going over finishes it.
       foe.crew.last.ragdoll = true;
-      foe.crew.last.offset = const Offset(4000, 0);
+      foe.crew.last.pose = RagdollPose.standingAt(const Offset(4000, 0));
       tick(ctrl, 400);
       expect(foe.alive, false);
     });
@@ -486,6 +623,117 @@ void main() {
       final b = raftFor(slow).crew.first.offset;
       expect((a - b).distance, lessThan(1.0),
           reason: 'the fixed-step accumulator keeps the two devices in agreement');
+    });
+
+    test('An off-centre impact spins the body; a centre hit mostly shoves it', () {
+      final ctrl = newMatch();
+      final foe = ctrl.world.raftOf(1)!;
+      final force = Crew.impactForce(Weapons.byId('grenade'));
+
+      // A blow to the head turns the body over — that is what a ragdoll is.
+      final headHit = foe.crew.first;
+      headHit.knock(const Offset(1, 0), force, hitLocal: const Offset(0, -55));
+
+      // The same blow dead-centre at the hips is a clean shove.
+      final centreHit = foe.crew.last;
+      centreHit.knock(const Offset(1, 0), force, hitLocal: const Offset(0, -15));
+
+      expect(headHit.pose!.maxSpin, greaterThan(centreHit.pose!.maxSpin * 1.5),
+          reason: 'hitting high must tumble the body, not just push it');
+      expect(headHit.vel.dx, greaterThan(0), reason: 'and it is still shoved along the shot');
+      ctrl.dispose();
+    });
+
+    test('A crew member walks back to their station after being knocked down', () {
+      final ctrl = newMatch();
+      final foe = ctrl.world.raftOf(1)!;
+      final c = foe.crew.first;
+
+      c.knock(const Offset(1, 0), Crew.impactForce(Weapons.byId('grenade')));
+
+      // Somewhere between settling and arriving home they must be seen
+      // walking; and when they arrive, the walk is over and the station is
+      // exactly where they left it.
+      var sawWalk = false;
+      for (int i = 0; i < 900; i++) {
+        ctrl.world.update(1 / 60);
+        if (c.walkAmp > 0.5 && c.offset != Offset.zero) sawWalk = true;
+      }
+
+      expect(sawWalk, true, reason: 'the walk back to station is animated');
+      expect(c.offset, Offset.zero, reason: 'they end up where they started');
+      expect(c.walkAmp, 0, reason: 'and the walk eases out on arrival');
+      ctrl.dispose();
+    });
+
+    test('Dynamic health bars: hidden by default, animated on damage, gone after', () {
+      final ctrl = newMatch();
+      final foe = ctrl.world.raftOf(1)!;
+      final c = foe.crew.first;
+
+      expect(c.hpBarT, 0, reason: 'bars are hidden while nobody is hurt');
+      expect(c.hpDisplay, 1.0);
+
+      c.hp = 55;
+      c.showHpBar(1.0); // the world passes the HP fraction from before the hit
+      expect(c.hpBarT, BattleConst.hpBarTime, reason: 'damage summons the bar');
+      expect(c.hpDisplay, closeTo(1.0, 0.001),
+          reason: 'the ghost bar starts where the HP was');
+
+      // The ghost drains toward the live value after its delay, never below.
+      tick(ctrl, 30); // half a second: past the ghost delay, mid-drain
+      expect(c.hpDisplay, inExclusiveRange(c.hpFrac, 1.0),
+          reason: 'the ghost drains toward the live HP, not past it');
+      expect(c.hpDisplay, lessThan(1.0), reason: 'and it has visibly drained');
+
+      // The bar hides itself once its time is out, and re-arms on the live
+      // HP so the next appearance is always current.
+      tick(ctrl, (BattleConst.hpBarTime * 60).ceil() + 10);
+      expect(c.hpBarT, 0, reason: 'the bar fades out once the animation completes');
+      expect(c.hpDisplay, c.hpFrac,
+          reason: 'a reappearing bar reflects the most current HP');
+
+      // A second hit while the bar is up extends it and keeps the ghost
+      // above the new live value.
+      c.showHpBar(c.hpFrac + 0.2);
+      expect(c.hpDisplay, greaterThan(c.hpFrac));
+      ctrl.dispose();
+    });
+
+    test('A killing blow flashes and the body only leaves after the full sink', () {
+      final ctrl = newMatch();
+      final world = ctrl.world;
+      final foe = world.raftOf(1)!;
+      final c = foe.crew.first;
+      c.hp = 30;
+
+      world.fire(
+        from: foe.crewPos(0) - const Offset(30, 0),
+        angleDeg: 10, power: 40, facing: 1,
+        weapon: Weapons.byId('bomb'), owner: 0,
+      );
+      ShotOutcome? outcome;
+      for (int i = 0; i < 200 && outcome == null; i++) {
+        outcome = world.stepShot();
+      }
+      expect(outcome, isNotNull);
+      expect(c.alive, false);
+
+      expect(c.deathFlash, greaterThan(0),
+          reason: 'the death sequence opens with a white impact flash');
+      expect(c.sinkT, 0, reason: 'the sink only starts once they are in the water');
+
+      // The sink takes the full sequence time, not an instant.
+      var ticksToSink = 0;
+      while (c.sinkT < 1 && ticksToSink < 1200) {
+        world.update(1 / 60);
+        ticksToSink++;
+      }
+      final expectedTicks = BattleConst.sinkTime * 60;
+      expect(ticksToSink, greaterThan(expectedTicks * 0.5),
+          reason: 'the body lingers at the surface before slipping under');
+      expect(c.gone, true, reason: 'and the sequence ends with the body gone');
+      ctrl.dispose();
     });
   });
 

@@ -553,54 +553,51 @@ class _GameScreenState extends State<GameScreen> {
     );
   }
 
-  /// The design's radial pull readout, drawn at the finger while dragging.
+  /// The Force/Angle readout, drawn at the finger while dragging — a white
+  /// rounded card with the two stats side by side and a thin divider
+  /// between them, matching the aiming pop-up from the reference design.
   Widget _pullReadout() {
     final p = _dragCurrent!;
     return Positioned(
-      left: p.dx - 75,
-      top: p.dy - 75,
+      left: p.dx - 96,
+      top: p.dy - 118,
       child: IgnorePointer(
         child: Container(
-          width: 150,
-          height: 150,
+          padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 14),
           decoration: BoxDecoration(
-            shape: BoxShape.circle,
-            color: const Color(0xFF0D3C46).withOpacity(0.16),
-            border: Border.all(color: Colors.white.withOpacity(0.45), width: 2),
+            color: Colors.white,
+            borderRadius: BorderRadius.circular(22),
+            boxShadow: const [
+              BoxShadow(color: Color(0x33000000), offset: Offset(0, 6), blurRadius: 14),
+            ],
           ),
-          child: Column(
-            mainAxisAlignment: MainAxisAlignment.center,
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
             children: [
-              Text('${ctrl.aimPower.round()}%',
-                  style: RT.chunky(size: 26, color: Colors.white)),
-              Text('${ctrl.aimAngle.round()}°',
-                  style: RT.body(size: 11, color: Colors.white, weight: FontWeight.w800, letterSpacing: 1.4)),
-              const SizedBox(height: 4),
+              _forceAngleStat('${ctrl.aimPower.round()}%', ctrl.aimFine ? 'FINE FORCE' : 'FORCE'),
               Container(
-                width: 76,
-                height: 6,
-                decoration: BoxDecoration(
-                  color: Colors.white.withOpacity(0.3),
-                  borderRadius: BorderRadius.circular(4),
-                ),
-                child: FractionallySizedBox(
-                  alignment: Alignment.centerLeft,
-                  widthFactor: (ctrl.aimPower / 100).clamp(0.0, 1.0),
-                  child: Container(
-                    decoration: BoxDecoration(
-                      color: RT.yellow,
-                      borderRadius: BorderRadius.circular(4),
-                    ),
-                  ),
-                ),
+                width: 1.4,
+                height: 34,
+                margin: const EdgeInsets.symmetric(horizontal: 16),
+                color: RT.ink.withOpacity(0.12),
               ),
-              const SizedBox(height: 4),
-              Text(ctrl.aimFine ? 'FINE TUNE' : 'PULL FURTHER',
-                  style: RT.body(size: 9, color: Colors.white.withOpacity(0.75), weight: FontWeight.w800, letterSpacing: 1.2)),
+              _forceAngleStat('${ctrl.aimAngle.round()}°', 'ANGLE'),
             ],
           ),
         ),
       ),
+    );
+  }
+
+  Widget _forceAngleStat(String value, String label) {
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Text(value, style: RT.chunky(size: 24, color: RT.ink)),
+        const SizedBox(height: 2),
+        Text(label,
+            style: RT.body(size: 10, color: RT.ink.withOpacity(0.45), weight: FontWeight.w800, letterSpacing: 1.2)),
+      ],
     );
   }
 
@@ -761,7 +758,13 @@ class _ScenePainter extends CustomPainter {
 
   @override
   void paint(Canvas canvas, Size size) {
-    renderer.render(canvas, size, ctrl.time);
+    renderer.render(
+      canvas, size, ctrl.time,
+      currentPlayer: ctrl.currentPlayer,
+      isAiming: ctrl.phase == GamePhase.aiming,
+      aimAngleDeg: ctrl.aimAngle,
+      weapon: ctrl.selectedWeapon,
+    );
 
     // Trajectory preview for the human shooter, drawn over the scene.
     if (ctrl.phase != GamePhase.aiming || !ctrl.canHumanAct) return;

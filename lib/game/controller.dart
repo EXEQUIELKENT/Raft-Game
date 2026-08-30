@@ -125,6 +125,27 @@ class GameController extends ChangeNotifier {
   double _resolveTimer = 0;
   double _transitionTimer = 0;
 
+  /// How long the aiming phase has been holding because the shooter is not
+  /// on their feet yet (mid-ragdoll from the previous shot's blast). The
+  /// turn clock is paused while they recover — nobody fires from mid-air —
+  /// with a hard cap after which the slot rotates or the turn is passed.
+  double _crewWait = 0;
+  static const double crewWaitLimit = 5.0;
+
+  /// The firing flow's opening beat: the camera holds on the shooter this
+  /// long after the shot leaves the barrel — long enough for the recoil kick
+  /// and muzzle flash to read — then cuts hard to the projectile and follows
+  /// it for the rest of the flight.
+  double _fireHold = 0;
+  static const double fireHoldTime = 0.45;
+
+  /// The flow's closing beat: after a shot resolves the camera holds on the
+  /// impact point for this long before easing back to the next shooter, so
+  /// the boom is seen where it actually happened.
+  double _impactHold = 0;
+  double _impactX = 0;
+  static const double impactHoldTime = 0.4;
+
   void Function(String kind, Map<String, dynamic> data)? onEvent;
 
   GameController({
@@ -322,9 +343,13 @@ class GameController extends ChangeNotifier {
     phase = GamePhase.aiming;
     _shotCommitted = false;
     _aiShotQueued = false;
+    _fireHold = 0;
+    _impactHold = 0;
+    _crewWait = 0;
     _turnSeq++;
 
     final raft = world.raftOf(player);
+    raft?.ensureActiveReady();
     raft?.ensureActiveAlive();
     // The view belongs to whoever is firing — except over a hotspot link,
     // where each device shows only its own deck, so you watch incoming fire
@@ -355,6 +380,31 @@ class GameController extends ChangeNotifier {
     // showed the player exactly where their shot was going. Shots are lobbed
     // blind now — see BattleWorld's camera lock.
     world.holdCam(dt);
+
+    // The shooter must be on their feet before anything else happens: a
+    // body still mid-ragdoll from the last shot's blast cannot fire, so the
+    // whole turn holds — clock, AI and input — until they have stood up.
+    // The physics watchdog guarantees recovery or drowning, and the wait
+    // cap rotates to another crew member or passes the turn as a backstop.
+    final shooter = world.raftOf(currentPlayer)?.activeCrew;
+    if (shooter == null || !shooter.ready) {
+      if (_crewWait == 0) statusMessage = 'Recovering…';
+      _crewWait += dt;
+      if (_crewWait > crewWaitLimit) {
+        final couldAct = world.raftOf(currentPlayer)?.ensureActiveReady() ?? false;
+        if (!couldAct) {
+          _endTurn();
+          return;
+        }
+      }
+      return;
+    }
+    if (_crewWait > 0) {
+      _crewWait = 0;
+      statusMessage = players[currentPlayer].isAi
+          ? '${players[currentPlayer].name} is aiming…'
+          : 'Your turn';
+    }
 
     // Only the device whose turn it actually is owns the clock. In hotspot
     // both devices run the same simulation, but their frames never line up
@@ -409,14 +459,26 @@ class GameController extends ChangeNotifier {
 
   void _updateFiring(double dt) {
     final s = world.shot;
-    // Track the projectile while it is in flight — both for the shooter and
-    // for the opponent on the receiving end. The aiming-phase camera lock is
-    // deliberately abandoned mid-flight: while the ball is in the air,
-    // watching where it goes is the whole show.
+
+    // The firing flow, in beats:
+    //
+    //   1. Hold on the shooter for a split second — the recoil and muzzle
+    //      flash play out on their own raft, and the shot is seen leaving.
+    //   2. Cut hard to the projectile — no ease across the gap — and from
+    //      then on follow it wherever it goes. The aiming-phase camera lock
+    //      is deliberately abandoned mid-flight: while the ball is in the
+    //      air, watching where it travels is the whole show, all the way to
+    //      the hit.
     //
     // vel is in design units per 60Hz step; the camera works in units per
     // second, hence the * 60.
-    if (s != null) world.trackShot(s.pos.dx, s.vel.dx * 60, dt);
+    if (_fireHold > 0) {
+      _fireHold -= dt;
+      world.holdCam(dt);
+      if (_fireHold <= 0 && s != null) world.cutCam(s.pos.dx);
+    } else if (s != null) {
+      world.trackShot(s.pos.dx, s.vel.dx * 60, dt);
+    }
 
     // Physics steps at a fixed 60Hz so flight is frame-rate independent.
     _accum += dt;
@@ -440,6 +502,8 @@ class GameController extends ChangeNotifier {
   void _onShotResolved(ShotOutcome outcome) {
     phase = GamePhase.resolving;
     _resolveTimer = 0.75;
+    _impactHold = impactHoldTime;
+    _impactX = outcome.impact.dx;
 
     if (outcome.hitSomething) {
       AudioService.instance.sfx('hit');
@@ -466,6 +530,16 @@ class GameController extends ChangeNotifier {
 
   void _updateResolving(double dt) {
     _resolveTimer -= dt;
+    if (_impactHold > 0) {
+      // Beat three of the firing flow: sit on the impact point while the
+      // boom plays where it landed, before the view starts back.
+      _impactHold -= dt;
+      world.easeCam(_impactX, dt);
+      if (_resolveTimer > 0) return;
+      if (_checkGameOver()) return;
+      _endTurn();
+      return;
+    }
     // While the splash / damage read-out plays, ease the camera back to
     // whoever is shooting next. In a single-player / local match that is
     // the next living opponent; over a hotspot link both devices watch
@@ -555,6 +629,9 @@ class GameController extends ChangeNotifier {
     if (currentPlayer < 0 || currentPlayer >= players.length) return false;
     if (players[currentPlayer].isAi) return false;
     if (mode == GameMode.hotspot && net != null) return currentPlayer == myPlayerIndex;
+    // The shooter must be on their feet: a body mid-ragdoll (tumbling, or
+    // still airborne) cannot line up a shot — the turn waits for them.
+    if (world.raftOf(currentPlayer)?.activeCrew?.ready != true) return false;
     return true;
   }
 
@@ -647,6 +724,13 @@ class GameController extends ChangeNotifier {
       if (kDebugMode) debugPrint('[fire] rejected: no living shooter for player=$currentPlayer');
       return;
     }
+    // A shooter who is not on their feet cannot fire — this is the last
+    // line of defence behind canHumanAct, and it also covers remote (network)
+    // fire requests, which are never trusted anyway.
+    if (raft.activeCrew?.ready != true) {
+      if (kDebugMode) debugPrint('[fire] rejected: shooter not ready (player=$currentPlayer)');
+      return;
+    }
     final safeWeapon = Weapons.all.contains(weapon) ? weapon : Weapons.starter;
     final safeAngle = angle.clamp(BattleConst.angleMin, BattleConst.angleMax);
     final safePower = power.clamp(BattleConst.powerMin, BattleConst.powerMax);
@@ -665,6 +749,7 @@ class GameController extends ChangeNotifier {
     _shotCommitted = true;
     phase = GamePhase.firing;
     _accum = 0;
+    _fireHold = fireHoldTime;
     aimAngle = safeAngle;
     aimPower = safePower;
     isCharging = false;

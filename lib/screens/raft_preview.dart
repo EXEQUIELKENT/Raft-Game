@@ -139,6 +139,31 @@ class _RaftPreviewPainter extends CustomPainter {
       );
     }
 
+    // Deck platforms — the same layout the battle physics walks on.
+    final profile = DeckProfile.forLoadout(lo, facing: 1);
+    for (final s in profile.segments) {
+      if (s.rise0 <= 0 && s.rise1 <= 0) continue;
+      final topL = deckTop - s.rise0;
+      final topR = deckTop - s.rise1;
+      final slab = Path()
+        ..moveTo(s.x0, topL)
+        ..lineTo(s.x1, topR)
+        ..lineTo(s.x1, deckTop)
+        ..lineTo(s.x0, deckTop)
+        ..close();
+      canvas.drawPath(
+        slab,
+        Paint()..color = Color.lerp(lo.color, Colors.white, 0.16)!,
+      );
+      canvas.drawPath(
+        slab,
+        Paint()
+          ..color = Colors.black.withOpacity(0.18)
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = 1.5,
+      );
+    }
+
     canvas.restore();
 
     // Caption
