@@ -357,9 +357,14 @@ class WorldRenderer {
         final pose = c.pose;
         if (pose != null) {
           // A ragdoll is drawn straight from its verlet points, which are
-          // stored station-local — the body renders exactly where the
-          // physics put it, no further displacement.
-          canvas.translate(raft.loadout.crewOffset(i), 0);
+          // stored station-local: x relative to the crew member's slot, y
+          // relative to the *deck surface* (see [RagdollPose]) — the same
+          // frame the physics in [BattleWorld._stepBody] works in. That
+          // frame still has to be placed on the actual raft, so the deck
+          // height goes into the translate here; omitting it (as before)
+          // left every ragdoll rendering near world-y 0 — up near the sky —
+          // instead of down on the raft where the physics actually put it.
+          canvas.translate(raft.loadout.crewOffset(i), raft.deckY);
         } else {
           // The standing body's own displacement from its station — a crew
           // member walking back after a knock-down is drawn wherever the
@@ -403,7 +408,7 @@ class WorldRenderer {
         } else if (c.hpBarT > 0) {
           // Dynamic health bar: hidden by default, summoned by damage, and
           // gone again once its animation finishes.
-          _crewHealthBar(canvas, c, pose);
+          _crewHealthBar(canvas, raft, c, pose);
         }
         canvas.restore();
       }
@@ -473,15 +478,19 @@ class WorldRenderer {
   /// quick fade-in, a red ghost bar drains from the HP the character *had*
   /// down to the live value, and the whole thing fades out once the drain
   /// completes.
-  void _crewHealthBar(Canvas canvas, Crew c, RagdollPose? pose) {
+  void _crewHealthBar(Canvas canvas, Raft raft, Crew c, RagdollPose? pose) {
     final double cx;
     final double topY;
     if (pose != null) {
+      // Deck-relative, same as the (now deck-shifted) outer translate.
       cx = pose.head.pos.dx;
       topY = pose.head.pos.dy - 14;
     } else {
+      // This frame is *not* deck-shifted (the standing branch adds the deck
+      // height internally, inside _crewMember's own save/restore), so it
+      // has to be added back here explicitly.
       cx = 0;
-      topY = -BattleConst.bodyHeight;
+      topY = raft.deckY - BattleConst.bodyHeight;
     }
 
     final shownFor = BattleConst.hpBarTime - c.hpBarT;
@@ -863,29 +872,8 @@ class WorldRenderer {
       }
       final barrelLen = 12.0 + (weapon.weight - 1) * 6;
 
-      canvas.save();
-      canvas.translate(gunHand.dx, gunHand.dy);
-      canvas.rotate(atan2(u.dy, u.dx));
-      if (levelled) {
-        // The weapon kicks back along the barrel and its muzzle climbs.
-        canvas.rotate(-gunSide * recoil * 0.30);
-        canvas.translate(-recoil * 4.5, 0);
-      }
-      canvas.drawRRect(
-        RRect.fromRectAndRadius(const Rect.fromLTWH(-4, -3.5, 9, 4), const Radius.circular(2)),
-        Paint()..color = metal,
-      );
-      canvas.drawRRect(
-        RRect.fromRectAndRadius(Rect.fromLTWH(5, -2.6, barrelLen, 3.2), const Radius.circular(1.6)),
-        Paint()..color = metal,
-      );
-      canvas.drawRect(Rect.fromLTWH(5 + barrelLen, -2.6, 2.4, 3.2), Paint()..color = accent);
-      // Grip: a short stub below the receiver where the hand wraps.
-      canvas.drawRRect(
-        RRect.fromRectAndRadius(const Rect.fromLTWH(-1.5, 0.5, 5, 6), const Radius.circular(2)),
-        Paint()..color = const Color(0xFF23262B),
-      );
-      canvas.restore();
+      _sidearm(canvas, gunHand, u, weapon, metal,
+          kickRotate: -gunSide * recoil * 0.30, kickBack: recoil * 4.5);
       canvas.drawCircle(gunHand, 5.5, Paint()..color = skin);
 
       // Muzzle flash: only the first sliver of the recoil window, at the
@@ -962,6 +950,47 @@ class WorldRenderer {
     canvas.restore();
   }
 
+  /// The sidearm itself: a metal receiver, a barrel whose length reflects
+  /// the weapon's weight, an accent-coloured muzzle cap, and a grip stub —
+  /// drawn with the barrel pointing along [aimDir] from [hand]. Shared by
+  /// the standing pose and the ragdoll so a knocked-out character is
+  /// drawn holding the exact same gun, not a simplified stand-in.
+  /// [kickRotate]/[kickBack] are the standing pose's recoil kick; the
+  /// ragdoll never passes them.
+  void _sidearm(
+    Canvas canvas,
+    Offset hand,
+    Offset aimDir,
+    WeaponDef weapon,
+    Color metal, {
+    double kickRotate = 0,
+    double kickBack = 0,
+  }) {
+    final barrelLen = 12.0 + (weapon.weight - 1) * 6;
+    canvas.save();
+    canvas.translate(hand.dx, hand.dy);
+    canvas.rotate(atan2(aimDir.dy, aimDir.dx));
+    if (kickRotate != 0 || kickBack != 0) {
+      canvas.rotate(kickRotate);
+      canvas.translate(-kickBack, 0);
+    }
+    canvas.drawRRect(
+      RRect.fromRectAndRadius(const Rect.fromLTWH(-4, -3.5, 9, 4), const Radius.circular(2)),
+      Paint()..color = metal,
+    );
+    canvas.drawRRect(
+      RRect.fromRectAndRadius(Rect.fromLTWH(5, -2.6, barrelLen, 3.2), const Radius.circular(1.6)),
+      Paint()..color = metal,
+    );
+    canvas.drawRect(Rect.fromLTWH(5 + barrelLen, -2.6, 2.4, 3.2), Paint()..color = weapon.color);
+    // Grip: a short stub below the receiver where the hand wraps.
+    canvas.drawRRect(
+      RRect.fromRectAndRadius(const Rect.fromLTWH(-1.5, 0.5, 5, 6), const Radius.circular(2)),
+      Paint()..color = const Color(0xFF23262B),
+    );
+    canvas.restore();
+  }
+
   /// Draws a crew member straight from their live ragdoll pose: limbs are
   /// stroked between the verlet points, so whatever tangle the physics
   /// produced is exactly what you see. The gun stays in the nearest hand.
@@ -987,25 +1016,41 @@ class WorldRenderer {
     void limbTo(RagdollPoint a, RagdollPoint b, double w, Color color) =>
         _limb(canvas, a.pos, b.pos, w, color);
 
-    // Legs first (behind the torso).
-    limbTo(pose.hip, pose.footL, 10, boot);
-    limbTo(pose.hip, pose.footR, 10, boot);
-    canvas.drawCircle(pose.footL.pos, 4.5, Paint()..color = boot);
-    canvas.drawCircle(pose.footR.pos, 4.5, Paint()..color = boot);
+    // Legs first (behind the torso). Each boot is oriented along its own
+    // shin instead of sitting as a bare circle, so a sprawled leg still
+    // reads as a booted foot, not a ball-joint.
+    for (final foot in [pose.footL, pose.footR]) {
+      limbTo(pose.hip, foot, 10, boot);
+      final shin = foot.pos - pose.hip.pos;
+      final shinAng = shin.distance > 1 ? atan2(shin.dy, shin.dx) : pi / 2;
+      canvas.save();
+      canvas.translate(foot.pos.dx, foot.pos.dy);
+      canvas.rotate(shinAng + pi / 2);
+      canvas.drawRRect(
+        RRect.fromRectAndRadius(
+          Rect.fromCenter(center: Offset.zero, width: 15, height: 9),
+          const Radius.circular(4.5),
+        ),
+        Paint()..color = boot,
+      );
+      canvas.restore();
+    }
 
     // Support arm behind the torso.
     limbTo(pose.neck, pose.handL, 8.5, suit);
     canvas.drawCircle(pose.handL.pos, 5.0, Paint()..color = skin);
 
-    // Torso: a rounded slab spanning neck→hip, oriented along the spine.
+    // Torso: a rounded slab spanning neck→hip, oriented along the spine —
+    // same shape and shading band as the standing body.
     final spine = pose.neck.pos - pose.hip.pos;
     final spineAng = atan2(spine.dy, spine.dx);
+    const torsoW = 29.0, torsoH = 27.0;
     canvas.save();
     canvas.translate(pose.hip.pos.dx, pose.hip.pos.dy);
     canvas.rotate(spineAng + pi / 2);
     canvas.drawRRect(
       RRect.fromRectAndCorners(
-        Rect.fromLTWH(-14.5, -27, 29, 27),
+        Rect.fromLTWH(-torsoW / 2, -torsoH, torsoW, torsoH),
         topLeft: const Radius.circular(11),
         topRight: const Radius.circular(11),
         bottomLeft: const Radius.circular(6),
@@ -1013,48 +1058,74 @@ class WorldRenderer {
       ),
       Paint()..color = suit,
     );
+    canvas.drawRRect(
+      RRect.fromRectAndRadius(
+        Rect.fromLTWH(-torsoW / 2, -torsoH * 0.4, torsoW, torsoH * 0.4),
+        const Radius.circular(6),
+      ),
+      Paint()..color = Colors.black.withOpacity(0.1),
+    );
     canvas.restore();
 
-    // Gun arm in front.
+    // Gun arm in front, still holding the real sidearm — aimed across the
+    // body along the line between the two hands, so a limp wrist reads as
+    // a limp gun rather than dropping it.
     limbTo(pose.neck, pose.handR, 8.5, suit);
+    if (weapon != null && crew.alive) {
+      final aim = pose.handR.pos - pose.handL.pos;
+      final u = aim.distance > 1 ? aim / aim.distance : Offset(dir, 0);
+      _sidearm(canvas, pose.handR.pos, u, weapon, metal);
+    }
     canvas.drawCircle(pose.handR.pos, 5.0, Paint()..color = skin);
 
-    // Head, tilted with the spine so a snapped-back head reads.
+    // Head, tilted with the spine so a snapped-back head reads — the full
+    // face and headgear, same as standing, so the ragdoll is unmistakably
+    // the same character mid-tumble rather than a simplified stand-in.
     final hAxis = pose.head.pos - pose.neck.pos;
     final hAng = atan2(hAxis.dy, hAxis.dx) + pi / 2;
     canvas.save();
     canvas.translate(pose.head.pos.dx, pose.head.pos.dy);
     canvas.rotate(hAng * 0.4);
-    canvas.drawCircle(Offset.zero, 14, Paint()..color = skin);
-    // X eyes when dead; a dazed squint otherwise.
-    if (dead) {
-      for (final ex in [-4.4, 4.4]) {
+    const headR = 14.0;
+    canvas.drawCircle(Offset.zero, headR, Paint()..color = skin);
+    canvas.drawArc(
+      Rect.fromCircle(center: Offset.zero, radius: headR),
+      0.3, pi * 0.75, false,
+      Paint()..color = Colors.black.withOpacity(0.06)..style = PaintingStyle.stroke..strokeWidth = 5,
+    );
+    final brow = Paint()
+      ..color = const Color(0xFF8A7448)
+      ..strokeWidth = 2.6
+      ..strokeCap = StrokeCap.round;
+    canvas.drawLine(const Offset(-8, -5), const Offset(-2.5, -6.5), brow);
+    canvas.drawLine(const Offset(2.5, -6.5), const Offset(8, -5), brow);
+    // Eyes: white ovals always, with either a tracking pupil (alive) or an
+    // X (dead) — matching the standing face exactly.
+    for (final ex in [-4.4, 4.4]) {
+      canvas.drawOval(
+        Rect.fromCenter(center: Offset(ex, 0), width: 7.5, height: 9),
+        Paint()..color = Colors.white,
+      );
+      if (dead) {
         canvas.drawLine(Offset(ex - 2, -2), Offset(ex + 2, 2), xEye);
         canvas.drawLine(Offset(ex + 2, -2), Offset(ex - 2, 2), xEye);
+      } else {
+        canvas.drawCircle(Offset(ex + dir * 1.0, 1.2), 2.2, Paint()..color = RT.ink);
       }
-    } else {
-      canvas.drawCircle(Offset(dir * 2.0, 0.5), 2.2, Paint()..color = RT.ink);
     }
+    canvas.drawOval(
+      Rect.fromCenter(center: const Offset(0, 5.5), width: 5, height: 3.6),
+      Paint()..color = const Color(0xFFDCC48B),
+    );
+    canvas.drawRRect(
+      RRect.fromRectAndRadius(
+        Rect.fromCenter(center: const Offset(0, 10), width: 9.5, height: 2.6),
+        const Radius.circular(2),
+      ),
+      Paint()..color = const Color(0xFFB9955C),
+    );
+    _headgear(canvas, raft.look, Offset.zero, headR, dir);
     canvas.restore();
-
-    // The sidearm stays glued to the gun hand, aimed across the body along
-    // the line between the two hands — a limp wrist reads as a limp gun.
-    if (weapon != null && crew.alive) {
-      final aim = pose.handR.pos - pose.handL.pos;
-      final u = aim.distance > 1 ? aim / aim.distance : Offset(dir, 0);
-      canvas.save();
-      canvas.translate(pose.handR.pos.dx, pose.handR.pos.dy);
-      canvas.rotate(atan2(u.dy, u.dx));
-      canvas.drawRRect(
-        RRect.fromRectAndRadius(const Rect.fromLTWH(-4, -3.5, 9, 4), const Radius.circular(2)),
-        Paint()..color = metal,
-      );
-      canvas.drawRRect(
-        RRect.fromRectAndRadius(const Rect.fromLTWH(5, -2.6, 14, 3.2), const Radius.circular(1.6)),
-        Paint()..color = metal,
-      );
-      canvas.restore();
-    }
   }
 
   /// A single thick, rounded-cap "bone" — the building block for every arm
