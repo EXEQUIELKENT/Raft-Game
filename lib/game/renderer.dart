@@ -816,8 +816,8 @@ class WorldRenderer {
       Offset(stance - swing, -liftR),
     ];
     for (final foot in feet) {
-      _limb(canvas, Offset(foot.dx * 0.8, hipY + hipBobWalk),
-          Offset(foot.dx, footY + foot.dy), 10, boot);
+      _taperedLimb(canvas, Offset(foot.dx * 0.8, hipY + hipBobWalk),
+          Offset(foot.dx, footY + foot.dy), 12, 9, boot);
       canvas.drawRRect(
         RRect.fromRectAndRadius(
           Rect.fromCenter(center: Offset(foot.dx, footY + foot.dy + 3), width: 15, height: 9),
@@ -847,7 +847,14 @@ class WorldRenderer {
     if (levelled) {
       final angleRad = aimAngleDeg * pi / 180;
       final aimDir = Offset(gunSide * cos(angleRad), -sin(angleRad));
-      gripBody = gunShoulder + aimDir * wv.holdDist;
+      // Near max elevation the pure aim-line offset lands the grip inside
+      // the head's own silhouette (both hands + weapon read as jammed into
+      // the face) — blend in sideways clearance as the shot steepens so it
+      // swings out beside the head instead. See [ArmIK.headClearance].
+      final steep = sin(angleRad).clamp(0.0, 1.0);
+      gripBody = gunShoulder +
+          aimDir * wv.holdDist +
+          Offset(gunSide * steep * ArmIK.headClearance, 0);
       // Local +x must point along the aim. Screen y-down: a positive canvas
       // rotation tips the muzzle toward the ground, so right-facing aims
       // rotate by NEGATIVE elevation, and a left-facing raft's aim line is
@@ -933,7 +940,7 @@ class WorldRenderer {
     canvas.rotate(lean);
     canvas.translate(0, -hipY);
 
-    _limb(canvas, suppShoulder, suppElbow, 9, suit);
+    _taperedLimb(canvas, suppShoulder, suppElbow, 13, 11, suit);
 
     canvas.drawRRect(
       RRect.fromRectAndCorners(
@@ -966,10 +973,10 @@ class WorldRenderer {
       );
     }
 
-    _limb(canvas, suppElbow, suppHandSolved, 8, skin);
+    _taperedLimb(canvas, suppElbow, suppHandSolved, 8, 6.5, skin);
     elbows(suppElbow);
-    _limb(canvas, gunShoulder, gunElbow, 9, suit);
-    _limb(canvas, gunElbow, gunHand, 8, skin);
+    _taperedLimb(canvas, gunShoulder, gunElbow, 13, 11, suit);
+    _taperedLimb(canvas, gunElbow, gunHand, 8, 6.5, skin);
     elbows(gunElbow);
 
     // ---- The equipped firearm + gripping hands ----
@@ -1905,6 +1912,60 @@ class WorldRenderer {
       Paint()
         ..color = color
         ..strokeWidth = width
+        ..strokeCap = StrokeCap.round,
+    );
+  }
+
+  /// A tapered, capped "bone" — like [_limb], but narrows from [widthA] at
+  /// [a] to [widthB] at [b] instead of holding one uniform stroke width.
+  ///
+  /// Two segments sharing a joint — an upper arm ending at some width, a
+  /// forearm starting at a smaller one — leave a visible rim of the wider
+  /// segment's color at the seam once both are drawn (the narrower cap
+  /// only partly covers the wider one underneath), which reads as a
+  /// sleeve cuff instead of the two colors hard-cutting mid-joint. Both
+  /// ends get a round cap sized to match their local width, so the taper
+  /// reads as one smooth capsule rather than a cut-off wedge, and a soft
+  /// shading line runs down one long edge for a hint of roundness without
+  /// a gradient.
+  void _taperedLimb(
+    Canvas canvas,
+    Offset a,
+    Offset b,
+    double widthA,
+    double widthB,
+    Color color,
+  ) {
+    final rA = widthA / 2, rB = widthB / 2;
+    final delta = b - a;
+    final len = delta.distance;
+    final paint = Paint()..color = color;
+    if (len < 1e-3) {
+      canvas.drawCircle(a, max(rA, rB), paint);
+      return;
+    }
+    final unit = delta / len;
+    final perp = Offset(-unit.dy, unit.dx);
+    final p1 = a + perp * rA;
+    final p2 = b + perp * rB;
+    final p3 = b - perp * rB;
+    final p4 = a - perp * rA;
+    canvas.drawPath(
+      Path()
+        ..moveTo(p1.dx, p1.dy)
+        ..lineTo(p2.dx, p2.dy)
+        ..lineTo(p3.dx, p3.dy)
+        ..lineTo(p4.dx, p4.dy)
+        ..close(),
+      paint,
+    );
+    canvas.drawCircle(a, rA, paint);
+    canvas.drawCircle(b, rB, paint);
+    canvas.drawLine(
+      p4, p3,
+      Paint()
+        ..color = Colors.black.withOpacity(0.13)
+        ..strokeWidth = min(rA, rB) * 0.7
         ..strokeCap = StrokeCap.round,
     );
   }

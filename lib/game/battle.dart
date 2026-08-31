@@ -1070,7 +1070,12 @@ class Raft {
       shoulderY + 5,
     );
     final r = aimAngleDeg * pi / 180;
-    final grip = gunShoulder + Offset(gunSide * cos(r), -sin(r)) * wv.holdDist;
+    // Mirrors the renderer's head-clearance blend (see [ArmIK.headClearance])
+    // so the drawn grip and the actual shot-spawn point never drift apart.
+    final steep = sin(r).clamp(0.0, 1.0);
+    final grip = gunShoulder +
+        Offset(gunSide * cos(r), -sin(r)) * wv.holdDist +
+        Offset(gunSide * steep * ArmIK.headClearance, 0);
     final bodyAng = gunSide > 0 ? -r : r - pi;
     final c = cos(bodyAng), s = sin(bodyAng);
     // Weapon-local muzzle tip -> body space: grip-centred frame, y mirrored

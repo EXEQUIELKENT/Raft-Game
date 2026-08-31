@@ -413,6 +413,24 @@ class ArmIK {
   /// so ordinary, well-within-reach poses stay pixel-identical to before.
   static const double softStretch = 1.55;
 
+  /// Extra sideways push blended into the levelled grip as the aim angle
+  /// steepens (see the renderer's and [Raft.muzzle]'s grip placement).
+  ///
+  /// The grip is normally placed by walking [WeaponView.holdDist] straight
+  /// out along the aim line from the shoulder. That works fine for shallow
+  /// and mid arcs, but near the game's max elevation (`BattleConst.angleMax`,
+  /// 85°) the aim line points almost straight up, so the grip — and both
+  /// fists riding on it — lands almost directly above the shoulder: inside
+  /// the head's own silhouette (headR 14, centred ~16 above the shoulder
+  /// line), rather than out past it. The weapon and hands visually bury
+  /// themselves in the crew member's face for any high lob shot.
+  ///
+  /// Blending in this many units of sideways offset, scaled by how steep
+  /// the shot is (`sin(angle)`), pushes the grip out clear of the head at
+  /// high elevations while leaving shallow-angle poses — where the bug
+  /// doesn't happen — essentially untouched.
+  static const double headClearance = 10.0;
+
   /// Maximum hand distance from the shoulder.
   static double get reachMax => (upper + fore) * softStretch;
 
