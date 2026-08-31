@@ -59,6 +59,12 @@ void main() {
     // selection has fallen back to the infinite starter weapon.
     ctrl.ammo['grenade'] = 1;
     expect(ctrl.selectWeapon('grenade'), true);
+    // The raise animation runs before the weapon is in firing condition —
+    // see the equip/swap tests — so bring the swap to completion first.
+    for (int i = 0; i < 40; i++) {
+      ctrl.world.update(1 / 60);
+    }
+    expect(ctrl.world.raftOf(0)!.activeCrew!.swapping, false);
     ctrl.humanFire();
     expect(ctrl.ammo['grenade'], 0);
     expect(ctrl.selectedWeaponId, Weapons.starter.id,

@@ -176,6 +176,10 @@ class BattleConst {
   /// the air indefinitely.
   static const double ragdollWatchdog = 8.0;
 
+  /// Total time a weapon swap takes: lower to the hip, equip at the
+  /// midpoint, raise the new model into the grip.
+  static const double weaponSwapTime = 0.5;
+
   /// Floor impacts slower than this land dead — no bounce. Without it a
   /// resting body never sleeps: gravity re-energizes the points into the
   /// deck every frame and the bounce returns a slice of that energy,
@@ -575,6 +579,55 @@ class Crew {
   /// 0..1 weight of the walk animation; eases in while walking and out
   /// once the station is reached.
   double walkAmp = 0;
+
+  // --- Weapon equipment -----------------------------------------------------
+
+  /// The weapon currently equipped in hand — the firearm model, grip and
+  /// firing animation all follow this. While [swapTarget] is set, a swap is
+  /// in progress: the old weapon lowers ([swapT] 0 → 0.5), the new one is
+  /// equipped at the halfway point, and the new weapon rises (0.5 → 1).
+  String? equipped;
+
+  /// The weapon being swapped in; null when no swap is running.
+  String? swapTarget;
+
+  /// 0..1 swap progress. The held weapon lowers to the hip through the
+  /// first half, the new model is equipped at the midpoint, and it rises
+  /// back into the grip through the second half.
+  double swapT = 1;
+
+  /// True while a weapon swap animation is running.
+  bool get swapping => swapTarget != null;
+
+  /// Requests a weapon swap. Re-requesting the equipped weapon is a no-op;
+  /// a swap already in flight retargets cleanly. The lower/equip/raise
+  /// animation is driven by the world's body stepper on the same fixed-step
+  /// clock as the bodies, so both hotspot devices see the same transition.
+  void equip(String weaponId) {
+    if (swapTarget == weaponId) return;
+    if (equipped == weaponId) {
+      swapTarget = null;
+      swapT = 1;
+      return;
+    }
+    if (equipped == null) {
+      // First equip: the weapon appears in hand already raised.
+      equipped = weaponId;
+      swapTarget = null;
+      swapT = 1;
+      return;
+    }
+    swapTarget = weaponId;
+    swapT = 0;
+  }
+
+  /// Sets the equipped weapon with no transition — used for AI shots and
+  /// turn-start sync, where the raise animation would fight the fire.
+  void equipInstant(String weaponId) {
+    equipped = weaponId;
+    swapTarget = null;
+    swapT = 1;
+  }
 
   Crew({required this.hp, required this.maxHp, this.bobPhase = 0});
 
@@ -1413,6 +1466,22 @@ class BattleWorld {
         // one on the deck is a ragdoll instead — it tumbles off the raft
         // and into the sea (see [_stepBody]) and only starts sinking once
         // it is actually in the water.
+        // Weapon swap: the held firearm lowers to the hip, the new model
+        // is equipped at the halfway point, and the new one rises back
+        // into the grip. The swap runs on the same fixed-step clock as
+        // the bodies so both hotspot devices see the identical transition.
+        if (c.swapTarget != null) {
+          c.swapT += dt / BattleConst.weaponSwapTime;
+          if (c.swapT >= 0.5 && c.equipped != c.swapTarget) {
+            c.equipped = c.swapTarget;
+          }
+          if (c.swapT >= 1) {
+            c.equipped = c.swapTarget;
+            c.swapTarget = null;
+            c.swapT = 1;
+          }
+        }
+
         if (c.drowned) {
           c.sinkT = (c.sinkT + dt / BattleConst.sinkTime).clamp(0.0, 1.0);
         } else if (!c.alive && !c.ragdoll) {

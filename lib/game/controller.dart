@@ -351,6 +351,14 @@ class GameController extends ChangeNotifier {
     final raft = world.raftOf(player);
     raft?.ensureActiveReady();
     raft?.ensureActiveAlive();
+    // Sync the active crew's firearm to this seat's selected weapon at turn
+    // start (instant — the raise animation belongs to mid-turn swaps, and
+    // over a hotspot link only the local seat's own crew is synced).
+    final localSeat = !players[player].isAi &&
+        (mode != GameMode.hotspot || player == myPlayerIndex);
+    if (localSeat) {
+      world.raftOf(player)?.activeCrew?.equipInstant(selectedWeaponId);
+    }
     // The view belongs to whoever is firing — except over a hotspot link,
     // where each device shows only its own deck, so you watch incoming fire
     // arrive rather than being teleported to the enemy's side on their turn.
@@ -387,8 +395,10 @@ class GameController extends ChangeNotifier {
     // The physics watchdog guarantees recovery or drowning, and the wait
     // cap rotates to another crew member or passes the turn as a backstop.
     final shooter = world.raftOf(currentPlayer)?.activeCrew;
-    if (shooter == null || !shooter.ready) {
-      if (_crewWait == 0) statusMessage = 'Recovering…';
+    if (shooter == null || !shooter.ready || shooter.swapping) {
+      if (_crewWait == 0) {
+        statusMessage = shooter != null && shooter.swapping ? 'Equipping…' : 'Recovering…';
+      }
       _crewWait += dt;
       if (_crewWait > crewWaitLimit) {
         final couldAct = world.raftOf(currentPlayer)?.ensureActiveReady() ?? false;
@@ -454,6 +464,9 @@ class GameController extends ChangeNotifier {
     aimAngle = shot.angle;
     aimPower = shot.power;
     selectedWeaponId = shot.weapon.id;
+    // The AI equips instantly: its weapon choice is made at fire time, and
+    // a raise animation would fight the recoil window that follows.
+    me.activeCrew?.equipInstant(shot.weapon.id);
     _doFire(shot.angle, shot.power, shot.weapon);
   }
 
@@ -632,6 +645,9 @@ class GameController extends ChangeNotifier {
     // The shooter must be on their feet: a body mid-ragdoll (tumbling, or
     // still airborne) cannot line up a shot — the turn waits for them.
     if (world.raftOf(currentPlayer)?.activeCrew?.ready != true) return false;
+    // Nor can they fire while the freshly selected weapon is still being
+    // raised into the grip.
+    if (world.raftOf(currentPlayer)?.activeCrew?.swapping == true) return false;
     return true;
   }
 
@@ -659,7 +675,17 @@ class GameController extends ChangeNotifier {
 
   bool selectWeapon(String weaponId) {
     if (!_hasAmmoFor(weaponId)) return false;
+    final changed = selectedWeaponId != weaponId;
     selectedWeaponId = weaponId;
+    // Only the local human seat animates a swap: their active crew lowers
+    // the old firearm, equips the new model, and raises it into the grip.
+    // The AI picks its weapon at fire time and simply equips it.
+    if (changed &&
+        phase == GamePhase.aiming &&
+        !players[currentPlayer].isAi &&
+        (mode != GameMode.hotspot || currentPlayer == myPlayerIndex)) {
+      world.raftOf(currentPlayer)?.activeCrew?.equip(weaponId);
+    }
     notifyListeners();
     return true;
   }
@@ -726,8 +752,9 @@ class GameController extends ChangeNotifier {
     }
     // A shooter who is not on their feet cannot fire — this is the last
     // line of defence behind canHumanAct, and it also covers remote (network)
-    // fire requests, which are never trusted anyway.
-    if (raft.activeCrew?.ready != true) {
+    // fire requests, which are never trusted anyway. A weapon mid-swap is
+    // likewise not in firing condition: the turn waits for the raise.
+    if (raft.activeCrew?.ready != true || raft.activeCrew?.swapping == true) {
       if (kDebugMode) debugPrint('[fire] rejected: shooter not ready (player=$currentPlayer)');
       return;
     }

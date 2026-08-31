@@ -7,6 +7,7 @@ import '../theme.dart';
 import 'battle.dart';
 import 'maps.dart';
 import 'models.dart';
+import 'weapon_views.dart';
 
 /// ---------------------------------------------------------------------------
 /// Scene renderer, drawn in the flat-vector style of the Claude Design mockup:
@@ -719,19 +720,27 @@ class WorldRenderer {
     final isShooter = crew.alive && raft.playerIndex == currentPlayer && index == raft.activeIndex;
     final aiming = isShooter && isAiming;
 
-    // Recoil: a short, sharp window right after this crew member's own shot
-    // leaves the barrel, decaying from 1 (muzzle flash + kickback) to 0.
-    // The whole body reads it, not just the arm: the torso leans away, the
-    // head ducks, and the stance widens to absorb the shove.
-    double recoil = 0;
+    // Firearm view: whichever projectile type is equipped defines the model
+    // geometry, the grip layout and the firing animation.
+    final wv = WeaponView.forCrew(crew.equipped ?? weapon?.id, weapon);
+    final accent = Weapons.byId(wv.id).color;
+
+    // Equip lift: 1 raised in the grip, 0 lowered to the hip mid-swap.
+    final lift = crew.swapping ? ((crew.swapT - 0.5).abs() * 2).clamp(0.0, 1.0) : 1.0;
+
+    // Firing state per view: recoil window, muzzle flash window and pump
+    // travel each scale with the caliber being fired.
+    double recoil = 0, flashT = 0, pumpT = 0;
     final liveShot = world.shot;
     if (liveShot != null && liveShot.owner == raft.playerIndex && index == raft.activeIndex) {
-      const recoilDur = 0.26;
       final dt = world.elapsed - liveShot.firedAt;
-      if (dt >= 0 && dt < recoilDur) {
-        final u = 1 - dt / recoilDur;
-        // Sharp attack, soft decay — a snap, not a slide.
-        recoil = u * u * (3 - 2 * u);
+      if (dt >= 0) {
+        if (dt < wv.recoilDur) {
+          final u = 1 - dt / wv.recoilDur;
+          recoil = u * u * (3 - 2 * u); // snap, then decay
+        }
+        if (dt < wv.flashDur) flashT = (1 - dt / wv.flashDur).clamp(0.0, 1.0);
+        if (wv.pumpTravel > 0 && dt < 0.34) pumpT = sin(pi * dt / 0.34);
       }
     }
 
@@ -748,8 +757,9 @@ class WorldRenderer {
     const headR = 14.0;
 
     final footY = deck;
-    // Recoil crouches the body: the hips drop, compressing the legs a touch.
-    final hipY = footY - legLen + recoil * 3.2;
+    // Recoil crouches the body — scaled by the caliber's kick, so a tennis
+    // ball barely moves the stance and an anchor shot drives the heels in.
+    final hipY = footY - legLen + recoil * wv.kick * 0.4;
     final shoulderY = hipY - torsoH;
     final headC = Offset(0, shoulderY - headR - 2);
 
@@ -757,7 +767,6 @@ class WorldRenderer {
     final suit = raft.playerIndex == 0 ? const Color(0xFF2D4F8F) : lo.color;
     const boot = Color(0xFF23262B);
     const metal = Color(0xFF3B3F45);
-    final accent = weapon?.color ?? RT.orange;
 
     final leanBack = recoil * 0.16;
     final hipBobWalk = sin(crew.walkPhase * pi * 2 * 2).abs() * 1.2 * crew.walkAmp;
@@ -789,42 +798,82 @@ class WorldRenderer {
       );
     }
 
-    // ---- Support arm (drawn first so it tucks behind the torso/gun arm) ----
     final gunSide = dir >= 0 ? 1.0 : -1.0;
+
+    // ---- Arms + firearm -------------------------------------------------
+    // The equipped [WeaponView] supplies the grip layout: the firing hand
+    // closes on the trigger grip, the support hand solves (analytic IK) to
+    // its grip target — foregrip, pump handle or stacked rear heft, chosen
+    // per caliber — and the weapon frame hangs off the firing hand.
     final gunShoulder = Offset(gunSide * (torsoW / 2 - 5), shoulderY + 5);
     final suppShoulder = Offset(-gunSide * (torsoW / 2 - 5), shoulderY + 5);
-    final sway = sin(time * 1.4 + crew.bobPhase) * 1.6;
+    final sway = sin(time * 1.4 + crew.bobPhase) * 1.6 * wv.sway;
 
-    late Offset gunElbow;
-    late Offset gunHand;
-
-    if (aiming || recoil > 0) {
-      // Two-handed grip, levelled along the live aim angle. [recoil] eats
-      // into the reach for a snappy kickback right as the shot goes out.
+    // Weapon frame transform: origin at the firing hand's grip position,
+    // rotated to the aim line while engaged, carried at low ready at rest.
+    // The whole frame eases toward the hip and tilts down during a swap's
+    // lower/raise halves ([lift]), so the model change happens off the
+    // character's shoulder line.
+    final bool levelled = (aiming || recoil > 0) && lift > 0.2;
+    double frameAng;
+    Offset frameOrigin;
+    if (levelled) {
       final angleRad = aimAngleDeg * pi / 180;
       final aimDir = Offset(gunSide * cos(angleRad), -sin(angleRad));
-      final reach = 24.0 - recoil * 7;
-      gunHand = gunShoulder + aimDir * reach;
-      gunElbow = gunShoulder + aimDir * (reach * 0.5) + const Offset(0, 3);
-
-      final suppHand = gunHand - aimDir * 7 + const Offset(0, 3);
-      final suppElbow = suppShoulder + (suppHand - suppShoulder) * 0.5 + const Offset(0, 5);
-      _limb(canvas, suppShoulder, suppElbow, 9, suit);
-      _limb(canvas, suppElbow, suppHand, 8, skin);
-      canvas.drawCircle(suppHand, 5.5, Paint()..color = skin);
+      // Heavier guns tuck closer to the shoulder; the recoil kick pulls the
+      // whole frame back along the barrel and the muzzle climbs.
+      final reach = wv.holdDist - recoil * wv.kick;
+      frameOrigin = gunShoulder + aimDir * reach + Offset(0, wv.gripY + recoil * wv.kick * 0.3);
+      frameAng = gunSide > 0 ? angleRad : pi - angleRad;
     } else {
-      // Relaxed: both arms hang at the sides with a little idle sway, plus
-      // a counter-swing while walking.
-      final walkSwing = sin(crew.walkPhase * pi * 2 + pi) * 4.0 * crew.walkAmp;
-      final suppElbow = suppShoulder + Offset(-gunSide * 3, 9 + sway * 0.3);
-      final suppHand = suppShoulder + Offset(-gunSide * 2, 18 - sway * 0.3);
-      _limb(canvas, suppShoulder, suppElbow, 9, suit);
-      _limb(canvas, suppElbow, suppHand + Offset(0, walkSwing), 8, skin);
-      canvas.drawCircle(suppHand + Offset(0, walkSwing), 5.5, Paint()..color = skin);
-
-      gunElbow = gunShoulder + Offset(gunSide * 3, 9 - sway * 0.3);
-      gunHand = gunShoulder + Offset(gunSide * 2, 18 + sway * 0.3);
+      // Low ready: grip at the hip, muzzle angled down-and-forward, with a
+      // walk-cycle sway. Mid-swap the weapon drops toward the other hip.
+      final lowered = 1 - lift;
+      frameOrigin = gunShoulder +
+          Offset(gunSide * 6, 16 + lowered * 8 + sway * 0.2);
+      frameAng = gunSide > 0
+          ? (0.9 - crew.walkAmp * 0.12 * sin(crew.walkPhase * pi * 2) + lowered * 0.5)
+          : pi - (0.9 - crew.walkAmp * 0.12 * sin(crew.walkPhase * pi * 2) + lowered * 0.5);
     }
+    frameAng += recoil * wv.climb * gunSide; // muzzle climb
+    frameOrigin += Offset(-cos(frameAng), -sin(frameAng)) * recoil * wv.kick * 0.35;
+
+    // Map weapon-local points into body space.
+    Offset toBody(double wx, double wy) {
+      final c = cos(frameAng), s = sin(frameAng);
+      final lx = wx - wv.gripX, ly = wy - wv.gripY;
+      return frameOrigin + Offset(lx * c - ly * s, lx * s + ly * c);
+    }
+
+    // The trigger hand sits exactly on the grip.
+    final gunHand = toBody(wv.gripX, wv.gripY);
+    // Support-hand target: on the weapon's foregrip/pump line, choked up
+    // toward the grip to the furthest spot the arm can actually reach —
+    // long guns are held shorter, short guns right at the foregrip. This is
+    // what keeps every grip looking natural without per-weapon poses.
+    final suppAxis = Offset(cos(frameAng), sin(frameAng));
+    final suppT = ArmIK.chokeUp(
+      anchor: frameOrigin,
+      axis: suppAxis,
+      shoulder: suppShoulder,
+      preferredT: wv.supportForeX - wv.gripX,
+      minT: 1,
+      maxT: (wv.muzzleX - wv.gripX) * 0.85,
+    );
+    final suppLocal = Offset(wv.gripX + suppT, wv.supportForeY);
+    final suppHand = toBody(suppLocal.dx, suppLocal.dy);
+
+    final suppBend = gunSide * wv.supportBend;
+    final (suppElbow, suppHandSolved) = ArmIK.solve(suppShoulder, suppHand, bend: suppBend);
+    final (gunElbow, _) = ArmIK.solve(
+      gunShoulder, gunHand,
+      bend: -gunSide,
+    );
+
+    // ---- Support arm (behind torso and weapon) ----
+    _limb(canvas, suppShoulder, suppElbow, 9, suit);
+    _limb(canvas, suppElbow, suppHandSolved, 8, skin);
+    canvas.drawCircle(suppHandSolved, 5.5, Paint()..color = skin);
 
     // ---- Torso ----
     canvas.save();
@@ -855,44 +904,49 @@ class WorldRenderer {
     _limb(canvas, gunShoulder, gunElbow, 9, suit);
     _limb(canvas, gunElbow, gunHand, 8, skin);
 
-    // ---- Sidearm — always in hand; levelled when aiming, carried angled
-    // down-and-forward at rest so it never reads as drilling for oil
-    // between the boots. ----
-    if (weapon != null && crew.alive) {
-      final bool levelled = aiming || recoil > 0;
-      final Offset u;
-      if (levelled) {
-        // Along the live aim; the muzzle climbs as the shot kicks.
-        final angleRad = aimAngleDeg * pi / 180;
-        u = Offset(gunSide * cos(angleRad), -sin(angleRad));
-      } else {
-        final restAng =
-            pi / 2 - gunSide * (0.42 + sin(crew.walkPhase * pi * 2) * 0.12 * crew.walkAmp);
-        u = Offset(cos(restAng), sin(restAng));
-      }
-      final barrelLen = 12.0 + (weapon.weight - 1) * 6;
-
-      _sidearm(canvas, gunHand, u, weapon, metal,
-          kickRotate: -gunSide * recoil * 0.30, kickBack: recoil * 4.5);
+    // ---- The equipped firearm ----
+    // Drawn in the weapon's local frame (origin at the trigger grip, +x to
+    // the muzzle): kick shoves the model back along the barrel into the
+    // shoulder, climb tips the muzzle up, and the pump slide runs its
+    // cycle — each one scaled by the caliber's own animation spec.
+    if (crew.alive) {
+      canvas.save();
+      canvas.translate(gunHand.dx, gunHand.dy);
+      canvas.rotate(frameAng);
+      canvas.scale(1, gunSide);
+      canvas.rotate(recoil * wv.climb);
+      canvas.translate(-recoil * wv.kick, 0);
+      _firearm(canvas, wv, accent, metal, pumpT: pumpT);
+      canvas.restore();
+      // Firing hand wraps the grip (over the weapon).
       canvas.drawCircle(gunHand, 5.5, Paint()..color = skin);
 
-      // Muzzle flash: only the first sliver of the recoil window, at the
-      // kicked barrel tip.
-      if (recoil > 0.7) {
-        // Clamp: (1.0 - 0.7) / 0.3 rounds to 1.0000000000000002, which the
-        // withOpacity assert rightly rejects.
-        final flashT = ((recoil - 0.7) / 0.3).clamp(0.0, 1.0);
-        final tip = gunHand + rotate(u, -gunSide * recoil * 0.30) * (17 + barrelLen);
+      // Muzzle flash at the true muzzle tip — size and burn time come from
+      // the view, so the mortar barks and the pop pistol snaps.
+      if (flashT > 0) {
+        final tip = toBody(wv.muzzle.dx, wv.muzzle.dy);
+        final r = wv.flashR * flashT;
         canvas.drawCircle(
           tip,
-          7 * flashT,
+          r,
           Paint()
             ..shader = RadialGradient(colors: [
               Colors.white.withOpacity(flashT),
               accent.withOpacity(flashT * 0.7),
               accent.withOpacity(0),
-            ]).createShader(Rect.fromCircle(center: tip, radius: max(0.01, 7 * flashT))),
+            ]).createShader(Rect.fromCircle(center: tip, radius: max(0.01, r))),
         );
+        // Spreaders and cannons show a bright ring past the prongs.
+        if (wv.prongLen > 0) {
+          canvas.drawCircle(
+            tip,
+            r * 1.4,
+            Paint()
+              ..color = accent.withOpacity(flashT * 0.3)
+              ..style = PaintingStyle.stroke
+              ..strokeWidth = 2,
+          );
+        }
       }
     }
 
@@ -917,45 +971,105 @@ class WorldRenderer {
     canvas.restore();
   }
 
-  /// The sidearm itself: a metal receiver, a barrel whose length reflects
-  /// the weapon's weight, an accent-coloured muzzle cap, and a grip stub —
-  /// drawn with the barrel pointing along [aimDir] from [hand]. Shared by
-  /// the standing pose and the ragdoll so a knocked-out character is
-  /// drawn holding the exact same gun, not a simplified stand-in.
-  /// [kickRotate]/[kickBack] are the standing pose's recoil kick; the
-  /// ragdoll never passes them.
-  void _sidearm(
+  /// The equipped firearm, drawn in weapon-local coordinates: origin at the
+  /// trigger grip, +x toward the muzzle, +y down. Geometry comes entirely
+  /// from the [WeaponView] — receiver, barrel, stock, drum, prongs and pump
+  /// slide — so each projectile type carries a genuinely different model,
+  /// not a recoloured stub.
+  void _firearm(
     Canvas canvas,
-    Offset hand,
-    Offset aimDir,
-    WeaponDef weapon,
+    WeaponView wv,
+    Color accent,
     Color metal, {
-    double kickRotate = 0,
-    double kickBack = 0,
+    double pumpT = 0,
   }) {
-    final barrelLen = 12.0 + (weapon.weight - 1) * 6;
-    canvas.save();
-    canvas.translate(hand.dx, hand.dy);
-    canvas.rotate(atan2(aimDir.dy, aimDir.dx));
-    if (kickRotate != 0 || kickBack != 0) {
-      canvas.rotate(kickRotate);
-      canvas.translate(-kickBack, 0);
+    // Butt stock behind the grip (shoulder-fired heavies).
+    if (wv.stockLen > 0) {
+      canvas.drawRRect(
+        RRect.fromRectAndRadius(
+          Rect.fromLTWH(wv.receiverX0 - wv.stockLen, -1.5, wv.stockLen + 4, 4.5),
+          const Radius.circular(2),
+        ),
+        Paint()..color = const Color(0xFF8A5F35),
+      );
     }
+    // Barrel, with a stepped profile: fat at the receiver, tapering out.
+    final midX = (wv.barrelX0 + wv.barrelX1) / 2;
     canvas.drawRRect(
-      RRect.fromRectAndRadius(const Rect.fromLTWH(-4, -3.5, 9, 4), const Radius.circular(2)),
+      RRect.fromRectAndRadius(
+        Rect.fromLTWH(wv.barrelX0, -wv.barrelW / 2 - 0.6, midX - wv.barrelX0, wv.barrelW + 1.2),
+        const Radius.circular(1.6),
+      ),
       Paint()..color = metal,
     );
     canvas.drawRRect(
-      RRect.fromRectAndRadius(Rect.fromLTWH(5, -2.6, barrelLen, 3.2), const Radius.circular(1.6)),
+      RRect.fromRectAndRadius(
+        Rect.fromLTWH(midX, -wv.barrelW / 2, wv.barrelX1 - midX, wv.barrelW),
+        const Radius.circular(1.4),
+      ),
+      Paint()..color = Color.lerp(metal, Colors.white, 0.12)!,
+    );
+    // Receiver.
+    canvas.drawRRect(
+      RRect.fromRectAndRadius(
+        Rect.fromLTWH(wv.receiverX0, -wv.receiverH / 2, wv.receiverX1 - wv.receiverX0, wv.receiverH),
+        const Radius.circular(2.4),
+      ),
       Paint()..color = metal,
     );
-    canvas.drawRect(Rect.fromLTWH(5 + barrelLen, -2.6, 2.4, 3.2), Paint()..color = weapon.color);
-    // Grip: a short stub below the receiver where the hand wraps.
+    // Ammunition drum (mortar-type feed), showing the caliber colour.
+    if (wv.drumR > 0) {
+      final drumC = Offset((wv.receiverX0 + wv.receiverX1) / 2, wv.receiverH / 2 + wv.drumR - 1.5);
+      canvas.drawCircle(drumC, wv.drumR, Paint()..color = Color.lerp(metal, Colors.black, 0.3)!);
+      canvas.drawCircle(drumC, wv.drumR * 0.55, Paint()..color = accent);
+    }
+    // Muzzle prongs / brake (spreaders + long guns).
+    if (wv.prongLen > 0) {
+      for (final dy in [-wv.barrelW / 2 - 0.5, wv.barrelW / 2 + 0.5]) {
+        canvas.drawLine(
+          Offset(wv.barrelX1 - 1, dy),
+          Offset(wv.muzzleX, dy * 1.7),
+          Paint()
+            ..color = metal
+            ..strokeWidth = 1.8
+            ..strokeCap = StrokeCap.round,
+        );
+      }
+    }
+    // Accent muzzle cap.
+    canvas.drawRect(
+      Rect.fromLTWH(wv.muzzleX - 2, -wv.barrelW / 2 - 0.4, 2.4, wv.barrelW + 0.8),
+      Paint()..color = accent,
+    );
+    // Pump slide — rides the barrel, runs its cycle on fire.
+    if (wv.pumpTravel > 0) {
+      canvas.drawRRect(
+        RRect.fromRectAndRadius(
+          Rect.fromLTWH(wv.pumpX0 + pumpT * wv.pumpTravel, -wv.barrelW / 2 - 1.4,
+              wv.pumpX1 - wv.pumpX0, wv.barrelW + 2.8),
+          const Radius.circular(2),
+        ),
+        Paint()..color = const Color(0xFF23262B),
+      );
+    }
+    // Trigger grip: the frame origin the firing hand closes on.
     canvas.drawRRect(
-      RRect.fromRectAndRadius(const Rect.fromLTWH(-1.5, 0.5, 5, 6), const Radius.circular(2)),
+      RRect.fromRectAndRadius(
+        Rect.fromLTWH(wv.gripX - 2.5, wv.gripY - 1, 5.5, 7),
+        const Radius.circular(2),
+      ),
       Paint()..color = const Color(0xFF23262B),
     );
-    canvas.restore();
+    // Foregrip under the barrel where the support hand clamps.
+    if (wv.supportStyle == GripStyle.foregrip) {
+      canvas.drawRRect(
+        RRect.fromRectAndRadius(
+          Rect.fromLTWH(wv.supportForeX - 2, wv.supportForeY - 4.5, 4, 6),
+          const Radius.circular(2),
+        ),
+        Paint()..color = const Color(0xFF23262B),
+      );
+    }
   }
 
   /// Draws a crew member straight from their live ragdoll pose: limbs are
@@ -1029,14 +1143,21 @@ class WorldRenderer {
     );
     canvas.restore();
 
-    // Gun arm in front, still holding the real sidearm — aimed across the
-    // body along the line between the two hands, so a limp wrist reads as
-    // a limp gun rather than dropping it.
+    // Gun arm in front, still holding the equipped firearm — the same view
+    // the standing body draws, aimed across the body along the line between
+    // the two hands, so a limp wrist reads as a limp gun rather than
+    // dropping it.
     limbTo(pose.neck, pose.handR, 8.5, suit);
-    if (weapon != null && crew.alive) {
+    if (weapon != null || crew.equipped != null) {
+      final wv = WeaponView.forCrew(crew.equipped ?? weapon?.id, weapon);
       final aim = pose.handR.pos - pose.handL.pos;
       final u = aim.distance > 1 ? aim / aim.distance : Offset(dir, 0);
-      _sidearm(canvas, pose.handR.pos, u, weapon, metal);
+      canvas.save();
+      canvas.translate(pose.handR.pos.dx, pose.handR.pos.dy);
+      canvas.rotate(atan2(u.dy, u.dx));
+      canvas.scale(1, dir >= 0 ? 1 : -1);
+      _firearm(canvas, wv, Weapons.byId(wv.id).color, metal);
+      canvas.restore();
     }
     canvas.drawCircle(pose.handR.pos, 5.0, Paint()..color = skin);
 

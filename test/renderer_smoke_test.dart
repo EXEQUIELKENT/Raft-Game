@@ -165,6 +165,61 @@ void main() {
     expect(tester.takeException(), isNull, reason: 'aim pose while the shot is live');
   });
 
+  testWidgets('every firearm model paints in aim, rest, recoil and swap states',
+      (tester) async {
+    for (final weapon in Weapons.all) {
+      final world = BattleWorld(map: GameMaps.all.first, seed: 9);
+      world.addRaft(Raft(
+        playerIndex: 0, x: BattleConst.playerX,
+        loadout: RaftLoadout.custom(hullId: 'tube', sizeId: 'medium', colorIndex: 0),
+        look: CrewLook.player, label: 'P1', facing: 1,
+        crew: [Crew(hp: 100, maxHp: 100)],
+      ));
+      world.addRaft(Raft(
+        playerIndex: 1, x: BattleConst.enemySlots.first,
+        loadout: RaftLoadout.custom(hullId: 'tube', sizeId: 'medium', colorIndex: 1),
+        look: CrewLook.raider, label: 'AI', facing: -1,
+        crew: [Crew(hp: 100, maxHp: 100)],
+      ));
+      final crew = world.raftOf(0)!.crew.first;
+
+      // Idle carry with this weapon equipped.
+      crew.equip(weapon.id);
+      await paint(tester, world);
+      expect(tester.takeException(), isNull, reason: '${weapon.id}: rest carry');
+
+      // Aiming pose (grip targets solved at the live aim angle).
+      await paint(tester, world, currentPlayer: 0, isAiming: true);
+      expect(tester.takeException(), isNull, reason: '${weapon.id}: aiming');
+
+      // Recoil + muzzle flash: fire, then paint inside the kick window.
+      world.fire(
+        from: world.raftOf(0)!.muzzle,
+        angleDeg: 20, power: 70, facing: 1,
+        weapon: weapon, owner: 0,
+      );
+      await paint(tester, world, currentPlayer: 0, isAiming: false);
+      expect(tester.takeException(), isNull, reason: '${weapon.id}: recoil + flash');
+
+      // Mid-swap: the firearm lowered to the hip.
+      crew.equip(Weapons.byId('tennis').id == weapon.id ? 'grenade' : 'tennis');
+      crew.swapT = 0.5;
+      await paint(tester, world);
+      expect(tester.takeException(), isNull, reason: '${weapon.id}: lowered mid-swap');
+    }
+  });
+
+  testWidgets('a ragdolled crew member paints holding their equipped firearm',
+      (tester) async {
+    final world = freshWorld();
+    final c = world.raftOf(1)!.crew.first;
+    c.equip('bomb');
+    c.knock(const Offset(1, 0), Crew.impactForce(Weapons.byId('grenade')),
+        hitLocal: const Offset(0, -40));
+    await paint(tester, world);
+    expect(tester.takeException(), isNull);
+  });
+
   testWidgets('deck platforms, ramps and rail lips paint on every hull', (tester) async {
     for (final hull in RaftHull.all) {
       for (final facing in [1, -1]) {
