@@ -78,8 +78,8 @@ void main() {
       for (final w in Weapons.all) {
         final view = WeaponView.forId(w.id);
         // The bell mouth is sized from the round's drawn diameter
-        // (radius `9 * weight` at render time): ~76% of it, hand-rounded to
-        // half units. The ball visibly belongs to the opening it left.
+        // (radius `9 * weight` at render time): ~98% of it, hand-rounded
+        // to half units. The ball visibly belongs to the opening it left.
         final roundDiameter = 2 * 9.0 * w.weight;
         expect(view.bore, closeTo(WeaponView.boreFor(w), 0.25),
             reason: '${w.id}: bore must track the projectile');
@@ -106,14 +106,40 @@ void main() {
       }
     });
 
-    test('Grip layouts differ per weapon: foregrips, cups and rear hefts', () {
+    test('Grip layouts differ per weapon: foregrips, cups, handles and hefts', () {
       expect(WeaponView.forId('tennis').supportStyle, GripStyle.cup);
+      // The grenade's default model is an AK-pattern rifle: support hand
+      // clamps the handguard.
       expect(WeaponView.forId('grenade').supportStyle, GripStyle.foregrip);
       expect(WeaponView.forId('bomb').supportStyle, GripStyle.heft);
-      // The grenade launcher's slide is a real pump action with travel.
-      expect(WeaponView.forId('grenade').pumpTravel, greaterThan(0));
-      // The starter has no slide to work.
+      // The cluster launcher is carried by a top handle — its own hold.
+      expect(WeaponView.forId('cluster').supportStyle, GripStyle.topHandle);
+      expect(WeaponView.forId('cluster').handleX, greaterThan(0));
+      // The grenade's drum lobber variant keeps a real pump action with
+      // travel; the AK-pattern default has no slide to work.
+      expect(WeaponView.variantCount('grenade'), greaterThan(1));
+      expect(WeaponView.forVariant('grenade', 1).pumpTravel, greaterThan(0));
+      expect(WeaponView.forId('grenade').pumpTravel, 0);
+      // The starter has no slide to work either.
       expect(WeaponView.forId('tennis').pumpTravel, 0);
+    });
+
+    test('Calibers with variants hand out distinct, stable models per crew', () {
+      // Variants exist and cycle deterministically from a bob phase.
+      expect(WeaponView.variantCount('tennis'), 2);
+      expect(WeaponView.variantCount('anchor'), 1);
+      final a = WeaponView.forVariant('tennis', WeaponView.variantForPhase(0.9, 'tennis'));
+      final b = WeaponView.forVariant('tennis', WeaponView.variantForPhase(0.9, 'tennis'));
+      expect(identical(a, b), true, reason: 'same phase, same model');
+      // Every variant keeps its caliber identity and its bore.
+      for (final id in ['tennis', 'grenade']) {
+        for (int v = 0; v < WeaponView.variantCount(id); v++) {
+          final view = WeaponView.forVariant(id, v);
+          expect(view.id, id);
+          expect(view.bore, closeTo(WeaponView.forId(id).bore, 0.25),
+              reason: '$id variant $v stays sized for its round');
+        }
+      }
     });
   });
 

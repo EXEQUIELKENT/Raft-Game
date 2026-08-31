@@ -175,9 +175,9 @@ void main() {
       final me = ctrl.world.raftOf(0)!;
       final foe = ctrl.world.raftOf(1)!;
 
-      expect(me.muzzle.dx, greaterThan(me.crewPos(me.activeIndex).dx),
+      expect(me.muzzle().dx, greaterThan(me.crewPos(me.activeIndex).dx),
           reason: 'player muzzle points right');
-      expect(foe.muzzle.dx, lessThan(foe.crewPos(foe.activeIndex).dx),
+      expect(foe.muzzle().dx, lessThan(foe.crewPos(foe.activeIndex).dx),
           reason: 'enemy muzzle points left');
       ctrl.dispose();
     });
@@ -190,9 +190,9 @@ void main() {
       final w = Weapons.starter;
 
       final near = ctrl.world.landingX(
-          from: me.muzzle, angleDeg: 45, power: 40, facing: 1, weapon: w);
+          from: me.muzzle(), angleDeg: 45, power: 40, facing: 1, weapon: w);
       final far = ctrl.world.landingX(
-          from: me.muzzle, angleDeg: 45, power: 90, facing: 1, weapon: w);
+          from: me.muzzle(), angleDeg: 45, power: 90, facing: 1, weapon: w);
 
       expect(far, greaterThan(near));
       expect(near.isFinite && far.isFinite, true);
@@ -203,7 +203,7 @@ void main() {
       final ctrl = newMatch();
       final me = ctrl.world.raftOf(0)!;
       final dots = ctrl.world.trajectory(
-        from: me.muzzle, angleDeg: 45, power: 70, facing: 1,
+        from: me.muzzle(), angleDeg: 45, power: 70, facing: 1,
         weapon: Weapons.starter, limit: 30,
       );
 
@@ -215,7 +215,7 @@ void main() {
       }
       // The arc should actually rise before it falls.
       final highest = dots.map((d) => d.pos.dy).reduce((a, b) => a < b ? a : b);
-      expect(highest, lessThan(me.muzzle.dy), reason: 'the shot arcs upward first');
+      expect(highest, lessThan(me.muzzle().dy), reason: 'the shot arcs upward first');
       ctrl.dispose();
     });
 
@@ -237,7 +237,7 @@ void main() {
       final ai = AiController(AiDifficulty.expert, seed: 1);
       final me = world.rafts.first;
       final shot = ai.plan(
-        from: me.muzzle,
+        from: me.muzzle(),
         targetPos: foe.crewPos(0),
         facing: 1,
         arsenal: [Weapons.starter],
@@ -245,7 +245,7 @@ void main() {
       );
 
       final landing = world.landingX(
-        from: me.muzzle, angleDeg: shot.angle, power: shot.power,
+        from: me.muzzle(aimAngleDeg: shot.angle), angleDeg: shot.angle, power: shot.power,
         facing: 1, weapon: shot.weapon,
       );
       expect((landing - foe.crewPos(0).dx).abs(), lessThan(160),

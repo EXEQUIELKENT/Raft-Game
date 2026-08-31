@@ -183,7 +183,7 @@ void main() {
 
       for (final power in [40.0, 70.0, 100.0]) {
         final dots = world.trajectory(
-          from: me.muzzle,
+          from: me.muzzle(),
           angleDeg: 45,
           power: power,
           facing: 1,
@@ -388,7 +388,7 @@ void main() {
       for (var angle = 10.0; angle <= 80.0; angle += 2.5) {
         for (var power = BattleConst.powerMin; power <= BattleConst.powerMax; power += 2.5) {
           final miss = (world.landingX(
-            from: me.muzzle,
+            from: me.muzzle(aimAngleDeg: angle),
             angleDeg: angle,
             power: power,
             facing: 1,

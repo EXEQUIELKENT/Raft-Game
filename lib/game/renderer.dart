@@ -57,6 +57,17 @@ class WorldRenderer {
     canvas.scale(scale);
     canvas.translate(-world.cam, 0);
 
+    // Screen shake: whole-scene jitter from impacts, while the world's
+    // shake energy decays. Two detuned sines read as a camera rattle rather
+    // than a slide.
+    if (world.shake > 0.3) {
+      final a = world.shake;
+      canvas.translate(
+        (sin(time * 53.3) + sin(time * 27.1) * 0.6) * a * 0.9,
+        (cos(time * 47.7) + sin(time * 33.2) * 0.6) * a * 0.5,
+      );
+    }
+
     _drawSky(canvas, time);
     _drawClouds(canvas, time);
     _drawProps(canvas, time);
@@ -725,8 +736,11 @@ class WorldRenderer {
     final aiming = isShooter && isAiming;
 
     // Firearm view: whichever projectile type is equipped defines the model
-    // geometry, the grip layout and the firing animation.
-    final wv = WeaponView.forCrew(crew.equipped ?? weapon?.id, weapon);
+    // geometry, the grip layout and the firing animation. Each crew member
+    // carries their own variant of the caliber (see [_variantSets]).
+    final equippedId = crew.equipped ?? weapon?.id;
+    final wv = WeaponView.forCrew(equippedId, weapon,
+        variant: WeaponView.variantForPhase(crew.bobPhase, equippedId ?? 'tennis'));
     final accent = Weapons.byId(wv.id).color;
 
     // Equip lift: 1 raised in the grip, 0 lowered to the hip mid-swap.
@@ -773,11 +787,17 @@ class WorldRenderer {
     const metal = Color(0xFF3B3F45);
 
     final gunSide = dir >= 0 ? 1.0 : -1.0;
+    // A survived torso hit gets a clutch: they stay on their feet, hunch
+    // over the wound and press it with the free hand while the wince plays.
+    final grabbing = crew.grabT > 0 && crew.alive;
     final leanBack = recoil * 0.16;
     // The upper-body block's common lean: recoil rocks the torso back about
-    // the hips, walking adds a slight forward hunch. Arms, torso, weapon and
-    // head all draw inside it so they pivot as one.
-    final lean = -leanBack * gunSide + crew.walkAmp * 0.04 * gunSide;
+    // the hips, walking adds a slight forward hunch, and a fresh torso hit
+    // doubles them over the wound. Arms, torso, weapon and head all draw
+    // inside it so they pivot as one.
+    final lean = -leanBack * gunSide +
+        crew.walkAmp * 0.04 * gunSide -
+        (grabbing ? 0.09 : 0) * gunSide;
     final hipBobWalk = sin(crew.walkPhase * pi * 2 * 2).abs() * 1.2 * crew.walkAmp;
 
     // ---- Legs ----
@@ -869,7 +889,10 @@ class WorldRenderer {
     // rest anywhere on the gun, including behind the grip. Long guns get
     // held short near the receiver, short guns right at the foregrip. At
     // the extreme it degenerates to a rear heft — which is how the
-    // cartoon-scale rig actually holds a cannon.
+    // cartoon-scale rig actually holds a cannon. The y is the fist's palm
+    // CENTRE ([WeaponView.supportPalmY]), not the barrel centre-line, so
+    // the solved wrist welds onto the drawn palm instead of stopping short
+    // above it.
     final pumpBack = pumpT * wv.pumpTravel;
     final suppAxis = Offset(cos(drawnAng), sin(drawnAng));
     final suppT = ArmIK.chokeUp(
@@ -880,8 +903,14 @@ class WorldRenderer {
       minT: wv.receiverX0 - wv.gripX,
       maxT: (wv.muzzleX - wv.gripX) * 0.85,
     );
-    final suppLocal = Offset(wv.gripX + suppT, wv.supportForeY);
-    final suppHand = toBody(suppLocal.dx, suppLocal.dy);
+    final suppLocal = Offset(wv.gripX + suppT, wv.supportPalmY);
+    var suppHand = toBody(suppLocal.dx, suppLocal.dy);
+
+    // Torso clutch: the free hand abandons its grip point and presses the
+    // wound instead — the lean above already doubles the body over it.
+    if (grabbing) {
+      suppHand = Offset(-gunSide * 3.5, shoulderY + torsoH * 0.66);
+    }
 
     // The hands only look right if the arms don't: both elbows break
     // downward/outward under the weapon's weight, solved in the same
@@ -954,18 +983,31 @@ class WorldRenderer {
       canvas.scale(1, gunSide);
       canvas.translate(-wv.gripX, -wv.gripY);
       _firearm(canvas, wv, accent, metal, pumpT: pumpT);
-      // Support hand (far side) closes first, then the firing hand sits
-      // over its grip on the near side. Layering both over the model is
-      // what reads as "barrel passing through a wrapped fist".
-      _gripFist(
-        canvas,
-        suppLocal,
-        skin,
-        wrap: wv.supportStyle == GripStyle.foregrip ? FistWrap.tube : FistWrap.stub,
-        tubeHalf: wv.barrelThickness / 2,
-        gripTopY: wv.stubTopY,
-        foregrip: wv.supportStyle == GripStyle.foregrip,
-      );
+      // Fists stay character-sized, but one closing on a mortar barrel
+      // reads a touch bigger than one on the pop pistol.
+      final handScale = (wv.bore / (2 * WeaponView.ballR)).clamp(1.0, 1.3);
+      final tubeHalf = wv.barrelThickness / 2;
+      final isTube = wv.supportStyle == GripStyle.foregrip;
+      final isTop = wv.supportStyle == GripStyle.topHandle;
+      // Support hand (far side) closes first — its palm centre is where
+      // the IK wrist landed — then the firing hand sits over its grip on
+      // the near side. Layering both over the model is what reads as
+      // "barrel passing through a wrapped fist". While a torso clutch has
+      // the free hand pressed to the wound, the weapon rides one-handed.
+      if (!grabbing) {
+        _gripFist(
+          canvas,
+          suppLocal,
+          skin,
+          wrap: isTube || isTop ? FistWrap.tube : FistWrap.stub,
+          tubeHalf: tubeHalf,
+          tubeCenterDy: isTube || isTop ? wv.supportPalmY.abs() : 0,
+          gripTopY: wv.stubTopY,
+          foregrip: isTube,
+          over: isTop,
+          scale: handScale,
+        );
+      }
       _gripFist(
         canvas,
         Offset(wv.gripX, wv.gripY),
@@ -973,6 +1015,7 @@ class WorldRenderer {
         wrap: FistWrap.stub,
         gripTopY: wv.stubTopY,
         thumb: true,
+        scale: handScale,
       );
       canvas.restore();
 
@@ -1005,6 +1048,31 @@ class WorldRenderer {
       }
     }
 
+    // The clutching hand pressed over the wound — drawn after the torso,
+    // before the injuries so the marks show around the pressed palm.
+    if (grabbing) {
+      final press = suppHandSolved;
+      canvas.drawCircle(press, 6.4, Paint()..color = skin);
+      canvas.drawLine(
+        press + const Offset(-3.4, 1.2), press + const Offset(3.4, 1.2),
+        Paint()
+          ..color = Colors.black.withOpacity(0.24)
+          ..strokeWidth = 1.3
+          ..strokeCap = StrokeCap.round,
+      );
+    }
+
+    // Bruises and cuts show off how much punishment they've taken.
+    _drawInjuries(
+      canvas,
+      crew,
+      torC: Offset(0, hipY - torsoH / 2),
+      legC: Offset((feet[0].dx + feet[1].dx) / 2, footY + 2),
+      armC: Offset(gunSide * 4, shoulderY + 14),
+      headC: headC,
+      dir: dir,
+    );
+
     // ---- Head ----
     final headC2 = headC + Offset(-recoil * 2.5 * gunSide, recoil * 2.6);
     canvas.drawCircle(headC2, headR, Paint()..color = skin);
@@ -1015,10 +1083,10 @@ class WorldRenderer {
     );
 
     // Face: expression-driven by combat state — see [_face]. Lining up a
-    // shot (aiming, before the recoil hits) reads as a bit of idle
-    // chatter/taunting; the recoil snap itself grits the teeth instead.
+    // shot is a focused squint, not chatter; the recoil itself grits the
+    // teeth, and idle fidgets only surface when nothing is urgent.
     _face(canvas, headC2, headR, dir, crew,
-        time: time, talking: aiming && recoil <= 0, firing: recoil > 0.55);
+        time: time, aiming: aiming, firing: recoil > 0);
 
     _headgear(canvas, raft.look, headC2, headR, dir);
 
@@ -1050,21 +1118,26 @@ class WorldRenderer {
   ///   grip point, three knuckle creases on the muzzle-facing side, and a
   ///   thumb running up the stub to press under the receiver ([gripTopY]).
   ///   The stub pokes out above and below the fist.
-  /// - [FistWrap.tube]: around the barrel/foregrip — [at] is a point on the
-  ///   tube's centre-line; the palm hangs below it and three finger bands
-  ///   curl up OVER the tube (with visible shaft segments between them), so
-  ///   the tube reads as passing through a closed hand.
-  /// [scale] grows the whole hand slightly for fatter tubes — a fist
-  /// gripping a 14-unit mortar barrel shouldn't look like the fist on a
-  /// 9-unit pistol.
+  /// - [FistWrap.tube]: around the barrel/foregrip — [at] is the fist's
+  ///   palm centre, hanging [tubeCenterDy] below the tube's centre-line
+  ///   (exactly where the IK wrist lands); the palm tucks under the shaft
+  ///   and three finger bands curl up OVER the tube (with visible shaft
+  ///   segments between them), so the tube reads as passing through a
+  ///   closed hand. With [over] the palm rides on TOP of the tube instead
+  ///   (carry-handle holds) and the bands curl down over it.
+  /// [scale] grows the whole fist slightly for fatter tubes — a fist
+  /// gripping a 16-unit mortar barrel shouldn't look like the fist on a
+  /// 10-unit pop gun.
   void _gripFist(
     Canvas canvas,
     Offset at,
     Color skin, {
     required FistWrap wrap,
     double tubeHalf = 0,
+    double tubeCenterDy = 0,
     double gripTopY = 0,
     bool foregrip = false,
+    bool over = false,
     bool thumb = false,
     double scale = 1.0,
   }) {
@@ -1076,35 +1149,37 @@ class WorldRenderer {
 
     if (wrap == FistWrap.stub) {
       // Palm around the grip stub, centered on the grip point.
-      _fistBody(canvas, at, 9.5, 8.6, skin);
+      _fistBody(canvas, at, 10.5 * scale, 9.2, skin);
       // Knuckle creases on the muzzle-facing side of the palm.
-      canvas.drawLine(at + const Offset(0.6, -2.2), at + const Offset(4.7, -2.4), crease);
-      canvas.drawLine(at + const Offset(0.9, -0.4), at + const Offset(4.9, -0.6), crease);
-      canvas.drawLine(at + const Offset(0.9, 1.8), at + const Offset(4.7, 1.6), crease);
+      canvas.drawLine(at + Offset(0.6 * scale, -2.4), at + Offset(4.9 * scale, -2.6), crease);
+      canvas.drawLine(at + Offset(0.9 * scale, -0.4), at + Offset(5.1 * scale, -0.6), crease);
+      canvas.drawLine(at + Offset(0.9 * scale, 1.6), at + Offset(4.9 * scale, 1.4), crease);
       if (thumb) {
         // Thumb running up the stub to brace under the receiver.
         final top = gripTopY > 0 ? gripTopY + 0.6 : at.dy - 4.6;
         canvas.drawRRect(
           RRect.fromRectAndRadius(
-            Rect.fromLTWH(at.dx + 1.5, top, 4.3, (at.dy + 1.4) - top),
+            Rect.fromLTWH(at.dx + 1.4, top, 4.4 * scale, (at.dy + 1.4) - top),
             const Radius.circular(1.9),
           ),
           Paint()..color = skin,
         );
       }
     } else {
-      // Palm mass hanging just under the tube.
-      _fistBody(canvas, at + Offset(0, tubeHalf * 0.55 + 2.2), 10.5 * scale,
-          7.4, skin);
-      // Fingers curling up over the barrel — bands crossing the tube with
+      // Palm mass against the tube — [at] IS the palm centre, so the
+      // solved wrist welds straight onto it. Under-barrel holds tuck the
+      // palm below the shaft; carry-handle holds ride above it.
+      _fistBody(canvas, at, 11.0 * scale, 8.6, skin);
+      // Fingers curling over the barrel — bands from just past the tube's
+      // far edge down into the palm (or mirrored, for a top grip), with
       // visible tube segments poking through between them.
-      for (final fx in [-3.0, -0.2, 2.6]) {
-        final top = at.dy - tubeHalf - 1.7;
-        final bottom = at.dy + tubeHalf + 2.4;
+      final bandTop = over ? at.dy - 2.2 : at.dy - tubeCenterDy - tubeHalf - 1.7;
+      final bandBottom = over ? at.dy + tubeCenterDy + tubeHalf + 1.7 : at.dy + 2.2;
+      for (final fx in [-3.2, -0.1, 3.0]) {
         canvas.drawRRect(
           RRect.fromRectAndRadius(
-            Rect.fromLTWH(at.dx + fx * scale - 1.3, top, 2.7 * scale, bottom - top),
-            const Radius.circular(1.3),
+            Rect.fromLTWH(at.dx + fx * scale - 1.4, bandTop, 2.8 * scale, bandBottom - bandTop),
+            const Radius.circular(1.4),
           ),
           Paint()..color = shade,
         );
@@ -1114,7 +1189,7 @@ class WorldRenderer {
         canvas.drawRRect(
           RRect.fromRectAndRadius(
             Rect.fromCenter(
-              center: at + Offset(4.6, tubeHalf + 1.6),
+              center: at + Offset(5.0 * scale, 0.4),
               width: 4.6,
               height: 3.0,
             ),
@@ -1125,7 +1200,6 @@ class WorldRenderer {
       }
     }
   }
-
   /// The equipped firearm, drawn in weapon-local coordinates: origin at the
   /// trigger grip, +x toward the muzzle, +y down. A blunderbuss silhouette
   /// sized by the [WeaponView]: a slim shaft barrel flaring into a bell
@@ -1176,6 +1250,27 @@ class WorldRenderer {
       ),
       Paint()..color = metal,
     );
+    // Top-light along the shaft so the tube reads round, not flat.
+    canvas.drawLine(
+      Offset(wv.barrelX0 + 1.5, -t / 2 + 1.2),
+      Offset(wv.barrelX1 - 1.5, -t / 2 + 1.2),
+      Paint()
+        ..color = Colors.white.withOpacity(0.25)
+        ..strokeWidth = 1.6
+        ..strokeCap = StrokeCap.round,
+    );
+
+    // Wooden handguard furniture over the front of the shaft (AK pattern).
+    if (wv.woodFurniture) {
+      canvas.drawRRect(
+        RRect.fromRectAndRadius(
+          Rect.fromLTWH(wv.barrelX0 + 1, -t / 2 - 1.2,
+              (wv.barrelX1 - wv.barrelX0) * 0.62, t + 2.4),
+          const Radius.circular(2.5),
+        ),
+        Paint()..color = wood,
+      );
+    }
 
     // Bell mouth: the flare that matches the muzzle to the round's size.
     final bell = Path()
@@ -1228,6 +1323,15 @@ class WorldRenderer {
       ),
       Paint()..color = metal,
     );
+    // Caliber accent band on the receiver, tying the gun to its round.
+    canvas.drawRRect(
+      RRect.fromRectAndRadius(
+        Rect.fromLTWH(wv.receiverX0 + 1.5, -wv.receiverHalf + 2.0,
+            wv.receiverX1 - wv.receiverX0 - 3.0, 2.6),
+        const Radius.circular(1.3),
+      ),
+      Paint()..color = accent.withOpacity(0.85),
+    );
 
     // Pump slide — hangs under the shaft, runs its cycle rearward on fire
     // (the support-hand target tracks the same offset).
@@ -1258,11 +1362,44 @@ class WorldRenderer {
     // right next to a wide gun.
     canvas.drawRRect(
       RRect.fromRectAndRadius(
-        Rect.fromLTWH(wv.gripX - 3.4, wv.stubTopY, 6.8, 9.8),
-        const Radius.circular(2.8),
+        Rect.fromLTWH(wv.gripX - 3.8, wv.stubTopY, 7.6, 10.4),
+        const Radius.circular(3),
       ),
       Paint()..color = const Color(0xFF23262B),
     );
+
+    // Carry handle above the barrel (top-handle holds grip this).
+    if (wv.handleX > 0) {
+      final railY = -t / 2 - 4.6;
+      canvas.drawLine(
+        Offset(wv.handleX - 3.2, -t / 2), Offset(wv.handleX - 3.2, railY),
+        Paint()..color = const Color(0xFF23262B)..strokeWidth = 2.4,
+      );
+      canvas.drawLine(
+        Offset(wv.handleX + 3.2, -t / 2), Offset(wv.handleX + 3.2, railY),
+        Paint()..color = const Color(0xFF23262B)..strokeWidth = 2.4,
+      );
+      canvas.drawRRect(
+        RRect.fromRectAndRadius(
+          Rect.fromLTWH(wv.handleX - 4.6, railY - 1.6, 9.2, 3.0),
+          const Radius.circular(1.5),
+        ),
+        Paint()..color = const Color(0xFF23262B),
+      );
+    }
+
+    // Rifle front sight post (AK-pattern models).
+    if (wv.sightX > 0) {
+      final paint = Paint()
+        ..color = const Color(0xFF23262B)
+        ..strokeWidth = 2.0
+        ..strokeCap = StrokeCap.round;
+      canvas.drawLine(Offset(wv.sightX, -t / 2), Offset(wv.sightX, -t / 2 - 4.6), paint);
+      canvas.drawLine(
+        Offset(wv.sightX - 2.2, -t / 2 - 4.6), Offset(wv.sightX + 2.2, -t / 2 - 4.6),
+        paint,
+      );
+    }
   }
 
   /// Draws a crew member straight from their live ragdoll pose: limbs are
@@ -1305,9 +1442,24 @@ class WorldRenderer {
       canvas.restore();
     }
 
-    // Support arm behind the torso.
-    limbTo(pose.neck, pose.handL, 8.5, suit);
-    canvas.drawCircle(pose.handL.pos, 5.0, Paint()..color = skin);
+    // Support arm behind the torso — unless a torso hit left them clutching
+    // the wound, in which case the hand grabs the spot instead of flailing.
+    if (crew.grabT > 0) {
+      final grab = (pose.neck.pos + pose.hip.pos) / 2 +
+          Offset(dir >= 0 ? 4 : -4, 2);
+      _limb(canvas, pose.neck.pos, grab, 8.5, suit);
+      canvas.drawCircle(grab, 5.2, Paint()..color = skin);
+      canvas.drawLine(
+        grab + const Offset(-2.4, 0), grab + const Offset(2.4, 0),
+        Paint()
+          ..color = Colors.black.withOpacity(0.2)
+          ..strokeWidth = 1.4
+          ..strokeCap = StrokeCap.round,
+      );
+    } else {
+      _limb(canvas, pose.neck.pos, pose.handL.pos, 8.5, suit);
+      canvas.drawCircle(pose.handL.pos, 5.0, Paint()..color = skin);
+    }
 
     // Torso: a rounded slab spanning neck→hip, oriented along the spine —
     // same shape and shading band as the standing body.
@@ -1342,7 +1494,9 @@ class WorldRenderer {
     // dropping it.
     limbTo(pose.neck, pose.handR, 8.5, suit);
     if (weapon != null || crew.equipped != null) {
-      final wv = WeaponView.forCrew(crew.equipped ?? weapon?.id, weapon);
+      final equippedId = crew.equipped ?? weapon!.id;
+      final wv = WeaponView.forCrew(equippedId, weapon,
+          variant: WeaponView.variantForPhase(crew.bobPhase, equippedId));
       final aim = pose.handR.pos - pose.handL.pos;
       final u = aim.distance > 1 ? aim / aim.distance : Offset(dir, 0);
       canvas.save();
@@ -1352,7 +1506,7 @@ class WorldRenderer {
       canvas.translate(-wv.gripX, -wv.gripY);
       _firearm(canvas, wv, Weapons.byId(wv.id).color, metal);
       // The firing hand stays wrapped around the grip mid-tumble — same
-      // fist, same frame as the standing pose.
+      // fist, same frame and caliber scale as the standing pose.
       _gripFist(
         canvas,
         Offset(wv.gripX, wv.gripY),
@@ -1360,18 +1514,36 @@ class WorldRenderer {
         wrap: FistWrap.stub,
         gripTopY: wv.stubTopY,
         thumb: true,
+        scale: (wv.bore / (2 * WeaponView.ballR)).clamp(1.0, 1.3),
       );
       canvas.restore();
     }
+
+    // Bruises and cuts show off how much punishment they've taken.
+    _drawInjuries(
+      canvas,
+      crew,
+      torC: (pose.neck.pos + pose.hip.pos) / 2,
+      legC: (pose.footL.pos + pose.footR.pos) / 2,
+      armC: (pose.handL.pos + pose.handR.pos) / 2,
+      headC: pose.head.pos,
+      dir: dir,
+    );
 
     // Head, tilted with the spine so a snapped-back head reads — the full
     // face and headgear, same as standing, so the ragdoll is unmistakably
     // the same character mid-tumble rather than a simplified stand-in.
     final hAxis = pose.head.pos - pose.neck.pos;
-    final hAng = atan2(hAxis.dy, hAxis.dx) + pi / 2;
+    var hAng = atan2(hAxis.dy, hAxis.dx) + pi / 2; // 0 = upright, π = inverted
+    // Never draw the face upside down: wrap the tilt to the *closest*
+    // upright orientation, so a body mid-backflip shows a face that reads
+    // as a wobble rather than an inverted skull. Fully upside-down bodies
+    // snap the head back near upright, exactly like a cartoony knockdown.
+    while (hAng > pi / 2) hAng -= pi;
+    while (hAng < -pi / 2) hAng += pi;
     canvas.save();
     canvas.translate(pose.head.pos.dx, pose.head.pos.dy);
-    canvas.rotate(hAng * 0.4);
+    canvas.rotate(hAng * 0.6);
     const headR = 14.0;
     canvas.drawCircle(Offset.zero, headR, Paint()..color = skin);
     canvas.drawArc(
@@ -1382,7 +1554,8 @@ class WorldRenderer {
     // Face: same expression logic as standing — a knockdown almost always
     // comes with a live [Crew.hitReactT], so the wince that triggered the
     // tumble is exactly what's still showing while the body flies.
-    _face(canvas, Offset.zero, headR, dir, crew, time: time, talking: false, firing: false);
+    _face(canvas, Offset.zero, headR, dir, crew,
+        time: time, aiming: false, firing: false);
     _headgear(canvas, raft.look, Offset.zero, headR, dir);
     canvas.restore();
   }
@@ -1392,20 +1565,23 @@ class WorldRenderer {
   /// ragdoll so a knocked-down character keeps reading as the exact same
   /// crew member, expression included, mid-tumble.
   ///
-  /// The expression is driven entirely by the crew member's live combat
-  /// state, highest priority first:
+  /// The expression is driven by the crew member's live combat state,
+  /// highest priority first:
   ///  1. dead — X eyes, same as before.
   ///  2. [Crew.hitReactT] > 0 — a pained wince, set the instant a hit is
   ///     survived (see [BattleWorld._resolve]); this is what a ragdoll shows
   ///     while it's still being thrown by the blow that triggered it.
-  ///  3. [firing] — gritted teeth on the sharp end of their own recoil.
+  ///  3. [firing] — gritted teeth for the whole recoil: the mouth is busy
+  ///     with effort, never with chatter.
   ///  4. [Crew.gloatT] > 0 — a satisfied grin the instant their own shot
   ///     lands on an enemy.
-  ///  5. low HP with nothing more urgent happening — a worried look, and a
-  ///     faster, nervier blink.
-  ///  6. otherwise — a neutral idle face: periodic blinking, and (while
-  ///     [talking]) a flapping mouth so lining up a shot doesn't read as a
-  ///     frozen photo.
+  ///  5. [aiming] — a focused squint: narrowed eyes, furrowed brows, a firm
+  ///     mouth. Deliberately silent — lining up a shot is concentration.
+  ///  6. low HP — a worried look and a faster, nervier blink.
+  ///  7. an idle micro-activity ([Crew.idle]) — yawn, whistle (with floating
+  ///     music notes), brief chatter, a wandering gaze, or a brow waggle
+  ///     with a smirk — whatever [Crew.updateIdle] last picked.
+  ///  8. otherwise — a neutral idle face with periodic blinking.
   void _face(
     Canvas canvas,
     Offset origin,
@@ -1413,18 +1589,33 @@ class WorldRenderer {
     double dir,
     Crew crew, {
     required double time,
-    required bool talking,
+    required bool aiming,
     required bool firing,
   }) {
     final dead = !crew.alive;
     final pain = dead ? 0.0 : (crew.hitReactT / BattleConst.hitReactTime).clamp(0.0, 1.0);
     final gloat = dead || pain > 0 ? 0.0 : (crew.gloatT / BattleConst.gloatTime).clamp(0.0, 1.0);
     final lowHp = !dead && pain <= 0 && gloat <= 0 && crew.hpFrac < BattleConst.lowHpFace;
+    // Idle fidgets only surface when nothing more urgent is on the face —
+    // and the active shooter keeps a straight face while aiming (the world
+    // also stops picking new activities for them).
+    final idleAct = (!dead && pain <= 0 && gloat <= 0 && !aiming && !firing)
+        ? crew.idle
+        : CrewIdle.none;
+    // 0..1 progress through the current activity, so expressions can ease
+    // in and out over its lifetime.
+    final idleK = idleAct == CrewIdle.none
+        ? 0.0
+        : (1 - (crew.idleT / (crew.idleDur == 0 ? 1 : crew.idleDur))).clamp(0.0, 1.0);
+    final yawnEnv = idleAct == CrewIdle.yawn ? sin(pi * idleK) : 0.0;
+    final wag =
+        idleAct == CrewIdle.browWaggle ? sin(time * 7 + crew.bobPhase * 4) : 0.0;
 
     // Blink: a short, sharp close on a per-character cycle (offset by
     // [Crew.bobPhase] so the crew doesn't blink in lockstep) rather than any
     // extra state — low HP roughly doubles the rate, a nervous flutter, and
-    // a pained or dead face never blinks over itself.
+    // a pained or dead face never blinks over itself. A yawn squeezes the
+    // lids shut with the same envelope as the mouth.
     double blink = 0;
     if (!dead && pain <= 0) {
       final period = lowHp ? 1.7 : 3.4;
@@ -1432,6 +1623,7 @@ class WorldRenderer {
       const closeDur = 0.11;
       if (phase < closeDur) blink = sin((phase / closeDur) * pi);
     }
+    if (yawnEnv > 0) blink = max(blink, yawnEnv * 0.9);
 
     // ---- Brows ----
     final browPaint = Paint()
@@ -1446,6 +1638,20 @@ class WorldRenderer {
       // Drawn down flat over the eyes — a grimace of effort.
       canvas.drawLine(origin + const Offset(-8, -6.8), origin + const Offset(-2.5, -5.2), browPaint);
       canvas.drawLine(origin + const Offset(2.5, -5.2), origin + const Offset(8, -6.8), browPaint);
+    } else if (aiming) {
+      // Furrowed in concentration — inner ends pulled down toward the nose.
+      canvas.drawLine(origin + const Offset(-8, -4.6), origin + const Offset(-2.5, -6.2), browPaint);
+      canvas.drawLine(origin + const Offset(2.5, -6.2), origin + const Offset(8, -4.6), browPaint);
+    } else if (idleAct == CrewIdle.yawn) {
+      // Raised high — sleepy surprise.
+      canvas.drawLine(origin + const Offset(-8, -6.4), origin + const Offset(-2.5, -8.2), browPaint);
+      canvas.drawLine(origin + const Offset(2.5, -8.2), origin + const Offset(8, -6.4), browPaint);
+    } else if (idleAct == CrewIdle.browWaggle) {
+      // Alternating bobs — the well-well-well.
+      final l = wag * 2.2;
+      final r = -wag * 2.2;
+      canvas.drawLine(origin + Offset(-8, -5 + l), origin + Offset(-2.5, -6.5 + l), browPaint);
+      canvas.drawLine(origin + Offset(2.5, -6.5 + r), origin + Offset(8, -5 + r), browPaint);
     } else if (lowHp) {
       // Inner ends lift — the classic worried tent.
       canvas.drawLine(origin + const Offset(-8, -6.5), origin + const Offset(-2.5, -4.2), browPaint);
@@ -1456,9 +1662,23 @@ class WorldRenderer {
     }
 
     // ---- Eyes ----
+    // Where the pupils sit: pinned toward the enemy while aiming (through a
+    // squint), wandering side to side while idly looking around, otherwise
+    // tracking the facing direction with the blink dip.
+    Offset pupilShift;
+    double squint = 0;
+    if (aiming) {
+      pupilShift = Offset(dir * 0.8, 1.0);
+      squint = 0.42;
+    } else if (idleAct == CrewIdle.lookAround) {
+      final scan = sin(time * 2.8 + crew.bobPhase * 3);
+      pupilShift = Offset(dir * 1.0 + scan * 2.6, 1.0 * (1 - blink));
+    } else {
+      pupilShift = Offset(dir * 1.0, 1.2 * (1 - blink));
+    }
     for (final ex in [-4.4, 4.4]) {
       final c = origin + Offset(ex, 0);
-      final openH = dead ? 9.0 : max(0.8, 9.0 * (1 - blink * 0.94));
+      final openH = dead ? 9.0 : max(0.8, 9.0 * (1 - blink * 0.94) * (1 - squint));
       canvas.drawOval(
         Rect.fromCenter(center: c, width: 7.5, height: openH),
         Paint()..color = Colors.white,
@@ -1487,7 +1707,7 @@ class WorldRenderer {
       }
       if (blink > 0.6) continue; // lids fully down — nothing more to draw
       canvas.drawCircle(
-        c + Offset(dir * 1.0, 1.2 * (1 - blink)),
+        c + pupilShift,
         2.2,
         Paint()..color = RT.ink,
       );
@@ -1542,13 +1762,49 @@ class WorldRenderer {
         Rect.fromCenter(center: origin + const Offset(0, 10), width: 4.4, height: 4.4),
         Paint()..color = mouthColor,
       );
-    } else if (talking) {
-      // Flapping open/closed — a bit of idle chatter/taunting while lined
-      // up to fire, so the aiming pause doesn't read as a frozen photo.
+    } else if (yawnEnv > 0) {
+      // The big slow yawn — a tall oval that blooms, then closes.
+      canvas.drawOval(
+        Rect.fromCenter(
+          center: origin + const Offset(0, 10.5),
+          width: 6.5,
+          height: 2.2 + yawnEnv * 7.5,
+        ),
+        Paint()..color = RT.ink.withOpacity(0.7),
+      );
+    } else if (idleAct == CrewIdle.whistle) {
+      // Puckered lips, with two little notes drifting off the mouth.
+      canvas.drawOval(
+        Rect.fromCenter(center: origin + const Offset(0, 10), width: 3.4, height: 3.8),
+        Paint()..color = RT.ink.withOpacity(0.75),
+      );
+      _musicNotes(canvas, origin, dir, headR, time);
+    } else if (idleAct == CrewIdle.chatter) {
+      // A brief bout of idle chatter — flapping open/closed, so the deck
+      // doesn't read as a row of frozen mannequins.
       final open = sin(time * 11 + crew.bobPhase * 5).abs();
       canvas.drawOval(
         Rect.fromCenter(center: origin + const Offset(0, 10), width: 8, height: 2.4 + open * 4.2),
         Paint()..color = RT.ink.withOpacity(0.7),
+      );
+    } else if (lowHp) {
+      // A tiny worried "o".
+      canvas.drawOval(
+        Rect.fromCenter(center: origin + const Offset(0, 10), width: 4.4, height: 4.4),
+        Paint()..color = mouthColor,
+      );
+    } else if (idleAct == CrewIdle.browWaggle) {
+      // A lopsided smirk to match the waggle.
+      final path = Path()
+        ..moveTo(origin.dx - 4.6, origin.dy + 10.2)
+        ..quadraticBezierTo(origin.dx + 1, origin.dy + 8.4, origin.dx + 5, origin.dy + 9.2);
+      canvas.drawPath(
+        path,
+        Paint()
+          ..color = mouthColor
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = 2.2
+          ..strokeCap = StrokeCap.round,
       );
     } else {
       canvas.drawRRect(
@@ -1558,6 +1814,84 @@ class WorldRenderer {
         ),
         Paint()..color = mouthColor,
       );
+    }
+  }
+
+  /// Bruises and cuts across the whole body, scaled by how much HP the
+  /// crew member has lost ([Crew.injuryLevel]). Marks are jittered per
+  /// character (from their [Crew.bobPhase]) so the same character shows the
+  /// same scars, but they never match their raft mates. Drawn in the
+  /// caller's current canvas space — body-local for a standing crew member,
+  /// station-local for a ragdoll.
+  void _drawInjuries(
+    Canvas canvas,
+    Crew crew, {
+    required Offset torC,
+    required Offset legC,
+    required Offset armC,
+    required Offset headC,
+    required double dir,
+  }) {
+    final level = crew.injuryLevel;
+    if (level <= 0) return;
+    final rng = Random((crew.bobPhase * 1000).round() ^ 0xC0FFEE);
+    double rx(double spread) => rng.nextDouble() * spread - spread / 2;
+
+    final bruise = Paint()..color = const Color(0xFF6D3B8E).withOpacity(0.5);
+    final dark = Paint()..color = const Color(0xFF4A2470).withOpacity(0.45);
+    final cut = Paint()
+      ..color = const Color(0xFFC0392B).withOpacity(0.8)
+      ..strokeWidth = 1.5
+      ..strokeCap = StrokeCap.round;
+
+    // Bruise spots: one on the torso when scuffed, an arm/leg when worse,
+    // and a shiner on the cheek when properly battered.
+    final spots = <(Offset, double)>[
+      (torC + Offset(rx(8), rx(6)), rng.nextDouble() * 2.2 + 2.0),
+      if (level >= 2)
+        (legC + Offset(rx(6), rx(3)), rng.nextDouble() * 2.2 + 1.8),
+      if (level >= 2)
+        (armC + Offset(rx(5), rx(4)), rng.nextDouble() * 2.0 + 1.6),
+      if (level >= 3)
+        (headC + Offset(dir * 3.2 + rx(2), rx(3) + 1), rng.nextDouble() * 1.8 + 1.4),
+      if (level >= 3)
+        (torC + Offset(rx(10), rx(6)), rng.nextDouble() * 2.0 + 1.8),
+    ];
+    for (final (at, r) in spots) {
+      canvas.drawCircle(at, r, bruise);
+      canvas.drawCircle(at + Offset(0.5, 0.4), r * 0.55, dark);
+    }
+
+    // Cuts appear once they're properly hurt, another when battered.
+    if (level >= 2) {
+      final c = torC + Offset(rx(6), rx(4));
+      canvas.drawLine(c + const Offset(-2.4, -1), c + const Offset(2.4, 1), cut);
+    }
+    if (level >= 3) {
+      final c = legC + Offset(rx(5), 1.2);
+      canvas.drawLine(c + const Offset(-2.2, -0.8), c + const Offset(2.2, 0.9), cut);
+    }
+  }
+
+  /// Two little music notes drifting up from a whistling mouth — drawn in
+  /// the face's head-local space, fading as they rise.
+  void _musicNotes(Canvas canvas, Offset origin, double dir, double headR, double time) {
+    for (final k in [0.0, 0.45]) {
+      final rise = (time * 10 + k * 12) % 12;
+      final a = (1 - rise / 12).clamp(0.0, 1.0);
+      final paint = Paint()
+        ..color = RT.ink.withOpacity(0.5 * a)
+        ..strokeWidth = 1.4
+        ..style = PaintingStyle.stroke
+        ..strokeCap = StrokeCap.round;
+      final c = origin +
+          Offset(
+            dir * (headR * 0.85 + 3) + sin(time * 3 + k * 5) * 1.5,
+            -headR * 0.3 - rise - k * 3,
+          );
+      canvas.drawCircle(c, 1.8, paint);
+      canvas.drawLine(c + const Offset(1.6, -0.6), c + const Offset(1.6, -6.2), paint);
+      canvas.drawLine(c + const Offset(1.6, -6.2), c + const Offset(4.0, -7.4), paint);
     }
   }
 
@@ -1649,7 +1983,7 @@ class WorldRenderer {
         Paint()..color = s.weapon.color.withOpacity(t * 0.4),
       );
     }
-    final r = 9 * s.weapon.weight;
+    final r = WeaponView.ballR * s.weapon.weight;
     canvas.drawCircle(s.pos, r + 2, Paint()..color = Colors.black.withOpacity(0.18));
     canvas.drawCircle(s.pos, r, Paint()..color = s.weapon.color);
   }
@@ -1659,20 +1993,15 @@ class WorldRenderer {
       final p = fx.progress;
       switch (fx.kind) {
         case 'boom':
+          // The gradient is cached on the fx (progress-bucketed); drawing a
+          // unit-radius circle through a scaled transform skips the per-frame
+          // shader rebuild that hitched on explosive volleys.
           final radius = fx.size * (0.25 + p * 1.35);
-          canvas.drawCircle(
-            fx.pos,
-            radius,
-            Paint()
-              ..shader = RadialGradient(
-                colors: [
-                  Colors.white.withOpacity(1 - p),
-                  const Color(0xFFFFB347).withOpacity((1 - p) * 0.85),
-                  const Color(0x00FF7A3C),
-                ],
-                stops: const [0.0, 0.55, 1.0],
-              ).createShader(Rect.fromCircle(center: fx.pos, radius: radius)),
-          );
+          canvas.save();
+          canvas.translate(fx.pos.dx, fx.pos.dy);
+          canvas.scale(radius);
+          canvas.drawCircle(Offset.zero, 1, fx.paintFor(radius));
+          canvas.restore();
           break;
         case 'splash':
           canvas.drawOval(
@@ -1685,6 +2014,50 @@ class WorldRenderer {
               ..color = Colors.white.withOpacity((1 - p) * 0.7)
               ..style = PaintingStyle.stroke
               ..strokeWidth = 3,
+          );
+          break;
+        case 'shock':
+          // Expanding blast ring — a squashed ellipse so it reads as a
+          // pressure wave skimming the deck/water.
+          final sr = fx.size * (0.15 + p * 0.85);
+          canvas.drawOval(
+            Rect.fromCenter(
+              center: fx.pos,
+              width: sr * 2,
+              height: sr,
+            ),
+            Paint()
+              ..color = Colors.white.withOpacity((1 - p) * 0.7)
+              ..style = PaintingStyle.stroke
+              ..strokeWidth = (1 - p) * 4 + 1.5,
+          );
+          canvas.drawOval(
+            Rect.fromCenter(
+              center: fx.pos,
+              width: sr * 1.3,
+              height: sr * 0.65,
+            ),
+            Paint()
+              ..color = fx.color.withOpacity((1 - p) * 0.35)
+              ..style = PaintingStyle.stroke
+              ..strokeWidth = (1 - p) * 3 + 1,
+          );
+          break;
+        case 'fire':
+          // Hot fireball core — same cached-gradient path as 'boom'.
+          final fr = fx.size * (0.4 + p * 1.1);
+          canvas.save();
+          canvas.translate(fx.pos.dx, fx.pos.dy);
+          canvas.scale(fr);
+          canvas.drawCircle(Offset.zero, 1, fx.paintFor(fr));
+          canvas.restore();
+          break;
+        case 'spark':
+          // An ember thrown out of the blast.
+          canvas.drawCircle(
+            fx.pos,
+            1.2 + 2.2 * (1 - p),
+            Paint()..color = fx.color.withOpacity((1 - p) * 0.85),
           );
           break;
       }

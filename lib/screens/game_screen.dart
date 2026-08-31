@@ -331,7 +331,8 @@ class _GameScreenState extends State<GameScreen> {
                 ),
               ),
               SafeArea(child: _buildHud()),
-              if (_charging && _dragCurrent != null) _pullReadout(),
+              if (ctrl.phase == GamePhase.aiming && ctrl.canHumanAct)
+                _pullReadout(),
               if (ctrl.phase == GamePhase.gameOver) _buildResult(),
             ],
           ),
@@ -553,32 +554,54 @@ class _GameScreenState extends State<GameScreen> {
     );
   }
 
-  /// The Force/Angle readout, drawn at the finger while dragging — a white
-  /// rounded card with the two stats side by side and a thin divider
-  /// between them, matching the aiming pop-up from the reference design.
+  /// The Force/Angle readout — a white rounded card with the two stats side
+  /// by side and a thin divider between them, fixed at the TOP-LEFT of the
+  /// character who is lining up the shot, mirroring the aiming pop-up from
+  /// the reference design. It stays put (it does not follow the drag
+  /// gesture) so the numbers are always readable in the same place while
+  /// you pull.
   Widget _pullReadout() {
-    final p = _dragCurrent!;
+    final raft = ctrl.currentRaft;
+    final screen = MediaQuery.sizeOf(context);
+    final scale = screen.height / BattleConst.worldH;
+    final cam = ctrl.world.cam;
+    // Anchor on the shooter's head — a little above-and-left of the crew
+    // member currently taking the turn.
+    double worldX = 0, worldY = 0;
+    if (raft != null && raft.activeIndex >= 0 && raft.activeIndex < raft.crew.length) {
+      final head = raft.crewPos(raft.activeIndex) - const Offset(0, 30);
+      worldX = head.dx;
+      worldY = head.dy;
+    }
+    final sx = (worldX - cam) * scale;
+    final sy = worldY * scale;
+    // Compact card — it floats over the action, so it stays small and never
+    // covers the shooter or the pull gesture.
+    final cardW = 152.0;
+    final cardH = 50.0;
+    final left = (sx - cardW + 8).clamp(8.0, (screen.width - cardW - 8).clamp(8.0, screen.width));
+    final top = (sy - cardH - 10).clamp(8.0, screen.height - cardH - 8);
     return Positioned(
-      left: p.dx - 96,
-      top: p.dy - 118,
+      left: left,
+      top: top,
       child: IgnorePointer(
         child: Container(
-          padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 14),
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 9),
           decoration: BoxDecoration(
             color: Colors.white,
-            borderRadius: BorderRadius.circular(22),
+            borderRadius: BorderRadius.circular(16),
             boxShadow: const [
-              BoxShadow(color: Color(0x33000000), offset: Offset(0, 6), blurRadius: 14),
+              BoxShadow(color: Color(0x26000000), offset: Offset(0, 4), blurRadius: 10),
             ],
           ),
           child: Row(
             mainAxisSize: MainAxisSize.min,
             children: [
-              _forceAngleStat('${ctrl.aimPower.round()}%', ctrl.aimFine ? 'FINE FORCE' : 'FORCE'),
+              _forceAngleStat('${ctrl.aimPower.round()}%', ctrl.aimFine ? 'FINE' : 'FORCE'),
               Container(
-                width: 1.4,
-                height: 34,
-                margin: const EdgeInsets.symmetric(horizontal: 16),
+                width: 1.2,
+                height: 22,
+                margin: const EdgeInsets.symmetric(horizontal: 10),
                 color: RT.ink.withOpacity(0.12),
               ),
               _forceAngleStat('${ctrl.aimAngle.round()}°', 'ANGLE'),
@@ -593,10 +616,10 @@ class _GameScreenState extends State<GameScreen> {
     return Column(
       mainAxisSize: MainAxisSize.min,
       children: [
-        Text(value, style: RT.chunky(size: 24, color: RT.ink)),
-        const SizedBox(height: 2),
+        Text(value, style: RT.chunky(size: 16, color: RT.ink)),
+        const SizedBox(height: 1),
         Text(label,
-            style: RT.body(size: 10, color: RT.ink.withOpacity(0.45), weight: FontWeight.w800, letterSpacing: 1.2)),
+            style: RT.body(size: 8, color: RT.ink.withOpacity(0.45), weight: FontWeight.w800, letterSpacing: 1.2)),
       ],
     );
   }
@@ -772,7 +795,9 @@ class _ScenePainter extends CustomPainter {
     final raft = ctrl.currentRaft;
     if (raft == null) return;
     final dots = ctrl.world.trajectory(
-      from: raft.muzzle,
+      // Same origin the shot will actually spawn from (the drawn muzzle at
+      // the live aim angle), so the dots lie exactly on the flight path.
+      from: raft.muzzle(aimAngleDeg: ctrl.aimAngle, weapon: ctrl.selectedWeapon),
       angleDeg: ctrl.aimAngle,
       power: ctrl.aimPower,
       facing: raft.facing,

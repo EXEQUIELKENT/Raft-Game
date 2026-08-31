@@ -153,7 +153,7 @@ void main() {
   testWidgets('the shooter paints the recoil pose and muzzle flash', (tester) async {
     final world = freshWorld();
     world.fire(
-      from: world.raftOf(0)!.muzzle,
+      from: world.raftOf(0)!.muzzle(aimAngleDeg: 42, weapon: Weapons.byId('grenade')),
       angleDeg: 42, power: 70, facing: 1,
       weapon: Weapons.byId('grenade'), owner: 0,
     );
@@ -194,7 +194,7 @@ void main() {
 
       // Recoil + muzzle flash: fire, then paint inside the kick window.
       world.fire(
-        from: world.raftOf(0)!.muzzle,
+        from: world.raftOf(0)!.muzzle(aimAngleDeg: 20, weapon: weapon),
         angleDeg: 20, power: 70, facing: 1,
         weapon: weapon, owner: 0,
       );

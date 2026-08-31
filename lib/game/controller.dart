@@ -164,6 +164,11 @@ class GameController extends ChangeNotifier {
 
   void _setup(int seed) {
     world = BattleWorld(map: settings.map, seed: seed);
+    // Crew voices — grunts, yelps, gloats and idle blips — route through
+    // the shared audio service at a slightly softer level than SFX.
+    world.onVoice = (sound) => AudioService.instance.sfx(sound, volume: 0.85);
+    // World SFX — ricochets, weapon swaps — at full punch.
+    world.onSfx = (sound) => AudioService.instance.sfx(sound);
 
     for (int i = 0; i < players.length; i++) {
       final p = players[i];
@@ -452,7 +457,10 @@ class GameController extends ChangeNotifier {
         .where((w) => settings.enabledWeapons.contains(w.id))
         .toList();
     final shot = AiController(p.aiDifficulty).plan(
-      from: me.muzzle,
+      // Planning origin: the muzzle at the nominal 45° lob. The shot itself
+      // is spawned from the exact live-angle muzzle in [_doFire]; the few
+      // units between the two are far below the AI's aim jitter.
+      from: me.muzzle(),
       targetPos: targetPos,
       facing: me.facing,
       arsenal: arsenal.isEmpty ? [Weapons.starter] : arsenal,
@@ -788,7 +796,10 @@ class GameController extends ChangeNotifier {
     }
 
     world.fire(
-      from: raft.muzzle,
+      // Spawn the ball at the drawn barrel mouth: the muzzle tip of the
+      // equipped firearm at the exact angle being fired, matching what the
+      // renderer and the aim-assist arc both use.
+      from: raft.muzzle(aimAngleDeg: safeAngle, weapon: safeWeapon),
       angleDeg: safeAngle,
       power: safePower,
       facing: raft.facing,

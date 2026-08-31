@@ -4,6 +4,7 @@ import 'dart:ui';
 import 'maps.dart';
 import 'models.dart';
 import 'raft.dart';
+import 'weapon_views.dart';
 
 /// ---------------------------------------------------------------------------
 /// The battle simulation.
@@ -87,10 +88,17 @@ class BattleConst {
   static const double camEnemyMargin = 140;
 
   /// The trajectory preview never draws past this fraction of the shot's
-  /// flight. Friv's Raft shows a stub of the arc, not the landing spot, and
-  /// now that the rafts are far apart an uncapped preview would hand the
-  /// player the exact range they are supposed to be guessing at.
-  static const double trajectoryReveal = 0.34;
+  /// flight — nor past [trajectoryMaxFrames] of simulation, so a
+  /// full-power lob reveals barely more arc than a gentle one. Friv's Raft
+  /// shows a stub of the arc, not the landing spot, and now that the rafts
+  /// are far apart an uncapped preview would hand the player the exact
+  /// range they are supposed to be guessing at.
+  static const double trajectoryReveal = 0.26;
+
+  /// Absolute cap on previewed flight frames, so the preview stays short
+  /// even at maximum fire force (the arc used to climb halfway to the
+  /// enemy on a full-power drag).
+  static const double trajectoryMaxFrames = 30;
 
   /// How far the camera may pan past either end of the world.
   ///
@@ -213,6 +221,27 @@ class BattleConst {
   static const double ragdollTorque = 4.0;
   static const double ragdollMaxSpin = 0.22;
 
+  /// Extra angular kick thrown into a head-region hit — the "shoot off and
+  /// backflip" tumble, delivered through [RagdollPose.applyImpulse]'s
+  /// [spin]. Landed on top of the ordinary torque.
+  static const double headshotSpin = 0.26;
+
+  /// Hard cap on angular velocity after a spin kick — above the ordinary
+  /// torque clamp so a headshot visibly whips the body over, but still
+  /// finite so nothing spins forever.
+  static const double ragdollSpinCap = 0.5;
+
+  /// How long a leg-region hit keeps its planted foot glued to the deck
+  /// while the rest of the body flies — the "one leg still standing"
+  /// stumble that pivots the body around the planted boot.
+  static const double legPlantTime = 0.8;
+
+  /// How long a torso-region hit keeps the off hand clutching the spot.
+  static const double grabTime = 0.7;
+
+  /// How fast screen-shake energy bleeds off, in units per second.
+  static const double shakeDecay = 55;
+
   // ---------------------------------------------------------------------------
   // Death sequence
   // ---------------------------------------------------------------------------
@@ -261,6 +290,12 @@ class RagdollPoint {
 
   /// 1 / mass. Zero would pin the point — no crew point is ever pinned.
   final double invMass;
+
+  /// 0 = free; >0 = planted in place. A planted point neither falls nor
+  /// moves during the constraint solve — used for the "one leg still
+  /// standing" tumble, where the far boot stays glued to the deck while
+  /// the rest of the body whips around it.
+  int pin = 0;
 
   RagdollPoint(Offset at, {double mass = 1})
       : pos = at,
@@ -349,9 +384,15 @@ class RagdollPose {
   }
 
   /// Advances the sim one 60Hz step: implicit-velocity integration under
-  /// gravity with per-frame drag.
+  /// gravity with per-frame drag. Planted points sit still — they neither
+  /// fall nor drift, so a planted foot can hold a whole body upright around
+  /// itself.
   void integrate({required double gravity, required double drag}) {
     for (final p in points) {
+      if (p.pin > 0) {
+        p.prev = p.pos;
+        continue;
+      }
       final v = (p.pos - p.prev) * drag;
       p.prev = p.pos;
       p.pos += v + Offset(0, gravity);
@@ -375,11 +416,14 @@ class RagdollPose {
           diff = (d - con.min!) / d;
         }
         if (diff == 0) continue;
-        final wSum = con.a.invMass + con.b.invMass;
+        // Planted points are inert: they anchor the constraint like a wall.
+        final ia = con.a.pin > 0 ? 0.0 : con.a.invMass;
+        final ib = con.b.pin > 0 ? 0.0 : con.b.invMass;
+        final wSum = ia + ib;
         if (wSum <= 0) continue;
         final corr = delta * diff;
-        con.a.pos += corr * (con.a.invMass / wSum);
-        con.b.pos -= corr * (con.b.invMass / wSum);
+        con.a.pos += corr * (ia / wSum);
+        con.b.pos -= corr * (ib / wSum);
       }
     }
   }
@@ -388,8 +432,9 @@ class RagdollPose {
   /// velocity [impulse]: every point takes the linear shove, and an
   /// off-centre hit adds torque around the centre of mass — a shot to the
   /// head snaps the body head-over-heels while one to the legs sweeps the
-  /// feet out from under them.
-  void applyImpulse(Offset hitLocal, Offset impulse) {
+  /// feet out from under them. [spin] adds an extra angular kick on top
+  /// (headshot backflips), clamped at the hard [BattleConst.ragdollSpinCap].
+  void applyImpulse(Offset hitLocal, Offset impulse, {double spin = 0}) {
     final com = hip.pos;
 
     // Moment of inertia about the centre of mass.
@@ -403,7 +448,7 @@ class RagdollPose {
     final rHit = hitLocal - com;
     final cross = rHit.dx * impulse.dy - rHit.dy * impulse.dx;
     var w = inertia > 1e-6 ? cross / inertia * BattleConst.ragdollTorque : 0.0;
-    w = w.clamp(-BattleConst.ragdollMaxSpin, BattleConst.ragdollMaxSpin);
+    w = (w + spin).clamp(-BattleConst.ragdollSpinCap, BattleConst.ragdollSpinCap);
 
     for (final p in points) {
       final r = p.pos - com;
@@ -490,6 +535,40 @@ class RagdollPose {
 /// their station. A body that slides off the deck falls into the sea and
 /// drowns — being knocked overboard is what actually eliminates a crew
 /// member in this game, not merely reaching 0 HP where they stand.
+/// Short, random things a crew member does with their face while standing
+/// around not shooting — picked by [Crew.updateIdle] every few seconds so
+/// the deck never reads as a row of frozen mannequins. Rendered by the
+/// face painter; each activity has a matching voice blip (see
+/// [BattleWorld.onVoice]).
+enum CrewIdle {
+  none,
+
+  /// Eyes dart left and right, scanning the horizon.
+  lookAround,
+
+  /// A big slow yawn, eyes squeezing shut.
+  yawn,
+
+  /// Puckered mouth with floating music notes.
+  whistle,
+
+  /// A brief bout of flapping-mouth chatter.
+  chatter,
+
+  /// Alternating brow bobs and a smirk.
+  browWaggle,
+}
+
+/// Which band of the body a given blow landed on — computed from the
+/// station-local hit point and used to pick the funny ragdoll reaction:
+/// headshots can whip into a backflip, leg hits plant one boot and make the
+/// rest of the body pivot around it, torso hits sometimes clutch the spot.
+enum HitZone {
+  head,
+  torso,
+  legs,
+}
+
 class Crew {
   double hp;
   final double maxHp;
@@ -561,6 +640,108 @@ class Crew {
   /// crew member the instant their own shot lands on an enemy.
   double gloatT = 0;
 
+  // --- Ragdoll reactions ----------------------------------------------------
+
+  /// Which foot is planted from a leg-hit tumble: −1 left, +1 right, 0
+  /// none. The planted boot stays glued to the deck while everything else
+  /// flies — the "one leg still standing" stumble.
+  double plantFoot = 0;
+
+  /// Seconds left the plant is active.
+  double plantT = 0;
+
+  /// Seconds left clutching the spot a torso hit landed on — the off hand
+  /// grabs the belly while they tumble.
+  double grabT = 0;
+
+  /// Frees a planted foot, if any.
+  void clearPlant() {
+    plantFoot = 0;
+    plantT = 0;
+    if (pose != null) {
+      pose!.footL.pin = 0;
+      pose!.footR.pin = 0;
+    }
+  }
+
+  // --- Idle micro-activities ------------------------------------------------
+
+  /// What this crew member is currently fidgeting with while standing
+  /// around; [CrewIdle.none] most of the time. Advanced by
+  /// [BattleWorld]'s body stepper, drawn by the face painter.
+  CrewIdle idle = CrewIdle.none;
+
+  /// Seconds left on the current idle activity.
+  double idleT = 0;
+
+  /// Duration the current activity was picked for — lets the renderer
+  /// ease expressions in and out over the activity's lifetime.
+  double idleDur = 1;
+
+  /// Countdown to the next idle activity; staggered per character via
+  /// [bobPhase] so the crew never fidgets in lockstep.
+  double idleNextIn = 0;
+
+  /// Per-character RNG for idle picking — seeded from [bobPhase] rather
+  /// than the world's stream, so idle fidgets never perturb battle
+  /// determinism (camera, AI and decor all share [BattleWorld.rng]).
+  late final Random _idleRng = Random((bobPhase * 7919).round() ^ 0x5f37);
+
+  /// Advances the idle fidget state. Returns the name of the voice blip to
+  /// play when a new activity starts (null otherwise). New activities are
+  /// only picked when [allowNew] — the active shooter keeps a straight
+  /// face while lining up their shot.
+  String? updateIdle(double dt, {required bool allowNew}) {
+    if (!alive || ragdoll || pose != null) {
+      idle = CrewIdle.none;
+      idleT = 0;
+      return null;
+    }
+    if (idle != CrewIdle.none) {
+      idleT -= dt;
+      if (idleT <= 0) {
+        idle = CrewIdle.none;
+        idleNextIn = 5 + _idleRng.nextDouble() * 8;
+      }
+      return null;
+    }
+    if (!allowNew) return null;
+    idleNextIn -= dt;
+    if (idleNextIn > 0) return null;
+    const pool = [
+      CrewIdle.lookAround,
+      CrewIdle.yawn,
+      CrewIdle.whistle,
+      CrewIdle.chatter,
+      CrewIdle.browWaggle,
+    ];
+    idle = pool[_idleRng.nextInt(pool.length)];
+    idleDur = switch (idle) {
+      CrewIdle.lookAround => 2.2,
+      CrewIdle.yawn => 1.7,
+      CrewIdle.whistle => 2.4,
+      CrewIdle.chatter => 1.9,
+      CrewIdle.browWaggle => 1.5,
+      CrewIdle.none => 1,
+    };
+    idleT = idleDur;
+    return switch (idle) {
+      CrewIdle.yawn => 'voice_yawn',
+      CrewIdle.whistle => 'voice_whistle',
+      CrewIdle.chatter => 'voice_chatter',
+      CrewIdle.browWaggle => 'voice_hmm',
+      CrewIdle.lookAround => 'voice_look',
+      CrewIdle.none => null,
+    };
+  }
+
+  /// Picks one of the "Awww" hit variations with this crew member's own
+  /// RNG — every pained yelp is a little different.
+  String hitVoice() {
+    const pool = ['voice_ouch1', 'voice_ouch2', 'voice_ouch3', 'voice_ouch4'];
+    return pool[_idleRng.nextInt(pool.length)];
+  }
+
   // --- Dynamic health bar ---------------------------------------------------
 
   /// Seconds left to show this crew member's HP bar; 0 = hidden.
@@ -599,6 +780,10 @@ class Crew {
   /// True while a weapon swap animation is running.
   bool get swapping => swapTarget != null;
 
+  /// Guards the swap sound effects so the slide-clack/"hup!" pair fires
+  /// exactly once per swap (a re-targeted swap keeps it quiet).
+  bool swapSoundStarted = false;
+
   /// Requests a weapon swap. Re-requesting the equipped weapon is a no-op;
   /// a swap already in flight retargets cleanly. The lower/equip/raise
   /// animation is driven by the world's body stepper on the same fixed-step
@@ -608,6 +793,7 @@ class Crew {
     if (equipped == weaponId) {
       swapTarget = null;
       swapT = 1;
+      swapSoundStarted = false;
       return;
     }
     if (equipped == null) {
@@ -615,6 +801,7 @@ class Crew {
       equipped = weaponId;
       swapTarget = null;
       swapT = 1;
+      swapSoundStarted = false;
       return;
     }
     swapTarget = weaponId;
@@ -627,11 +814,25 @@ class Crew {
     equipped = weaponId;
     swapTarget = null;
     swapT = 1;
+    swapSoundStarted = false;
   }
 
-  Crew({required this.hp, required this.maxHp, this.bobPhase = 0});
+  Crew({required this.hp, required this.maxHp, this.bobPhase = 0}) {
+    idleNextIn = 2.5 + bobPhase % 5;
+  }
 
   bool get alive => hp > 0;
+
+  /// Bruise/cut severity from HP loss — drives the injury decals drawn over
+  /// the whole body: 0 healthy, 1 scuffed, 2 bruised and cut, 3 battered.
+  int get injuryLevel {
+    final f = hpFrac;
+    if (!alive) return 3;
+    if (f >= 0.66) return 0;
+    if (f >= 0.34) return 1;
+    if (f >= 0.15) return 2;
+    return 3;
+  }
 
   /// True once the sink animation has finished and they should stop drawing.
   bool get gone => !alive && sinkT >= 1;
@@ -656,24 +857,59 @@ class Crew {
   /// actually landed at — where the hit lands decides how the body moves.
   /// Omitting it treats the blow as landing dead-centre: a clean shove with
   /// no spin.
-  void knock(Offset dir, double force, {Offset? hitLocal}) {
+  ///
+  /// The knockout comedy lives here: [zone] decides the funny reaction —
+  /// [HitZone.head] can whip into a backflip ([spin], [headKick]), a
+  /// [HitZone.legs] hit can [plant] one boot so the body pivots around it,
+  /// and [lift] adds an upward launch for blasts.
+  void knock(
+    Offset dir,
+    double force, {
+    Offset? hitLocal,
+    HitZone zone = HitZone.torso,
+    double lift = 0,
+    double spin = 0,
+    double headKick = 0,
+    bool plant = false,
+    double hitSide = 0,
+  }) {
     final d = dir.distance <= 0 ? const Offset(1, 0) : dir / dir.distance;
     ragdoll = true;
     ragdollTime = 0;
     rest = 0;
     getUpT = -1;
+    clearPlant();
     pose ??= RagdollPose.standingAt(Offset(offset.dx, offset.dy));
-    final impulse = Offset(d.dx * force, d.dy * force - force * BattleConst.bodyLift);
-    pose!.applyImpulse(hitLocal ?? pose!.hip.pos, impulse);
+    final impulse = Offset(
+        d.dx * force, d.dy * force - force * (BattleConst.bodyLift + lift));
+    pose!.applyImpulse(hitLocal ?? pose!.hip.pos, impulse, spin: spin);
+    if (headKick > 0 && pose != null) {
+      // A headshot can "shoot off": the head gets an extra snap backward,
+      // pitching the whole body over into a backflip.
+      pose!.head.setVel(pose!.head.vel + Offset(0, -headKick));
+    }
     vel = pose!.hip.vel;
+    if (plant && pose != null) {
+      final side = hitSide < 0 ? -1.0 : 1.0;
+      plantFoot = side;
+      plantT = BattleConst.legPlantTime;
+      (side < 0 ? pose!.footL : pose!.footR).pin = 1;
+    }
   }
 
   /// A killing blow. Unlike a hit someone survives, a dead body never stands
   /// back up: it tumbles the way the impact pointed, goes limp, and — nudged
   /// along by the death drift in [_stepBody] — slides off the deck and into
   /// the sea. [railDir] is the way off the nearest rail, used when the
-  /// impact itself has little horizontal say in where they fall.
-  void startDeath(Offset hitDir, double force, {double railDir = 1, Offset? hitLocal}) {
+  /// impact itself has little horizontal say in where they fall. [spin]
+  /// lets a killing headshot still throw a backflip on the way down.
+  void startDeath(
+    Offset hitDir,
+    double force, {
+    double railDir = 1,
+    Offset? hitLocal,
+    double spin = 0,
+  }) {
     final d = hitDir.distance <= 0 ? const Offset(1, 0) : hitDir / hitDir.distance;
     deathDir = d.dx.abs() >= 0.4
         ? (d.dx < 0 ? -1.0 : 1.0)
@@ -683,11 +919,13 @@ class Crew {
     ragdollTime = 0;
     rest = 0;
     getUpT = -1;
+    clearPlant();
     pose ??= RagdollPose.standingAt(Offset(offset.dx, offset.dy));
     final f = max(force, 3.0);
     pose!.applyImpulse(
       hitLocal ?? pose!.hip.pos,
       Offset(d.dx * f, d.dy * f - 2.2),
+      spin: spin,
     );
     vel = pose!.hip.vel;
   }
@@ -756,6 +994,14 @@ class Raft {
   /// Half the walkable deck. Past this a crew member is over open water.
   double get deckHalf => loadout.deckHalf;
 
+  /// Half the solid hull — the walkable deck plus the rail/deck edges. A
+  /// projectile whose x sits past this (but whose y is at water level) is
+  /// clear of the raft entirely.
+  double get hullHalf => loadout.width * 0.5;
+
+  /// Bottom edge of the solid hull block, below the waterline.
+  double get hullBottom => deckY + loadout.width * loadout.hull.thickness;
+
   /// The walkable surface at hull-local [x], as a y-offset from [deckY]
   /// (0 on the main deck, negative up on a raised platform), or null past
   /// the rails. This is the height-field the body physics and the walk-back
@@ -798,10 +1044,41 @@ class Raft {
     return c.alive ? c : null;
   }
 
-  /// Where this raft's shots originate.
-  Offset get muzzle {
+  /// Where this raft's shots originate: the drawn firearm's muzzle tip.
+  ///
+  /// Mirrors the renderer's levelled aim pose — standing crew, zero recoil,
+  /// the grip carried [WeaponView.holdDist] along the aim line and the shot
+  /// exiting at [WeaponView.muzzleX] — so the projectile, the aim-assist arc
+  /// and the AI's ballistic solve all start at the barrel mouth the player
+  /// actually sees, instead of a fixed offset from the body that read as
+  /// firing from the hip. [aimAngleDeg] defaults to the nominal 45° lob for
+  /// callers that plan before an angle exists; the live aim angle must be
+  /// passed at fire and preview time. [weapon] resolves which firearm is in
+  /// hand exactly like the renderer does ([WeaponView.forCrew]).
+  Offset muzzle({double aimAngleDeg = 45, WeaponDef? weapon}) {
     final i = activeIndex.clamp(0, max(0, crew.length - 1)).toInt();
-    return crewPos(i) + Offset(facing * 18.0, -6);
+    final equippedId = crew[i].equipped ?? weapon?.id;
+    final wv = WeaponView.forCrew(equippedId, weapon,
+        variant: WeaponView.variantForPhase(crew[i].bobPhase, equippedId ?? 'tennis'));
+    final gunSide = facing >= 0 ? 1.0 : -1.0;
+    // Standing rig layout — same constants as the renderer's crew: feet on
+    // the deck, 15-unit legs, 27-unit torso, gun shoulder 9.5 in from the
+    // centre and 5 below the shoulder line.
+    final shoulderY = deckY + crew[i].offset.dy - 15.0 - 27.0;
+    final gunShoulder = Offset(
+      x + loadout.crewOffset(i) + crew[i].offset.dx + gunSide * 9.5,
+      shoulderY + 5,
+    );
+    final r = aimAngleDeg * pi / 180;
+    final grip = gunShoulder + Offset(gunSide * cos(r), -sin(r)) * wv.holdDist;
+    final bodyAng = gunSide > 0 ? -r : r - pi;
+    final c = cos(bodyAng), s = sin(bodyAng);
+    // Weapon-local muzzle tip -> body space: grip-centred frame, y mirrored
+    // for left-facing rafts. Must stay in lockstep with the renderer's
+    // toBody() — including the per-crew variant pick — so the ball can
+    // never leave from beside the barrel.
+    final p = Offset(wv.muzzleX - wv.gripX, -wv.gripY * gunSide);
+    return grip + Offset(p.dx * c - p.dy * s, p.dx * s + p.dy * c);
   }
 
   /// Advances [activeIndex] to the next living crew member, wrapping around.
@@ -850,6 +1127,10 @@ class Shot {
   final int owner;
   final List<Offset> trail = [];
 
+  /// How many times this shot has ricocheted off a raft deck. Caps the
+  /// ping-pong so a shot can never bounce forever.
+  int bounces = 0;
+
   /// [BattleWorld.elapsed] at the moment this shot left the barrel. Lets the
   /// renderer time the shooter's recoil kick and muzzle flash without the
   /// simulation itself needing to know anything about how it's drawn.
@@ -868,7 +1149,7 @@ class Shot {
 /// ripple under a raft. No physics attached.
 class Fx {
   final Offset pos;
-  final String kind; // boom | splash | ripple
+  final String kind; // boom | splash | ripple | shock | fire | spark
   final Color color;
   final double size;
   double t = 0;
@@ -878,6 +1159,48 @@ class Fx {
 
   bool get done => t >= life;
   double get progress => (t / life).clamp(0.0, 1.0);
+
+  /// Cached unit-radius gradient paint for the gradient-heavy kinds ('boom',
+  /// 'fire'). The radial gradient is rotation-invariant and its colours only
+  /// depend on the fx's own lifetime, so it is built once here and drawn
+  /// through a scaled canvas transform — instead of rebuilding the shader
+  /// object every frame for every explosion on screen (the old per-frame
+  /// allocation was the visible hitch when explosive volleys landed).
+  Paint? _unitPaint;
+
+  /// The gradient paints, parameterised by how far into the fx's life we are
+  /// — rebuilt only when the progress bucket changes, not every frame.
+  Paint? _paint;
+  double _paintBucket = -1;
+  Paint paintFor(double radius) {
+    _paint ??= Paint();
+    final bucket = (progress * 20).floorToDouble();
+    if (bucket != _paintBucket) {
+      _paintBucket = bucket;
+      final p = 1 - bucket / 20;
+      final shader = RadialGradient(
+        colors: switch (kind) {
+          'boom' => [
+              Colors.white.withOpacity(p),
+              const Color(0xFFFFB347).withOpacity(p * 0.85),
+              const Color(0x00FF7A3C),
+            ],
+          'fire' => [
+              Colors.white.withOpacity(p * 0.95),
+              const Color(0xFFFFB347).withOpacity(p * 0.9),
+              const Color(0xFFE2541E).withOpacity(p * 0.55),
+              const Color(0xFFE2541E).withOpacity(0),
+            ],
+          _ => [accentLike(this).withOpacity(p), accentLike(this).withOpacity(0)],
+        },
+        stops: kind == 'fire' ? const [0.0, 0.4, 0.75, 1.0] : const [0.0, 0.55, 1.0],
+      ).createShader(Rect.fromCircle(center: Offset.zero, radius: 1));
+      _paint!.shader = shader;
+    }
+    return _paint!;
+  }
+
+  static Color accentLike(Fx fx) => fx.color;
 }
 
 /// The result of resolving one shot, so the controller can drive turn flow
@@ -888,11 +1211,16 @@ class ShotOutcome {
   final double damage;
   final Offset impact;
 
+  /// True when this was an explosive round (splash > 0) — the controller
+  /// layers the deep-boom sound on top of the regular hit/splash.
+  final bool splash;
+
   const ShotOutcome({
     required this.hitSomething,
     required this.hitPlayerSide,
     required this.damage,
     required this.impact,
+    required this.splash,
   });
 }
 
@@ -922,6 +1250,35 @@ class BattleWorld {
   /// Whose raft the camera is locked to. Shots are lobbed blind, so the view
   /// belongs to whoever is firing — never to their target.
   int camAnchor = 0;
+
+  /// Team check: the human side is seat 0; every other seat belongs to the
+  /// enemy team. AI shots can therefore never wound their own side — the
+  /// enemies kept bombing each other across the gap, which read as a bug
+  /// rather than chaos. (The player is a team of one and never hits
+  /// themselves: splash already skips the shooter's own raft.)
+  static bool sameSide(int a, int b) => a == b || (a != 0 && b != 0);
+
+  /// Called whenever a crew member makes a sound with their face — a grunt
+  /// on fire, an "ow" on being hit, a laugh on landing one, and the idle
+  /// fidget blips (yawn, whistle, chatter, "hmm"). The controller wires
+  /// this to the audio service; the simulation itself never touches audio.
+  void Function(String sound)? onVoice;
+
+  /// Non-voice world sounds — deck ricochets, weapon swaps. Same pipe as
+  /// [onVoice], separate hook so the controller can balance them apart.
+  void Function(String sound)? onSfx;
+
+  /// Test/preview hook: forces the zone reaction of the next direct hit —
+  /// 'flip' (headshot backflip), 'plant' (leg plant) or 'grab' (torso
+  /// clutch) — instead of the deterministic dice roll. Null plays normally.
+  String? debugHitReaction;
+
+  /// Screen-shake energy in world units: decays each frame in [update] and
+  /// offsets the whole scene in the renderer while above zero. Set by
+  /// impacts and explosions.
+  double shake = 0;
+
+  void bumpShake(double amount) => shake = min(shake + amount, 26.0);
 
   BattleWorld({required this.map, required int seed}) : rng = GameRng(seed);
 
@@ -1157,12 +1514,11 @@ class BattleWorld {
 
   /// Dotted arc preview.
   ///
-  /// Capped hard at [BattleConst.trajectoryReveal] of the flight: now that
-  /// the rafts sit a thousand-odd units apart, an uncapped arc would climb
-  /// over the horizon and come down on the enemy raft, telling the player
-  /// the exact range they are supposed to be judging by eye. What they get
-  /// is the first third — enough to read the shape of the lob, like the
-  /// Friv original, and no more.
+  /// Capped hard: first at [BattleConst.trajectoryReveal] of the flight,
+  /// then at [BattleConst.trajectoryMaxFrames] of simulation absolute — so
+  /// cranking the power stretches the *real* shot, not the hint. What the
+  /// player sees is a short fan of dots near the muzzle, enough to read the
+  /// shape of the lob, like the Friv original, and no more.
   List<TrajectoryDot> trajectory({
     required Offset from,
     required double angleDeg,
@@ -1188,7 +1544,13 @@ class BattleWorld {
       pv = Offset(pv.dx, pv.dy + BattleConst.gravity);
       if (probe.dy > BattleConst.waterY + 8) break;
     }
-    final budget = max(6.0, flight * BattleConst.trajectoryReveal).round();
+    final budget = max(
+      6.0,
+      min(
+        flight * BattleConst.trajectoryReveal,
+        BattleConst.trajectoryMaxFrames,
+      ),
+    ).round();
 
     for (int i = 0; i < flight; i++) {
       p += v;
@@ -1224,6 +1586,8 @@ class BattleWorld {
       owner: owner,
       firedAt: elapsed,
     );
+    // The effortful grunt that rides the recoil.
+    onVoice?.call('voice_grunt');
   }
 
   /// Advances the in-flight shot by one frame. Returns a [ShotOutcome] on the
@@ -1239,32 +1603,176 @@ class BattleWorld {
     s.pos += s.vel;
     s.vel = Offset(s.vel.dx, s.vel.dy + BattleConst.gravity);
 
-    // Direct hit on any crew member not belonging to the shooter. The shot
-    // is tested as the segment it swept this frame against a body-shaped
-    // capsule, so a fast projectile cannot step over a head, torso or pair
-    // of legs in a single frame and phase through a character it visibly
-    // clipped — the old point-in-circle test did exactly that. The closest
-    // point on the capsule is kept so the ragdoll knows exactly where the
-    // blow landed.
+    // Collision resolution picks the *earliest* hit along this frame's sweep
+    // — every candidate (crew capsules, raft decks, hull walls) reports the
+    // fraction of the segment it happens at, and only the smallest t acts.
+    // The previous version tested crew before hulls, so a capsule behind a
+    // raft stole the hit and let the projectile fly through the raft's near
+    // wall; and a side-wall crossing at low speed burst through instead of
+    // bouncing.
+    var bestT = double.infinity;
+    ShotOutcome? resolve;
+    void Function() act = () {};
+
+    // --- Crew capsules ---
     for (final raft in rafts) {
-      if (raft.playerIndex == s.owner || !raft.alive) continue;
+      if (BattleWorld.sameSide(raft.playerIndex, s.owner) || !raft.alive) continue;
       for (int i = 0; i < raft.crew.length; i++) {
-        final c = raft.crew[i];
-        if (!c.alive) continue;
+        if (!raft.crew[i].alive) continue;
         final sweep = _sweepCrew(prev, s.pos, raft, i);
-        if (sweep.hit) {
-          return _resolve(s, raft, i, hitPoint: sweep.point);
+        if (!sweep.hit) continue;
+        final t = _sweepT(prev, s.pos, sweep.point);
+        if (t < bestT) {
+          bestT = t;
+          final raftHit = raft;
+          final idx = i;
+          final point = sweep.point;
+          act = () => resolve = _resolve(s, raftHit, idx, hitPoint: point);
         }
       }
     }
 
-    // Splashdown / off the world.
-    if (s.pos.dy > BattleConst.waterY + 40 ||
-        s.pos.dx < -100 ||
-        s.pos.dx > BattleConst.worldW + 100) {
-      return _resolve(s, null, -1);
+    // --- Raft hulls ---
+    for (final raft in rafts) {
+      final localX = s.pos.dx - raft.x;
+      final top = raft.deckY;
+      final bottom = raft.hullBottom;
+
+      // 1. Deck/platform top, within the walkable deck.
+      if (localX.abs() <= raft.deckHalf) {
+        final surf = top + (raft.surfaceY(localX) ?? 0.0);
+        if (prev.dy <= surf && s.pos.dy >= surf && s.vel.dy > 0) {
+          final hit = Offset(s.pos.dx, surf);
+          final t = _sweepT(prev, s.pos, hit);
+          if (t < bestT) {
+            if (s.bounces < 2 && _shotBounce(s)) {
+              bestT = t;
+              final surfHit = surf;
+              act = () {
+                s.pos = Offset(s.pos.dx, surfHit - 0.5);
+                s.vel = Offset(s.vel.dx * 0.72, -s.vel.dy * 0.48);
+                s.bounces++;
+                _hullBounceFx(Offset(s.pos.dx, surfHit), s);
+              };
+            } else {
+              bestT = t;
+              act = () => resolve = _resolve(s, raft, -1, hitPoint: hit);
+            }
+          }
+        }
+      }
+
+      // 2. Hull shoulders: the deck edge band between the walkable deck and
+      // the hull's outer walls.
+      if (localX.abs() > raft.deckHalf && localX.abs() <= raft.hullHalf) {
+        if (prev.dy <= top && s.pos.dy >= top && s.vel.dy > 0) {
+          final hit = Offset(s.pos.dx, top);
+          final t = _sweepT(prev, s.pos, hit);
+          if (t < bestT) {
+            if (s.bounces < 2 && _shotBounce(s)) {
+              bestT = t;
+              act = () {
+                s.pos = Offset(s.pos.dx, top - 0.5);
+                s.vel = Offset(s.vel.dx * 0.62, -s.vel.dy * 0.4);
+                s.bounces++;
+                _hullBounceFx(Offset(s.pos.dx, top), s);
+              };
+            } else {
+              bestT = t;
+              act = () => resolve = _resolve(s, raft, -1, hitPoint: hit);
+            }
+          }
+        }
+      }
+
+      // 3. Side walls: a shot entering the hull's vertical faces below the
+      // deck ALWAYS bounces off the solid hull — fast shots ricochet back
+      // into play, slow shots thud in (bounce momentum spent) and burst on
+      // the spot. Nobody's raft lets anything through its flank, from
+      // either side.
+      for (final side in [-1.0, 1.0]) {
+        final plane = raft.x + side * raft.hullHalf;
+        final cameFromOut = side < 0 ? prev.dx < plane : prev.dx > plane;
+        final crossed = side < 0 ? s.pos.dx >= plane : s.pos.dx <= plane;
+        if (!cameFromOut || !crossed) continue;
+        final ddx = s.pos.dx - prev.dx;
+        if (ddx.abs() < 1e-9) continue;
+        final t = (plane - prev.dx) / ddx;
+        if (t < 0 || t > 1) continue;
+        final y = prev.dy + (s.pos.dy - prev.dy) * t;
+        if (y < top || y > bottom + 6) continue;
+        final hit = Offset(plane + side * 0.5, y);
+        if (t >= bestT) continue;
+        if (s.bounces < 2 && s.vel.distance > 5) {
+          bestT = t;
+          act = () {
+            s.pos = hit;
+            s.vel = Offset(-s.vel.dx * 0.55, s.vel.dy * 0.8);
+            s.bounces++;
+            _hullBounceFx(hit, s);
+            bumpShake(1.2);
+            onSfx?.call('bounce');
+          };
+        } else {
+          bestT = t;
+          act = () => resolve = _resolve(s, raft, -1, hitPoint: hit);
+        }
+      }
+
     }
-    return null;
+
+    // Safety net: ended up inside a solid hull below the deck without
+    // crossing a face this frame (spawn edge cases) — resolve there, but
+    // only when no real candidate claimed the sweep.
+    if (bestT.isInfinite) {
+      for (final raft in rafts) {
+        final localX = s.pos.dx - raft.x;
+        if (localX.abs() <= raft.hullHalf &&
+            s.pos.dy >= raft.deckY &&
+            s.pos.dy <= raft.hullBottom) {
+          act = () => resolve = _resolve(s, raft, -1, hitPoint: s.pos);
+          break;
+        }
+      }
+    }
+
+    act();
+
+    // Splashdown / off the world: only when nothing along the sweep claimed
+    // the frame.
+    if (resolve == null) {
+      if (s.pos.dy > BattleConst.waterY + 40 ||
+          s.pos.dx < -100 ||
+          s.pos.dx > BattleConst.worldW + 100) {
+        resolve = _resolve(s, null, -1);
+      }
+    }
+    return resolve;
+  }
+
+  /// Sweep fraction [t] ∈ [0,1] at which the frame's segment passes nearest
+  /// to [point] — used to order simultaneous collision candidates.
+  double _sweepT(Offset from, Offset to, Offset point) {
+    final d = to - from;
+    final len2 = d.dx * d.dx + d.dy * d.dy;
+    if (len2 < 1e-9) return 0;
+    return (((point - from).dx * d.dx + (point - from).dy * d.dy) / len2)
+        .clamp(0.0, 1.0);
+  }
+
+  /// Whether a shot is moving fast enough to ricochet off a raft surface
+  /// rather than thud into it and burst.
+  bool _shotBounce(Shot s) => s.vel.distance > 5;
+
+  void _hullBounceFx(Offset at, Shot s) {
+    effects.add(Fx(
+      pos: at,
+      kind: 'ripple',
+      color: s.weapon.color,
+      size: 24,
+      life: 0.3,
+    ));
+    onSfx?.call('bounce');
   }
 
   /// Whether the shot's sweep from [from] to [to] comes close enough to crew
@@ -1355,48 +1863,114 @@ class BattleWorld {
         hitRaft.x + hitRaft.loadout.crewOffset(crewIndex),
         hitRaft.deckY,
       );
+      final zone = _hitZone(hitLocal);
+      final boom = s.weapon.splash > 0;
+      // Test/preview hook: when set ('flip' | 'plant' | 'grab'), the
+      // matching zone reaction always fires instead of being dice-rolled.
+      final forced = debugHitReaction;
       if (c.alive) {
-        c.knock(s.vel, Crew.impactForce(s.weapon), hitLocal: hitLocal);
-        c.hitReactT = BattleConst.hitReactTime;
+        // Zone-driven comedy: headshots can whip into a backflip, leg hits
+        // sometimes plant a boot and pivot, torso hits sometimes clutch —
+        // each rolled deterministically from the shot so replays agree. A
+        // torso clutch replaces the knock-down entirely: they take the hit
+        // on their feet, hunched over the wound (until it fades and they
+        // carry on — or the next blast sends them flying).
+        final grab = zone == HitZone.torso &&
+            !boom &&
+            (forced == 'grab' || _hitChance(s, 0x55, 0.4));
+        if (grab) {
+          c.grabT = BattleConst.grabTime;
+          c.hitReactT = BattleConst.hitReactTime;
+          onVoice?.call(c.hitVoice());
+          onSfx?.call('hit');
+          bumpShake(1.2);
+        } else {
+          final spin = (zone == HitZone.head &&
+                  (forced == 'flip' || _hitChance(s, 0x11, 0.4)))
+              ? (_hitChance(s, 0x22, 0.5)
+                  ? BattleConst.headshotSpin
+                  : -BattleConst.headshotSpin)
+              : 0.0;
+          final headKick =
+              (zone == HitZone.head && (forced == 'flip' || _hitChance(s, 0x33, 0.3)))
+                  ? 4.2 + s.weapon.weight * 1.5
+                  : 0.0;
+          c.knock(s.vel, Crew.impactForce(s.weapon) * (boom ? 1.35 : 1.0),
+              hitLocal: hitLocal,
+              lift: boom ? 0.12 : 0,
+              spin: spin,
+              headKick: headKick,
+              zone: zone,
+              plant: zone == HitZone.legs &&
+                  (forced == 'plant' || _hitChance(s, 0x44, 0.55)),
+              hitSide: hitLocal.dx);
+          c.hitReactT = BattleConst.hitReactTime;
+          onVoice?.call(c.hitVoice());
+          // Impact audio: a thud for small arms, a proper bang for
+          // explosives, and a whoosh riding any backflip launch.
+          onSfx?.call(boom ? 'explosion' : 'hit');
+          if (spin != 0) onSfx?.call('whoosh');
+        }
       } else {
-        c.startDeath(s.vel, Crew.impactForce(s.weapon),
-            railDir: hitRaft.railDir(crewIndex), hitLocal: hitLocal);
+        c.startDeath(s.vel, Crew.impactForce(s.weapon) * (boom ? 1.4 : 1.0),
+            railDir: hitRaft.railDir(crewIndex),
+            hitLocal: hitLocal,
+            spin: zone == HitZone.head && forced == 'flip'
+                ? BattleConst.headshotSpin
+                : (zone == HitZone.head
+                    ? BattleConst.headshotSpin * 0.6
+                    : 0));
+        onSfx?.call(boom ? 'explosion' : 'hit');
+        onSfx?.call('eliminate');
       }
     }
 
-    // Splash damage: everyone (on any raft but the shooter's) inside radius,
-    // falling off with distance. The directly-hit crew member is skipped so a
-    // direct hit isn't double-counted. Everyone caught in the blast is shoved
-    // away from the burst, which is how a near miss empties a crowded deck.
+    // Explosive blast: everyone on another team inside the damage radius is
+    // hurt, and everyone within an even wider "pressure" radius gets thrown
+    // flat — blast damage on a near miss that still ragdolls the crew.
     if (s.weapon.splash > 0) {
+      final shoveR = s.weapon.splash * 1.25;
       for (final raft in rafts) {
-        if (raft.playerIndex == s.owner || !raft.alive) continue;
+        if (BattleWorld.sameSide(raft.playerIndex, s.owner) || !raft.alive) continue;
         for (int i = 0; i < raft.crew.length; i++) {
           if (identical(raft, hitRaft) && i == crewIndex) continue;
           final c = raft.crew[i];
           if (!c.alive) continue;
           final d = (impact - raft.crewPos(i)).distance;
-          if (d > s.weapon.splash) continue;
-          final falloff = 1 - (d / s.weapon.splash);
-          final before = c.hp;
-          c.hp = max(0, c.hp - s.weapon.damage * 0.6 * falloff);
-          dealt += before - c.hp;
-          c.showHpBar(before / c.maxHp);
-          final away = raft.crewPos(i) - impact;
           final station = Offset(raft.x + raft.loadout.crewOffset(i), raft.deckY);
-          if (c.alive) {
-            c.knock(away, Crew.impactForce(s.weapon) * 0.55 * falloff,
-                hitLocal: raft.crewPos(i) - station);
+          final away = raft.crewPos(i) - impact;
+          if (d <= s.weapon.splash) {
+            final falloff = 1 - (d / s.weapon.splash);
+            final before = c.hp;
+            c.hp = max(0, c.hp - s.weapon.damage * 0.6 * falloff);
+            dealt += before - c.hp;
+            c.showHpBar(before / c.maxHp);
+            // Blast throws bodies: full shove plus an upward launch, so
+            // caught crew fly and tumble instead of just sliding.
+            final force = Crew.impactForce(s.weapon) * (1.1 + 0.5 * falloff);
+            if (c.alive) {
+              c.knock(Offset(away.dx, -1.0), force,
+                  hitLocal: raft.crewPos(i) - station,
+                  lift: 0.45 * falloff,
+                  zone: HitZone.torso);
+              c.hitReactT = BattleConst.hitReactTime;
+              onVoice?.call(c.hitVoice());
+            } else {
+              c.startDeath(Offset(away.dx, -1.0), max(3.0, force),
+                  railDir: raft.railDir(i),
+                  hitLocal: raft.crewPos(i) - station);
+            }
+            if (raft.playerIndex == 0) hitPlayerSide = true;
+          } else if (d <= shoveR) {
+            // Pressure wave only: no HP damage, but the shock still knocks
+            // them flat — the ragdoll sells the near miss.
+            final falloff = 1 - (d - s.weapon.splash) / (shoveR - s.weapon.splash);
+            c.knock(Offset(away.dx, -0.6), 1.2 + falloff * 3.2,
+                hitLocal: raft.crewPos(i) - station,
+                lift: 0.3 * falloff,
+                zone: HitZone.torso);
             c.hitReactT = BattleConst.hitReactTime;
-          } else {
-            c.startDeath(
-              away,
-              max(2.5, Crew.impactForce(s.weapon) * 0.55 * falloff),
-              railDir: raft.railDir(i),
-              hitLocal: raft.crewPos(i) - station,
-            );
           }
-          if (raft.playerIndex == 0) hitPlayerSide = true;
         }
       }
     }
@@ -1408,10 +1982,50 @@ class BattleWorld {
       size: s.weapon.splash > 0 ? s.weapon.splash * 1.1 : 62,
       life: 0.55,
     ));
+    // Explosives get the full show: a shockwave ring, a hot fireball, a
+    // scatter of embers — and screen shake loud enough to feel.
+    if (s.weapon.splash > 0) {
+      effects.add(Fx(
+        pos: impact,
+        kind: 'shock',
+        color: s.weapon.color,
+        size: s.weapon.splash * 1.6,
+        life: 0.5,
+      ));
+      effects.add(Fx(
+        pos: impact,
+        kind: 'fire',
+        color: s.weapon.color,
+        size: s.weapon.splash * 0.75,
+        life: 0.32,
+      ));
+      for (int k = 0; k < 5; k++) {
+        final a = pi * 2 * (k / 5) + s.firedAt * 0.6;
+        effects.add(Fx(
+          pos: impact + Offset(cos(a) * 8, sin(a) * 8),
+          kind: 'spark',
+          color: const Color(0xFFFFC966),
+          size: 10,
+          life: 0.4,
+        ));
+      }
+      bumpShake(5 + s.weapon.damage * 0.13);
+      onSfx?.call('explosion');
+      onSfx?.call('shockwave');
+    } else if (dealt > 0) {
+      bumpShake(1.5 + s.weapon.damage * 0.045);
+    } else {
+      // A clean miss into the water: the splash is all the feedback the
+      // shooter gets.
+      onSfx?.call('splash');
+    }
 
-    // A landed hit earns the shooter a satisfied grin, whether it was a
-    // direct hit or splash damage caught someone in the blast.
-    if (dealt > 0) shooterCrew?.gloatT = BattleConst.gloatTime;
+    // A landed hit earns the shooter a satisfied grin — and a chuckle —
+    // whether it was a direct hit or splash damage caught someone.
+    if (dealt > 0) {
+      shooterCrew?.gloatT = BattleConst.gloatTime;
+      if (shooterCrew?.alive == true) onVoice?.call('voice_laugh');
+    }
 
     shot = null;
     for (final r in rafts) {
@@ -1423,7 +2037,25 @@ class BattleWorld {
       hitPlayerSide: hitPlayerSide,
       damage: dealt,
       impact: impact,
+      splash: s.weapon.splash > 0,
     );
+  }
+
+  /// Band of the body a station-local hit point landed on, by height off
+  /// the deck: head above the neck (−46), legs at/below the hip (−14),
+  /// torso between.
+  HitZone _hitZone(Offset local) {
+    if (local.dy < -46) return HitZone.head;
+    if (local.dy > -14) return HitZone.legs;
+    return HitZone.torso;
+  }
+
+  /// Deterministic per-shot dice roll so ragdoll comedy (backflips, kicks,
+  /// clutches) replays identically on both hotspot seats and never draws
+  /// from the shared world RNG.
+  bool _hitChance(Shot s, int salt, double probability) {
+    final hash = (s.firedAt * 7919).round() ^ (s.pos.dx * 31).round() ^ salt;
+    return (hash & 0x3FF) / 1024 < probability;
   }
 
   // ---------------------------------------------------------------------------
@@ -1442,6 +2074,7 @@ class BattleWorld {
       fx.t += dt;
     }
     effects.removeWhere((f) => f.done);
+    shake = max(0, shake - dt * BattleConst.shakeDecay);
 
     _bodyAccum += dt;
     const step = 1 / 60;
@@ -1471,14 +2104,24 @@ class BattleWorld {
         // into the grip. The swap runs on the same fixed-step clock as
         // the bodies so both hotspot devices see the identical transition.
         if (c.swapTarget != null) {
+          // Swap feedback: a slide-clack as the old firearm drops, a
+          // chirpy "hup!" and the new model locks in with a click at the
+          // halfway point.
+          if (!c.swapSoundStarted) {
+            c.swapSoundStarted = true;
+            onSfx?.call('swap');
+            onVoice?.call('voice_swap');
+          }
           c.swapT += dt / BattleConst.weaponSwapTime;
           if (c.swapT >= 0.5 && c.equipped != c.swapTarget) {
             c.equipped = c.swapTarget;
+            onSfx?.call('click');
           }
           if (c.swapT >= 1) {
             c.equipped = c.swapTarget;
             c.swapTarget = null;
             c.swapT = 1;
+            c.swapSoundStarted = false;
           }
         }
 
@@ -1508,6 +2151,19 @@ class BattleWorld {
 
         if (c.hitReactT > 0) c.hitReactT = max(0, c.hitReactT - dt);
         if (c.gloatT > 0) c.gloatT = max(0, c.gloatT - dt);
+
+        // Ragdoll-reaction timers: the leg plant releases after its window,
+        // and a torso clutch fades once the body settles.
+        if (c.plantT > 0) {
+          c.plantT -= dt;
+          if (c.plantT <= 0) c.clearPlant();
+        }
+        if (c.grabT > 0) c.grabT = max(0, c.grabT - dt);
+
+        // Idle fidgets: anyone standing around who isn't the active
+        // shooter may pick a little activity — and voice it.
+        final voice = c.updateIdle(dt, allowNew: raft.activeIndex != i);
+        if (voice != null) onVoice?.call(voice);
 
         if (c.ragdoll) {
           _stepBody(raft, i, c);
@@ -1586,6 +2242,8 @@ class BattleWorld {
     // finishes the pose hands over to the normal standing renderer, which
     // walks them back down to their station along the deck surface.
     if (c.getUpT >= 0) {
+      c.clearPlant();
+      c.grabT = 0;
       c.getUpT = min(1.0, c.getUpT + (1 / 60) / BattleConst.bodyGetUpTime);
       final feet = raft.surfaceY(stationX + pose.hip.pos.dx) ?? 0.0;
       pose.blendTo(RagdollPose.standingAt(Offset(pose.hip.pos.dx, feet)), c.getUpT);
@@ -1686,6 +2344,7 @@ class BattleWorld {
     // Drowning: hips this far under the waterline ends them for the round.
     if (!c.drowned && raft.deckY + pose.hip.pos.dy > BattleConst.waterY + BattleConst.drownDepth) {
       c.drowned = true;
+      c.clearPlant();
       c.ragdoll = false;
       c.hp = 0;
       c.vel = Offset.zero;

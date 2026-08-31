@@ -15,9 +15,25 @@ class AudioService {
   AudioPlayer? _music;
   final List<AudioPlayer> _pool = [];
   int _poolIndex = 0;
+
+  /// One dedicated player per sound, with its asset preloaded at init.
+  /// `play(AssetSource(...))` decodes the clip from the bundle on *every*
+  /// call — an explosive blast fires 4–7 concurrent sfx in a single frame
+  /// (boom + shockwave + eliminate + a voice per hit crew), and re-decoding
+  /// all of them at once stuttered the frame. Preloading turns a replay
+  /// into a cheap resume.
+  final Map<String, AudioPlayer> _locked = {};
   String? _currentMusic;
   bool _ready = false;
   bool _available = true;
+
+  /// Every clip the game plays, so [init] can preload them all.
+  static const List<String> _knownSounds = [
+    'click', 'bounce', 'hit', 'explosion', 'shockwave', 'splash',
+    'eliminate', 'whoosh', 'swap', 'turn', 'place', 'fire',
+    'voice_grunt', 'voice_laugh', 'voice_ouch1', 'voice_ouch2',
+    'voice_ouch3', 'voice_ouch4', 'voice_swap',
+  ];
 
   AudioService._();
 
@@ -25,20 +41,28 @@ class AudioService {
     if (_ready || !_available) return;
     try {
       final music = AudioPlayer(playerId: 'music');
-      final pool = <AudioPlayer>[
-        for (int i = 0; i < 6; i++) AudioPlayer(playerId: 'sfx$i'),
-      ];
       await music.setReleaseMode(ReleaseMode.loop);
-      for (final p in pool) {
-        await p.setReleaseMode(ReleaseMode.stop);
-      }
+      await music.setVolume(_musicVol);
       _music = music;
-      _pool.addAll(pool);
+      // Preload one dedicated player per known sound.
+      for (final name in _knownSounds) {
+        final p = AudioPlayer(playerId: 'sfx_$name');
+        await p.setReleaseMode(ReleaseMode.stop);
+        await p.setSourceAsset('sfx/$name.wav');
+        _locked[name] = p;
+      }
+      // Fallback pool for any sound not in the known list.
+      for (int i = 0; i < 4; i++) {
+        final p = AudioPlayer(playerId: 'sfx_pool$i');
+        await p.setReleaseMode(ReleaseMode.stop);
+        _pool.add(p);
+      }
       _ready = true;
     } catch (e) {
       debugPrint('audio unavailable: $e');
       _available = false;
       _music = null;
+      _locked.clear();
       _pool.clear();
     }
   }
@@ -78,13 +102,29 @@ class AudioService {
   }
 
   void sfx(String name, {double volume = 1.0}) {
-    if (!_ready || !_available || _sfxVol <= 0.01 || _pool.isEmpty) return;
-    final p = _pool[_poolIndex];
+    if (!_ready || !_available || _sfxVol <= 0.01) return;
+    final vol = (volume * _sfxVol).clamp(0.0, 1.0);
+    final locked = _locked[name];
+    if (locked != null) {
+      // Preloaded: a stop + resume restarts the clip with no re-decode.
+      () async {
+        try {
+          await locked.stop();
+          await locked.setVolume(vol);
+          await locked.resume();
+        } catch (_) {}
+      }();
+      return;
+    }
+    // Fallback for unknown names: pooled lazy-load (one decode, then the
+    // platform caches it for that player).
+    final p = _pool.isEmpty ? null : _pool[_poolIndex];
+    if (p == null) return;
     _poolIndex = (_poolIndex + 1) % _pool.length;
     () async {
       try {
         await p.stop();
-        await p.setVolume((volume * _sfxVol).clamp(0.0, 1.0));
+        await p.setVolume(vol);
         await p.play(AssetSource('sfx/$name.wav'));
       } catch (_) {}
     }();
@@ -94,6 +134,9 @@ class AudioService {
     if (!_available) return;
     try {
       _music?.dispose();
+      for (final p in _locked.values) {
+        p.dispose();
+      }
       for (final p in _pool) {
         p.dispose();
       }

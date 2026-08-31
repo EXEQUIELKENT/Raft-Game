@@ -127,7 +127,7 @@ void main() {
       final power = BattleConst.powerMin +
           rng.nextDouble() * (BattleConst.powerMax - BattleConst.powerMin);
       world.fire(
-        from: world.rafts.first.muzzle,
+        from: world.rafts.first.muzzle(aimAngleDeg: angle),
         angleDeg: angle, power: power, facing: 1, weapon: w, owner: 0,
       );
 
