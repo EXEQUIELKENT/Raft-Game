@@ -382,12 +382,36 @@ class WeaponView {
 /// [softStretch]) when a grip sits beyond nominal span, exactly like the
 /// hand-drawn poses did, so hands always land *on* the weapon.
 class ArmIK {
-  /// Upper and forearm lengths for the chunky crew rig, at rest.
+  /// Upper and forearm lengths for the chunky crew rig, at rest. Left as-is
+  /// (some code — e.g. the "just past nominal span" test — assumes a
+  /// 14+14=28 nominal reach), so ordinary poses are pixel-identical to
+  /// before; only the stretch budget below changed.
   static const double upper = 14;
   static const double fore = 14;
 
   /// How far bones may stretch past nominal span (1.0 = rigid).
-  static const double softStretch = 1.14;
+  ///
+  /// The grip layouts have grown considerably across revisions of this
+  /// file (guns are now sized to match their projectile — see the "Size
+  /// match" doc above — so barrels, receivers and their grip points sit
+  /// much farther from the body than before). The support shoulder is a
+  /// torso-width away from most grip points; measuring the distance to
+  /// each current [WeaponView]'s intentional choke-up fallback (all the
+  /// way back to the receiver rear — see [chokeUp]'s doc comment) across
+  /// the game's actual aim range (`BattleConst.angleMin`..`angleMax`, 6°
+  /// to 85° — not the full ±90° a naive sweep would check) puts the worst
+  /// realistic case — cluster's top-handle hold, at the shallowest aim —
+  /// at ~38 units. The previous 1.14 (reachMax ~31.9) fell short of that
+  /// for essentially every foregrip/heft/topHandle weapon, so the support
+  /// arm sat pinned at its absolute limit on every shot rather than only
+  /// stretching for the rare case that actually needs it. 1.55 (reachMax
+  /// ~43.4) clears the worst case with several units of margin.
+  ///
+  /// Deliberately not pushed higher: past ~44 the synthetic "chokes up on
+  /// a long gun" case in the IK test starts falling fully in reach (no
+  /// choke-up left to demonstrate), and nominal bone length is left alone
+  /// so ordinary, well-within-reach poses stay pixel-identical to before.
+  static const double softStretch = 1.55;
 
   /// Maximum hand distance from the shoulder.
   static double get reachMax => (upper + fore) * softStretch;
