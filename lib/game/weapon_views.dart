@@ -7,17 +7,27 @@ import 'models.dart';
 /// ---------------------------------------------------------------------------
 /// Per-projectile weapon views.
 ///
-/// Every [WeaponDef] has its own firearm: geometry (receiver, barrel, stock,
-/// drum, prongs, pump), grip layout — expressed as IK hand targets on the
-/// weapon's local frame — and a firing animation spec (recoil kick, muzzle
-/// climb, slide/pump travel, muzzle flash) that scales with the projectile's
-/// weight and caliber. The renderer draws the weapon and solves the arms
-/// against the grip targets; nothing is shared between calibers except the
-/// resolution machinery.
+/// Every [WeaponDef] has its own firearm: geometry (receiver, shaft barrel,
+/// bell mouth, stock, drum, prongs, pump), grip layout — expressed as IK hand
+/// targets on the weapon's local frame — and a firing animation spec (recoil
+/// kick, muzzle climb, slide/pump travel, muzzle flash) that scales with the
+/// projectile's weight and caliber. The renderer draws the weapon and solves
+/// the arms against the grip targets; nothing is shared between calibers
+/// except the resolution machinery.
+///
+/// ## Size match
+/// The projectile renderer draws each ball at radius `9 * weight` — rounds
+/// 18 to 28.8 units across, deliberately head-sized. A firearm sized to its
+/// ammo is therefore a *launcher*: the shaft barrel is a hand-grippable tube
+/// ([barrelThickness]) that flares at the muzzle into a bell mouth of [bore]
+/// ≈ 76% of the round's full diameter ([boreFor]), with a rimmed opening you
+/// can see the ball sit in. Small calibers get a blunderbuss cup; the anchor
+/// gets a mortar mouth as big as a chest — which is the joke.
 ///
 /// Weapon-local frame: the origin sits at the trigger grip (where the firing
-/// hand closes), +x runs forward toward the muzzle, +y runs down. The muzzle
-/// tip lands at [muzzleX].
+/// hand closes), +x runs forward toward the muzzle, +y runs down. The barrel
+/// shaft runs [barrelX0] → [barrelX1], the bell flares on to the rim at
+/// [muzzleX].
 /// ---------------------------------------------------------------------------
 
 /// How the support (off) hand holds this particular firearm.
@@ -25,10 +35,10 @@ enum GripStyle {
   /// Hand cups under the trigger hand — light one-hand-ish guns.
   cup,
 
-  /// Hand clamps a foregrip partway along the barrel.
+  /// Hand clamps a foregrip/pump handle under the barrel.
   foregrip,
 
-  /// Both hands stacked on the rear grip, hefting the weight.
+  /// A second fist under the receiver front, hefting the weight.
   heft,
 }
 
@@ -39,22 +49,26 @@ class WeaponView {
   final double receiverX0;
   final double receiverX1;
   final double receiverH;
+
+  /// Barrel shaft: start (at the receiver), end (where the bell begins).
   final double barrelX0;
   final double barrelX1;
 
-  /// Diameter of the muzzle opening. Sized from the projectile the weapon
-  /// fires ([boreFor]), with the barrel walls adding to it — see
-  /// [barrelThickness].
+  /// Bell-mouth bore diameter at the rim — 76% of the round's drawn
+  /// diameter (see [boreFor]): the visible proof that this firearm is sized
+  /// to the projectile it fires.
   final double bore;
+
+  /// Hull-local x of the muzzle rim (end of the bell).
   final double muzzleX;
 
-  /// A butt stock drawn behind the grip (heavy shoulder-fired guns).
+  /// A butt stock drawn behind the receiver (shoulder-fired guns).
   final double stockLen;
 
-  /// An ammunition drum drawn under the receiver, radius (0 = none).
+  /// An ammunition drum hanging under the receiver, radius (0 = none).
   final double drumR;
 
-  /// Muzzle prongs / brake, extending past the barrel (0 = none).
+  /// Muzzle brake prongs splaying off the rim (0 = none).
   final double prongLen;
 
   /// Slide handle travel on fire (pump action, 0 = none).
@@ -62,19 +76,17 @@ class WeaponView {
   final double pumpX0;
   final double pumpX1;
 
-  // --- Grip layout (IK targets, weapon-local) ---
+  // --- Grip layout (IK hand targets, weapon-local) ---
   final double gripX;
   final double gripY;
 
-  /// Where the trigger hand sits relative to the weapon origin, and the
-  /// support-hand target. [gripReach] is how far forward of the shoulder
-  /// the grip is held while aiming.
+  /// The support hand's hold: its x along the weapon and resting y — 0-line
+  /// for tube wraps (fingers hook over the shaft from either side), stub
+  /// level for cup/heft fists stacking under the receiver — and the wrist
+  /// bend that makes the arm match.
   final double supportForeX;
   final double supportForeY;
   final GripStyle supportStyle;
-
-  /// Arm bend direction: +1 sags the elbow low (carry), −1 lifts it out
-  /// (bracing a heavy weapon).
   final double supportBend;
 
   /// How far forward of the shoulder the grip is carried while aiming —
@@ -119,62 +131,85 @@ class WeaponView {
     required this.sway,
   });
 
-  /// Muzzle bore for [w], proportional to the round's drawn radius
-  /// (`9 * weight` in the projectile renderer): the muzzle opening always
-  /// reads as sized for the exact caliber the weapon fires.
-  static double boreFor(WeaponDef w) => 9.0 * w.weight * 0.45;
+  /// Bell-mouth bore for [w]: 76% of the round's drawn diameter
+  /// (`2 * 9 * weight`), so the firearm opening always reads as sized for
+  /// the exact caliber — big enough to admit the ball, rimmed so you can
+  /// see the round sitting in the mouth.
+  static double boreFor(WeaponDef w) => 2 * 9.0 * w.weight * 0.76;
 
-  /// Outer barrel thickness: the bore plus the tube walls.
-  double get barrelThickness => bore + 1.2;
+  /// Shaft thickness: a hand-wrappable tube (62% of the bell bore + walls).
+  double get barrelThickness => bore * 0.62 + 1.4;
+
+  /// Bell-mouth rim height, slightly wider than the bore for a read at a
+  /// glance.
+  double get flare => bore + 1.0;
+
+  /// Half the receiver height — grip, drum and stock geometry hang off it.
+  double get receiverHalf => receiverH / 2;
+
+  /// Top edge of the trigger-grip stub: just under the receiver.
+  double get stubTopY => receiverHalf - 0.6;
+
+  /// Muzzle opening (center of the rim band) in weapon-local coordinates —
+  /// the muzzle flash and shot exit both happen here.
+  Offset get muzzle => Offset(muzzleX - 1.6, 0);
+
+  /// Support-fist target: the grip/pump handle position, sliding rearward
+  /// with the pump cycle.
+  Offset supportTarget(double pumpT) =>
+      Offset(supportForeX - pumpT * pumpTravel, supportForeY);
 
   static const WeaponView _tennis = WeaponView(
     id: 'tennis',
-    receiverX0: -2, receiverX1: 7, receiverH: 5,
-    barrelX0: 7, barrelX1: 18, bore: 4.05, muzzleX: 20,
-    gripX: 0, gripY: 1.5,
-    supportForeX: -3, supportForeY: 4,
+    receiverX0: -2, receiverX1: 6, receiverH: 15,
+    barrelX0: 6, barrelX1: 17, bore: 13.5, muzzleX: 20.5,
+    gripX: 0, gripY: 12,
+    supportForeX: -1.5, supportForeY: 13,
     supportStyle: GripStyle.cup,
-    holdDist: 13,
+    holdDist: 13.5,
     kick: 3.5, climb: 0.22, recoilDur: 0.20,
-    flashR: 7, flashDur: 0.10, sway: 0.8,
+    flashR: 10, flashDur: 0.10, sway: 0.8,
   );
 
   static const WeaponView _grenade = WeaponView(
     id: 'grenade',
-    receiverX0: -4, receiverX1: 8, receiverH: 6,
-    barrelX0: 8, barrelX1: 23, bore: 4.7, muzzleX: 25,
-    drumR: 4.2,
-    pumpTravel: 4, pumpX0: 12, pumpX1: 16,
-    gripX: -2, gripY: 1.5,
-    supportForeX: 14, supportForeY: 0,
+    receiverX0: -6, receiverX1: 4, receiverH: 17,
+    barrelX0: 4, barrelX1: 20.5, bore: 15.5, muzzleX: 24.5,
+    stockLen: 3.5,
+    drumR: 6.2,
+    pumpTravel: 4, pumpX0: 12, pumpX1: 16.5,
+    gripX: -2.5, gripY: 13,
+    supportForeX: 14, supportForeY: 1,
     supportStyle: GripStyle.foregrip,
-    holdDist: 14,
+    holdDist: 14.5,
     kick: 5.5, climb: 0.30, recoilDur: 0.30,
-    flashR: 10, flashDur: 0.16, sway: 1.1,
+    flashR: 12, flashDur: 0.16, sway: 1.1,
   );
 
   static const WeaponView _bomb = WeaponView(
     id: 'bomb',
-    receiverX0: -6, receiverX1: 6, receiverH: 7,
-    barrelX0: 6, barrelX1: 15, bore: 5.5, muzzleX: 17,
-    stockLen: 6,
-    gripX: -4, gripY: 1.5,
-    supportForeX: -2, supportForeY: 2.5,
+    receiverX0: -10, receiverX1: 2, receiverH: 18.5,
+    barrelX0: 2, barrelX1: 20, bore: 18.5, muzzleX: 25,
+    stockLen: 8.5,
+    drumR: 7.2,
+    gripX: -5.5, gripY: 14,
+    supportForeX: 1, supportForeY: 15,
     supportStyle: GripStyle.heft,
     supportBend: -1,
-    holdDist: 12,
+    holdDist: 13,
     kick: 8, climb: 0.38, recoilDur: 0.38,
-    flashR: 13, flashDur: 0.20, sway: 1.3,
+    flashR: 14, flashDur: 0.20, sway: 1.3,
   );
 
   static const WeaponView _cluster = WeaponView(
     id: 'cluster',
-    receiverX0: -3, receiverX1: 8, receiverH: 5,
-    barrelX0: 8, barrelX1: 20, bore: 4.5, muzzleX: 24,
-    drumR: 3.6,
+    receiverX0: -4, receiverX1: 5, receiverH: 16.5,
+    barrelX0: 5, barrelX1: 16, bore: 15, muzzleX: 20,
+    stockLen: 3.5,
+    drumR: 5.5,
     prongLen: 4,
-    gripX: -1.5, gripY: 1.5,
-    supportForeX: 9, supportForeY: 0,
+    gripX: -2, gripY: 12.5,
+    supportForeX: 9, supportForeY: 1,
     supportStyle: GripStyle.foregrip,
     holdDist: 14,
     kick: 5, climb: 0.26, recoilDur: 0.28,
@@ -183,15 +218,16 @@ class WeaponView {
 
   static const WeaponView _anchor = WeaponView(
     id: 'anchor',
-    receiverX0: -5, receiverX1: 8, receiverH: 7,
-    barrelX0: 8, barrelX1: 28, bore: 6.5, muzzleX: 32,
+    receiverX0: -9, receiverX1: 7, receiverH: 24,
+    barrelX0: 7, barrelX1: 26, bore: 22, muzzleX: 31,
+    stockLen: 9,
     prongLen: 4,
-    gripX: -3, gripY: 1.5,
-    supportForeX: 12, supportForeY: 0,
+    gripX: -4, gripY: 16,
+    supportForeX: 15, supportForeY: 1.5,
     supportStyle: GripStyle.foregrip,
     holdDist: 15,
     kick: 9.5, climb: 0.45, recoilDur: 0.45,
-    flashR: 14, flashDur: 0.22, sway: 1.4,
+    flashR: 16, flashDur: 0.22, sway: 1.4,
   );
 
   static const Map<String, WeaponView> _all = {
@@ -211,13 +247,6 @@ class WeaponView {
     if (selected != null) return forId(selected.id);
     return forId('tennis');
   }
-
-  /// Forearm support: the foregrip/pump handle slides with the pump.
-  Offset supportTarget(double pumpT) =>
-      Offset(supportForeX + pumpT * pumpTravel, supportForeY);
-
-  /// Muzzle tip in weapon-local coordinates.
-  Offset get muzzle => Offset(muzzleX, 0);
 }
 
 /// Analytic two-bone IK: given a shoulder and a hand target, returns the
@@ -268,6 +297,7 @@ class ArmIK {
     Offset shoulder,
     Offset target, {
     double bend = 1,
+    double maxBend = 9.0,
   }) {
     var delta = target - shoulder;
     var dist = delta.distance;
@@ -294,7 +324,10 @@ class ArmIK {
 
     // Law of cosines for the elbow's position along the shoulder->hand line.
     final a = (up * up - fo * fo + dist * dist) / (2 * dist);
-    final h = sqrt(max(0.0, up * up - a * a));
+    // Clamp the perpendicular bulge: near-reach grips give an isosceles
+    // triangle with huge elbow excursion (chicken wings). Real gun carries
+    // are fairly straight — cap the bend.
+    final h = min(sqrt(max(0.0, up * up - a * a)), maxBend);
     final u = delta / dist;
     final perp = Offset(-u.dy * bend, u.dx * bend);
     final elbow = shoulder + u * a + perp * h;

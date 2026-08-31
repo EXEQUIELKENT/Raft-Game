@@ -19,6 +19,10 @@ import 'weapon_views.dart';
 /// panned horizontally by the camera — which is why the visible width varies
 /// with device aspect and is fed back into the world as `viewWidth`.
 /// ---------------------------------------------------------------------------
+
+/// How a drawn fist closes on the part it holds — see [_gripFist].
+enum FistWrap { stub, tube }
+
 class WorldRenderer {
   final BattleWorld world;
   final MapDef map;
@@ -768,7 +772,12 @@ class WorldRenderer {
     const boot = Color(0xFF23262B);
     const metal = Color(0xFF3B3F45);
 
+    final gunSide = dir >= 0 ? 1.0 : -1.0;
     final leanBack = recoil * 0.16;
+    // The upper-body block's common lean: recoil rocks the torso back about
+    // the hips, walking adds a slight forward hunch. Arms, torso, weapon and
+    // head all draw inside it so they pivot as one.
+    final lean = -leanBack * gunSide + crew.walkAmp * 0.04 * gunSide;
     final hipBobWalk = sin(crew.walkPhase * pi * 2 * 2).abs() * 1.2 * crew.walkAmp;
 
     // ---- Legs ----
@@ -798,8 +807,6 @@ class WorldRenderer {
       );
     }
 
-    final gunSide = dir >= 0 ? 1.0 : -1.0;
-
     // ---- Arms + firearm -------------------------------------------------
     // The equipped [WeaponView] supplies the grip layout: the firing hand
     // closes on the trigger grip, the support hand solves (analytic IK) to
@@ -821,10 +828,14 @@ class WorldRenderer {
       final angleRad = aimAngleDeg * pi / 180;
       final aimDir = Offset(gunSide * cos(angleRad), -sin(angleRad));
       gripBody = gunShoulder + aimDir * wv.holdDist;
-      // Local +x must point along the aim: for a left-facing raft the frame
-      // turns past vertical (mirroring `pi - angleRad` would flip the
-      // muzzle height instead).
-      bodyAng = gunSide > 0 ? angleRad : angleRad - pi;
+      // Local +x must point along the aim. Screen y-down: a positive canvas
+      // rotation tips the muzzle toward the ground, so right-facing aims
+      // rotate by NEGATIVE elevation, and a left-facing raft's aim line is
+      // the same ray past vertical (angleRad - pi) — never `pi - angleRad`,
+      // which mirrors the muzzle height. The bell mouth and receiver
+      // underside (the grip hangs at +y) stay below the tube line either
+      // way.
+      bodyAng = gunSide > 0 ? -angleRad : angleRad - pi;
     } else {
       // Low ready: grip at the hip, muzzle angled down-and-forward, with a
       // walk-cycle sway. Mid-swap the weapon drops toward the other hip.
@@ -835,51 +846,66 @@ class WorldRenderer {
       bodyAng = gunSide > 0 ? restA : pi - restA;
     }
 
-    // Weapon-local point -> body space, through the frame as posed (the
-    // recoil kick and muzzle climb are applied by the caller on top).
+    // Recoil-aware weapon frame: the whole assembly kicks back along the
+    // barrel and the muzzle climbs about the grip. Computed once here and
+    // fed to the model, the arms, and the fists alike — because the hands
+    // share the weapon's transform, they can never be left hanging when
+    // the gun slides.
+    final drawnAng = bodyAng - gunSide * recoil * wv.climb;
+    final drawnOrigin =
+        gripBody - Offset(cos(drawnAng), sin(drawnAng)) * (recoil * wv.kick);
+
+    // Weapon-local -> body space. MUST stay in lockstep with the canvas
+    // transform used to draw the firearm below: translate(origin), rotate,
+    // scale(1, facing) — grip-centered.
     Offset toBody(double wx, double wy) {
-      final lx = wx - wv.gripX, ly = wy - wv.gripY;
-      final p = Offset(lx, ly * gunSide);
-      final c = cos(bodyAng), s = sin(bodyAng);
-      return gripBody + Offset(p.dx * c - p.dy * s, p.dx * s + p.dy * c);
+      final p = Offset(wx - wv.gripX, (wy - wv.gripY) * gunSide);
+      final c = cos(drawnAng), s = sin(drawnAng);
+      return drawnOrigin + Offset(p.dx * c - p.dy * s, p.dx * s + p.dy * c);
     }
 
-    // The trigger hand sits exactly on the grip.
-    final gunHand = toBody(wv.gripX, wv.gripY);
-    // Support-hand target: on the weapon's foregrip/pump line, choked up
-    // toward the grip to the furthest spot the arm can actually reach —
-    // long guns are held shorter, short guns right at the foregrip. This is
-    // what keeps every grip looking natural without per-weapon poses.
-    final suppAxis = Offset(cos(bodyAng), sin(bodyAng));
+    // Support-hand target: choke-up measured from the support SHOULDER
+    // (the arm's pivot), along the weapon from its rear — so the hand can
+    // rest anywhere on the gun, including behind the grip. Long guns get
+    // held short near the receiver, short guns right at the foregrip. At
+    // the extreme it degenerates to a rear heft — which is how the
+    // cartoon-scale rig actually holds a cannon.
+    final pumpBack = pumpT * wv.pumpTravel;
+    final suppAxis = Offset(cos(drawnAng), sin(drawnAng));
     final suppT = ArmIK.chokeUp(
-      anchor: gripBody,
+      anchor: drawnOrigin,
       axis: suppAxis,
       shoulder: suppShoulder,
-      preferredT: wv.supportForeX - wv.gripX,
-      minT: 1,
+      preferredT: wv.supportForeX - pumpBack - wv.gripX,
+      minT: wv.receiverX0 - wv.gripX,
       maxT: (wv.muzzleX - wv.gripX) * 0.85,
     );
     final suppLocal = Offset(wv.gripX + suppT, wv.supportForeY);
     final suppHand = toBody(suppLocal.dx, suppLocal.dy);
 
+    // The hands only look right if the arms don't: both elbows break
+    // downward/outward under the weapon's weight, solved in the same
+    // torso-local space the arms are drawn in, so wrists stay welded to
+    // their fists through recoil lean and walk hunch.
     final suppBend = gunSide * wv.supportBend;
     final (suppElbow, suppHandSolved) = ArmIK.solve(suppShoulder, suppHand, bend: suppBend);
-    final (gunElbow, _) = ArmIK.solve(
-      gunShoulder, gunHand,
-      bend: -gunSide,
-    );
+    final gunHand = toBody(wv.gripX, wv.gripY);
+    final (gunElbow, _) = ArmIK.solve(gunShoulder, gunHand, bend: gunSide);
 
-    // ---- Support arm (behind torso and weapon) ----
-    _limb(canvas, suppShoulder, suppElbow, 9, suit);
-    _limb(canvas, suppElbow, suppHandSolved, 8, skin);
-
-    // ---- Torso ----
+    // ---- Arms + torso: one leaned block ----
+    // The whole upper body — shoulders, arms, torso, weapon and fists —
+    // draws inside the torso's recoil lean, so they pivot as one rigid
+    // unit and wrists can never detach from grips mid-kick. Within it the
+    // order is depth order: far upper arm, torso, far forearm reaching
+    // across the chest, near arm, then the weapon with both fists wrapped
+    // last, on top.
     canvas.save();
-    // Recoil leans the whole upper body back about the hips; walking adds
-    // a slight forward hunch.
     canvas.translate(0, hipY);
-    canvas.rotate(-leanBack * gunSide + crew.walkAmp * 0.04 * gunSide);
+    canvas.rotate(lean);
     canvas.translate(0, -hipY);
+
+    _limb(canvas, suppShoulder, suppElbow, 9, suit);
+
     canvas.drawRRect(
       RRect.fromRectAndCorners(
         Rect.fromLTWH(-torsoW / 2, shoulderY, torsoW, torsoH),
@@ -898,50 +924,57 @@ class WorldRenderer {
       Paint()..color = Colors.black.withOpacity(0.1),
     );
 
-    // ---- Gun arm (over the torso, so it always reads in front) ----
+    // Elbow: a shallow dark crease over the joint so the IK kink reads as
+    // a bent arm, not a sharp fold.
+    void elbows(Offset e) {
+      canvas.drawCircle(
+        e,
+        5.4,
+        Paint()
+          ..color = Colors.black.withOpacity(0.14)
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = 1.6,
+      );
+    }
+
+    _limb(canvas, suppElbow, suppHandSolved, 8, skin);
+    elbows(suppElbow);
     _limb(canvas, gunShoulder, gunElbow, 9, suit);
     _limb(canvas, gunElbow, gunHand, 8, skin);
+    elbows(gunElbow);
 
-    // ---- The equipped firearm ----
-    // The hands close AROUND the model: both palms draw before it (the
-    // barrel and grip sit inside the closed grip), the knuckle rows wrap
-    // over it after — that layering is what makes the grip anatomical.
-    // Recoil kicks the whole frame back along the barrel and climbs the
-    // muzzle about the grip; the hands ride the frame with it.
+    // ---- The equipped firearm + gripping hands ----
+    // One transform carries the model AND both fists: the weapon-local
+    // positions are identical for hands and geometry, so a fist can't
+    // drift off its grip — at any aim angle, facing, or mid-recoil.
     if (crew.alive) {
-      final bodyAngDrawn = bodyAng - gunSide * recoil * wv.climb;
-      final barrelDir = Offset(cos(bodyAngDrawn), sin(bodyAngDrawn));
-      final frameOrigin = gripBody - barrelDir * (recoil * wv.kick);
-      final suppPalmC = toBody(
-        suppLocal.dx, suppLocal.dy + wv.barrelThickness / 2 + 2.6,
-      );
-      final suppKnC = toBody(
-        suppLocal.dx, suppLocal.dy - wv.barrelThickness / 2 - 1.6,
-      );
-      final gunPalmC = toBody(wv.gripX - 2.4, wv.gripY + 1.2);
-      final gunKnC = toBody(wv.gripX + 2.4, wv.gripY + 2.2);
-      final gunThumbC = toBody(wv.gripX + 0.6, wv.gripY - 2.8);
-
-      _handPalm(canvas, suppPalmC, bodyAngDrawn, skin);
-      _handPalm(canvas, gunPalmC, bodyAngDrawn, skin);
-
       canvas.save();
-      canvas.translate(frameOrigin.dx, frameOrigin.dy);
-      canvas.rotate(bodyAngDrawn);
+      canvas.translate(drawnOrigin.dx, drawnOrigin.dy);
+      canvas.rotate(drawnAng);
       canvas.scale(1, gunSide);
       canvas.translate(-wv.gripX, -wv.gripY);
       _firearm(canvas, wv, accent, metal, pumpT: pumpT);
+      // Support hand (far side) closes first, then the firing hand sits
+      // over its grip on the near side. Layering both over the model is
+      // what reads as "barrel passing through a wrapped fist".
+      _gripFist(
+        canvas,
+        suppLocal,
+        skin,
+        wrap: wv.supportStyle == GripStyle.foregrip ? FistWrap.tube : FistWrap.stub,
+        tubeHalf: wv.barrelThickness / 2,
+        gripTopY: wv.stubTopY,
+        foregrip: wv.supportStyle == GripStyle.foregrip,
+      );
+      _gripFist(
+        canvas,
+        Offset(wv.gripX, wv.gripY),
+        skin,
+        wrap: FistWrap.stub,
+        gripTopY: wv.stubTopY,
+        thumb: true,
+      );
       canvas.restore();
-
-      _handKnuckles(
-        canvas, suppKnC, bodyAngDrawn, skin,
-        along: 3.0, over: 0, count: 4,
-      );
-      _handKnuckles(
-        canvas, gunKnC, bodyAngDrawn + pi / 2, skin,
-        along: 3.0, over: -2.2, count: 3,
-      );
-      _handThumb(canvas, gunThumbC, bodyAngDrawn, skin);
 
       // Muzzle flash at the true muzzle tip — size and burn time come from
       // the view, so the mortar barks and the pop pistol snaps.
@@ -993,85 +1026,112 @@ class WorldRenderer {
     canvas.restore();
   }
 
-  /// Palm slab for a gripping hand, long axis rotated to [angle].
-  void _handPalm(Canvas canvas, Offset center, double angle, Color skin) {
-    canvas.save();
-    canvas.translate(center.dx, center.dy);
-    canvas.rotate(angle);
+  /// Fist body + knuckle shading shared by the wraps below: a rounded palm
+  /// block with a soft outline so hands read against the weapon, not as
+  /// flat blobs on top of it.
+  void _fistBody(Canvas canvas, Offset c, double w, double h, Color skin) {
     final r = RRect.fromRectAndRadius(
-      Rect.fromCenter(center: Offset.zero, width: 11.5, height: 9),
-      const Radius.circular(4.2),
+      Rect.fromCenter(center: c, width: w, height: h),
+      Radius.circular((w < h ? w : h) * 0.42),
     );
     canvas.drawRRect(r, Paint()..color = skin);
     canvas.drawRRect(
       r,
       Paint()
-        ..color = Colors.black.withOpacity(0.12)
+        ..color = Colors.black.withOpacity(0.14)
         ..style = PaintingStyle.stroke
         ..strokeWidth = 1,
     );
-    canvas.restore();
   }
 
-  /// Knuckle pads — the finger row that wraps a grip. [along] spaces the
-  /// pads along the grip's long axis, [over] pushes them across it (which
-  /// side of the weapon the fingers close from).
-  void _handKnuckles(
+  /// How a fist closes on the part it holds.
+  ///
+  /// - [FistWrap.stub]: around a near-vertical grip — palm centered on the
+  ///   grip point, three knuckle creases on the muzzle-facing side, and a
+  ///   thumb running up the stub to press under the receiver ([gripTopY]).
+  ///   The stub pokes out above and below the fist.
+  /// - [FistWrap.tube]: around the barrel/foregrip — [at] is a point on the
+  ///   tube's centre-line; the palm hangs below it and three finger bands
+  ///   curl up OVER the tube (with visible shaft segments between them), so
+  ///   the tube reads as passing through a closed hand.
+  /// [scale] grows the whole hand slightly for fatter tubes — a fist
+  /// gripping a 14-unit mortar barrel shouldn't look like the fist on a
+  /// 9-unit pistol.
+  void _gripFist(
     Canvas canvas,
-    Offset center,
-    double angle,
+    Offset at,
     Color skin, {
-    double along = 3.0,
-    double over = 3.4,
-    int count = 4,
+    required FistWrap wrap,
+    double tubeHalf = 0,
+    double gripTopY = 0,
+    bool foregrip = false,
+    bool thumb = false,
+    double scale = 1.0,
   }) {
-    final shade = Color.lerp(skin, Colors.black, 0.18)!;
-    canvas.save();
-    canvas.translate(center.dx, center.dy);
-    canvas.rotate(angle);
-    for (int i = 0; i < count; i++) {
-      final dx = (i - (count - 1) / 2) * along;
-      canvas.drawRRect(
-        RRect.fromRectAndRadius(
-          Rect.fromCenter(center: Offset(dx, over), width: 3.0, height: 5.4),
-          const Radius.circular(1.5),
-        ),
-        Paint()..color = shade,
-      );
+    final shade = Color.lerp(skin, Colors.black, 0.22)!;
+    final crease = Paint()
+      ..color = Colors.black.withOpacity(0.22)
+      ..strokeWidth = 1.1
+      ..strokeCap = StrokeCap.round;
+
+    if (wrap == FistWrap.stub) {
+      // Palm around the grip stub, centered on the grip point.
+      _fistBody(canvas, at, 9.5, 8.6, skin);
+      // Knuckle creases on the muzzle-facing side of the palm.
+      canvas.drawLine(at + const Offset(0.6, -2.2), at + const Offset(4.7, -2.4), crease);
+      canvas.drawLine(at + const Offset(0.9, -0.4), at + const Offset(4.9, -0.6), crease);
+      canvas.drawLine(at + const Offset(0.9, 1.8), at + const Offset(4.7, 1.6), crease);
+      if (thumb) {
+        // Thumb running up the stub to brace under the receiver.
+        final top = gripTopY > 0 ? gripTopY + 0.6 : at.dy - 4.6;
+        canvas.drawRRect(
+          RRect.fromRectAndRadius(
+            Rect.fromLTWH(at.dx + 1.5, top, 4.3, (at.dy + 1.4) - top),
+            const Radius.circular(1.9),
+          ),
+          Paint()..color = skin,
+        );
+      }
+    } else {
+      // Palm mass hanging just under the tube.
+      _fistBody(canvas, at + Offset(0, tubeHalf * 0.55 + 2.2), 10.5 * scale,
+          7.4, skin);
+      // Fingers curling up over the barrel — bands crossing the tube with
+      // visible tube segments poking through between them.
+      for (final fx in [-3.0, -0.2, 2.6]) {
+        final top = at.dy - tubeHalf - 1.7;
+        final bottom = at.dy + tubeHalf + 2.4;
+        canvas.drawRRect(
+          RRect.fromRectAndRadius(
+            Rect.fromLTWH(at.dx + fx * scale - 1.3, top, 2.7 * scale, bottom - top),
+            const Radius.circular(1.3),
+          ),
+          Paint()..color = shade,
+        );
+      }
+      if (foregrip) {
+        // Thumb hooking the muzzle-side underside of the grip.
+        canvas.drawRRect(
+          RRect.fromRectAndRadius(
+            Rect.fromCenter(
+              center: at + Offset(4.6, tubeHalf + 1.6),
+              width: 4.6,
+              height: 3.0,
+            ),
+            const Radius.circular(1.5),
+          ),
+          Paint()..color = skin,
+        );
+      }
     }
-    canvas.restore();
   }
 
-  /// Thumb pad bracing at an offset from the hand center.
-  void _handThumb(
-    Canvas canvas,
-    Offset center,
-    double angle,
-    Color skin, {
-    double dx = 0,
-    double dy = 0,
-  }) {
-    canvas.save();
-    canvas.translate(center.dx, center.dy);
-    canvas.rotate(angle);
-    final r = RRect.fromRectAndRadius(
-      Rect.fromCenter(center: Offset(dx, dy), width: 4.4, height: 5.2),
-      const Radius.circular(2),
-    );
-    canvas.drawRRect(r, Paint()..color = skin);
-    canvas.drawRRect(
-      r,
-      Paint()
-        ..color = Colors.black.withOpacity(0.12)
-        ..style = PaintingStyle.stroke
-        ..strokeWidth = 1,
-    );
-    canvas.restore();
-  }  /// The equipped firearm, drawn in weapon-local coordinates: origin at the
-  /// trigger grip, +x toward the muzzle, +y down. Geometry comes entirely
-  /// from the [WeaponView] — receiver, barrel, stock, drum, prongs and pump
-  /// slide — so each projectile type carries a genuinely different model,
-  /// not a recoloured stub.
+  /// The equipped firearm, drawn in weapon-local coordinates: origin at the
+  /// trigger grip, +x toward the muzzle, +y down. A blunderbuss silhouette
+  /// sized by the [WeaponView]: a slim shaft barrel flaring into a bell
+  /// mouth wide enough for the round it fires, a bore-dark opening ringed in
+  /// the caliber's accent colour, and furniture (receiver, stock, drum,
+  /// grip, prongs, pump) in proportion to the bore.
   void _firearm(
     Canvas canvas,
     WeaponView wv,
@@ -1079,95 +1139,130 @@ class WorldRenderer {
     Color metal, {
     double pumpT = 0,
   }) {
-    // Butt stock behind the grip (shoulder-fired heavies).
+    final t = wv.barrelThickness;
+    final half = wv.bore / 2;
+    const wood = Color(0xFF8A5F35);
+    final darkMetal = Color.lerp(metal, Colors.black, 0.42)!;
+
+    // Butt stock behind the receiver — a shoulder wedge on the heavies.
     if (wv.stockLen > 0) {
+      final stockH = wv.receiverH * 0.46;
       canvas.drawRRect(
         RRect.fromRectAndRadius(
-          Rect.fromLTWH(wv.receiverX0 - wv.stockLen, -1.5, wv.stockLen + 4, 4.5),
-          const Radius.circular(2),
+          Rect.fromLTWH(wv.receiverX0 - wv.stockLen,
+              wv.receiverHalf * 0.14 - stockH * 0.5, wv.stockLen + 3, stockH),
+          const Radius.circular(2.5),
         ),
-        Paint()..color = const Color(0xFF8A5F35),
+        Paint()..color = wood,
       );
     }
-    // Barrel, with a stepped profile: fat at the receiver, tapering out.
-    // Its bore is the exact caliber the weapon fires (see [WeaponView.bore]).
-    final t = wv.barrelThickness;
-    final midX = (wv.barrelX0 + wv.barrelX1) / 2;
-    canvas.drawRRect(
-      RRect.fromRectAndRadius(
-        Rect.fromLTWH(wv.barrelX0, -t / 2 - 0.6, midX - wv.barrelX0, t + 1.2),
-        const Radius.circular(1.6),
-      ),
-      Paint()..color = metal,
-    );
-    canvas.drawRRect(
-      RRect.fromRectAndRadius(
-        Rect.fromLTWH(midX, -t / 2, wv.barrelX1 - midX, t),
-        const Radius.circular(1.4),
-      ),
-      Paint()..color = Color.lerp(metal, Colors.white, 0.12)!,
-    );
-    // Receiver.
-    canvas.drawRRect(
-      RRect.fromRectAndRadius(
-        Rect.fromLTWH(wv.receiverX0, -wv.receiverH / 2, wv.receiverX1 - wv.receiverX0, wv.receiverH),
-        const Radius.circular(2.4),
-      ),
-      Paint()..color = metal,
-    );
-    // Ammunition drum (mortar-type feed), showing the caliber colour.
+
+    // Ammunition drum hanging under the receiver (drawn first so the
+    // mechanism boxes sit over its mounting).
     if (wv.drumR > 0) {
-      final drumC = Offset((wv.receiverX0 + wv.receiverX1) / 2, wv.receiverH / 2 + wv.drumR - 1.5);
-      canvas.drawCircle(drumC, wv.drumR, Paint()..color = Color.lerp(metal, Colors.black, 0.3)!);
+      final drumC = Offset(
+        (wv.receiverX1 + wv.barrelX0) / 2,
+        wv.receiverHalf + wv.drumR * 0.62 - 1,
+      );
+      canvas.drawCircle(drumC, wv.drumR, Paint()..color = darkMetal);
       canvas.drawCircle(drumC, wv.drumR * 0.55, Paint()..color = accent);
     }
-    // Muzzle prongs / brake (spreaders + long guns).
+
+    // Shaft barrel: slim, so both fists can actually close around it.
+    canvas.drawRRect(
+      RRect.fromRectAndRadius(
+        Rect.fromLTWH(wv.barrelX0, -t / 2, wv.barrelX1 - wv.barrelX0, t),
+        Radius.circular(t / 2.4),
+      ),
+      Paint()..color = metal,
+    );
+
+    // Bell mouth: the flare that matches the muzzle to the round's size.
+    final bell = Path()
+      ..moveTo(wv.barrelX1 - 1, -t / 2 + 0.5)
+      ..quadraticBezierTo(wv.muzzleX - half * 0.5, -t / 2, wv.muzzleX - 2, -half)
+      ..lineTo(wv.muzzleX - 2, half)
+      ..quadraticBezierTo(wv.muzzleX - half * 0.5, t / 2, wv.barrelX1 - 1, t / 2 - 0.5)
+      ..close();
+    canvas.drawPath(bell, Paint()..color = Color.lerp(metal, Colors.white, 0.12)!);
+
+    // The bore itself: a dark recessed opening at the muzzle plane...
+    canvas.drawRRect(
+      RRect.fromRectAndRadius(
+        Rect.fromLTWH(wv.muzzleX - 2.6, -half + 0.6, 3.0, wv.bore - 1.2),
+        Radius.circular(half * 0.5),
+      ),
+      Paint()..color = darkMetal,
+    );
+    // ...rimmed in the caliber's accent, so the muzzle reads at a glance
+    // as the right size for the projectile.
+    canvas.drawRRect(
+      RRect.fromRectAndRadius(
+        Rect.fromLTWH(wv.muzzleX - 1.6, -half, 1.9, wv.bore),
+        Radius.circular(half * 0.55),
+      ),
+      Paint()..color = accent,
+    );
+
+    // Muzzle prongs / brake fins splaying off the bell (spreaders, cannon).
     if (wv.prongLen > 0) {
-      for (final dy in [-t / 2 - 0.5, t / 2 + 0.5]) {
+      final prong = Paint()
+        ..color = metal
+        ..strokeWidth = 2.0
+        ..strokeCap = StrokeCap.round;
+      for (final s in [-1.0, 1.0]) {
         canvas.drawLine(
-          Offset(wv.barrelX1 - 1, dy),
-          Offset(wv.muzzleX, dy * 1.7),
-          Paint()
-            ..color = metal
-            ..strokeWidth = 1.8
-            ..strokeCap = StrokeCap.round,
+          Offset(wv.muzzleX - 1.5, s * (half - 0.5)),
+          Offset(wv.muzzleX + wv.prongLen, s * (half + 2.8)),
+          prong,
         );
       }
     }
-    // Accent muzzle cap — an open bore the exact diameter of the round.
-    canvas.drawRect(
-      Rect.fromLTWH(wv.muzzleX - 2, -wv.bore / 2 - 0.4, 2.4, wv.bore + 0.8),
-      Paint()..color = accent,
+
+    // Receiver — the boxy action housing the round.
+    canvas.drawRRect(
+      RRect.fromRectAndRadius(
+        Rect.fromLTWH(
+            wv.receiverX0, -wv.receiverHalf, wv.receiverX1 - wv.receiverX0, wv.receiverH),
+        const Radius.circular(3),
+      ),
+      Paint()..color = metal,
     );
-    // Pump slide — rides the barrel, runs its cycle on fire.
+
+    // Pump slide — hangs under the shaft, runs its cycle rearward on fire
+    // (the support-hand target tracks the same offset).
     if (wv.pumpTravel > 0) {
       canvas.drawRRect(
         RRect.fromRectAndRadius(
-          Rect.fromLTWH(wv.pumpX0 + pumpT * wv.pumpTravel, -t / 2 - 1.4,
-              wv.pumpX1 - wv.pumpX0, t + 2.8),
+          Rect.fromLTWH(wv.pumpX0 - pumpT * wv.pumpTravel, t / 2 - 1.0,
+              wv.pumpX1 - wv.pumpX0, 4.8),
           const Radius.circular(2),
         ),
         Paint()..color = const Color(0xFF23262B),
       );
     }
-    // Trigger grip: the frame origin the firing hand closes on.
-    canvas.drawRRect(
-      RRect.fromRectAndRadius(
-        Rect.fromLTWH(wv.gripX - 2.5, wv.gripY - 1, 5.5, 7),
-        const Radius.circular(2),
-      ),
-      Paint()..color = const Color(0xFF23262B),
-    );
-    // Foregrip under the barrel where the support hand clamps.
+
+    // Foregrip block under the shaft where the support hand clamps.
     if (wv.supportStyle == GripStyle.foregrip) {
       canvas.drawRRect(
         RRect.fromRectAndRadius(
-          Rect.fromLTWH(wv.supportForeX - 2, wv.supportForeY - 4.5, 4, 6),
+          Rect.fromLTWH(wv.supportForeX - 2.4, t / 2 - 1, 4.8, 5.4),
           const Radius.circular(2),
         ),
         Paint()..color = const Color(0xFF23262B),
       );
     }
+
+    // Trigger grip: a stub dropping out of the receiver's underside —
+    // hand-sized, not barrel-sized, which is what keeps the fists looking
+    // right next to a wide gun.
+    canvas.drawRRect(
+      RRect.fromRectAndRadius(
+        Rect.fromLTWH(wv.gripX - 3.4, wv.stubTopY, 6.8, 9.8),
+        const Radius.circular(2.8),
+      ),
+      Paint()..color = const Color(0xFF23262B),
+    );
   }
 
   /// Draws a crew member straight from their live ragdoll pose: limbs are
@@ -1256,13 +1351,16 @@ class WorldRenderer {
       canvas.scale(1, dir >= 0 ? 1 : -1);
       canvas.translate(-wv.gripX, -wv.gripY);
       _firearm(canvas, wv, Weapons.byId(wv.id).color, metal);
-      // The firing hand stays wrapped around the grip mid-tumble.
-      _handPalm(canvas, Offset(wv.gripX - 2.4, wv.gripY + 1.2), 0, skin);
-      _handKnuckles(
-        canvas, Offset(wv.gripX + 2.4, wv.gripY + 2.2), pi / 2, skin,
-        along: 3.0, over: -2.2, count: 3,
+      // The firing hand stays wrapped around the grip mid-tumble — same
+      // fist, same frame as the standing pose.
+      _gripFist(
+        canvas,
+        Offset(wv.gripX, wv.gripY),
+        skin,
+        wrap: FistWrap.stub,
+        gripTopY: wv.stubTopY,
+        thumb: true,
       );
-      _handThumb(canvas, Offset(wv.gripX + 0.6, wv.gripY - 2.8), 0, skin);
       canvas.restore();
     }
 

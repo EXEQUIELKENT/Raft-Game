@@ -77,17 +77,33 @@ void main() {
     test('Firearm scale matches the caliber: bore tracks the projectile size', () {
       for (final w in Weapons.all) {
         final view = WeaponView.forId(w.id);
-        // The bore is derived from the projectile's drawn radius
-        // (`9 * weight`), so the muzzle opening always fits its own round.
-        // Values are hand-rounded to one decimal from that formula.
-        expect(view.bore, closeTo(WeaponView.boreFor(w), 0.1),
-            reason: '${w.id}: bore must match the projectile radius');
-        // Walls exist: the barrel is thicker than the opening.
-        expect(view.barrelThickness, greaterThan(view.bore));
+        // The bell mouth is sized from the round's drawn diameter
+        // (radius `9 * weight` at render time): ~76% of it, hand-rounded to
+        // half units. The ball visibly belongs to the opening it left.
+        final roundDiameter = 2 * 9.0 * w.weight;
+        expect(view.bore, closeTo(WeaponView.boreFor(w), 0.25),
+            reason: '${w.id}: bore must track the projectile');
+        expect(view.bore, greaterThan(roundDiameter * 0.7),
+            reason: '${w.id}: bell mouth admits most of its round');
+        // Blunderbuss profile: the shaft is a hand-wrappable tube and the
+        // muzzle *flares* out to the full bore — never the reverse.
+        expect(view.barrelThickness, lessThan(view.bore),
+            reason: '${w.id}: shaft must be slimmer than its bell');
+        expect(view.barrelThickness, inInclusiveRange(8.5, 16),
+            reason: '${w.id}: shaft stays grippable next to a ~10-unit fist');
+        expect(view.flare, greaterThan(view.bore),
+            reason: '${w.id}: the rim reads wider than the tube');
+        // The receiver is the boxy housing the round actually sits in.
+        expect(view.receiverH, greaterThanOrEqualTo(view.bore),
+            reason: '${w.id}: receiver houses its caliber');
       }
-      // Heavier calibers get proportionally bigger bores.
-      expect(WeaponView.forId('bomb').bore, greaterThan(WeaponView.forId('tennis').bore));
-      expect(WeaponView.forId('anchor').bore, greaterThan(WeaponView.forId('grenade').bore));
+      // Heavier calibers get proportionally bigger guns, end to end.
+      final byWeight = <String>['tennis', 'cluster', 'grenade', 'bomb', 'anchor'];
+      for (int i = 1; i < byWeight.length; i++) {
+        expect(WeaponView.forId(byWeight[i]).bore,
+            greaterThan(WeaponView.forId(byWeight[i - 1]).bore),
+            reason: '${byWeight[i]} must out-size ${byWeight[i - 1]}');
+      }
     });
 
     test('Grip layouts differ per weapon: foregrips, cups and rear hefts', () {
