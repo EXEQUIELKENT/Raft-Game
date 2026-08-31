@@ -74,6 +74,22 @@ void main() {
           greaterThan(WeaponView.forId('tennis').recoilDur));
     });
 
+    test('Firearm scale matches the caliber: bore tracks the projectile size', () {
+      for (final w in Weapons.all) {
+        final view = WeaponView.forId(w.id);
+        // The bore is derived from the projectile's drawn radius
+        // (`9 * weight`), so the muzzle opening always fits its own round.
+        // Values are hand-rounded to one decimal from that formula.
+        expect(view.bore, closeTo(WeaponView.boreFor(w), 0.1),
+            reason: '${w.id}: bore must match the projectile radius');
+        // Walls exist: the barrel is thicker than the opening.
+        expect(view.barrelThickness, greaterThan(view.bore));
+      }
+      // Heavier calibers get proportionally bigger bores.
+      expect(WeaponView.forId('bomb').bore, greaterThan(WeaponView.forId('tennis').bore));
+      expect(WeaponView.forId('anchor').bore, greaterThan(WeaponView.forId('grenade').bore));
+    });
+
     test('Grip layouts differ per weapon: foregrips, cups and rear hefts', () {
       expect(WeaponView.forId('tennis').supportStyle, GripStyle.cup);
       expect(WeaponView.forId('grenade').supportStyle, GripStyle.foregrip);

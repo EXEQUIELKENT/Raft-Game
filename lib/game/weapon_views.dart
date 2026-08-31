@@ -41,7 +41,11 @@ class WeaponView {
   final double receiverH;
   final double barrelX0;
   final double barrelX1;
-  final double barrelW;
+
+  /// Diameter of the muzzle opening. Sized from the projectile the weapon
+  /// fires ([boreFor]), with the barrel walls adding to it — see
+  /// [barrelThickness].
+  final double bore;
   final double muzzleX;
 
   /// A butt stock drawn behind the grip (heavy shoulder-fired guns).
@@ -92,7 +96,7 @@ class WeaponView {
     required this.receiverH,
     required this.barrelX0,
     required this.barrelX1,
-    required this.barrelW,
+    required this.bore,
     required this.muzzleX,
     this.stockLen = 0,
     this.drumR = 0,
@@ -115,10 +119,18 @@ class WeaponView {
     required this.sway,
   });
 
+  /// Muzzle bore for [w], proportional to the round's drawn radius
+  /// (`9 * weight` in the projectile renderer): the muzzle opening always
+  /// reads as sized for the exact caliber the weapon fires.
+  static double boreFor(WeaponDef w) => 9.0 * w.weight * 0.45;
+
+  /// Outer barrel thickness: the bore plus the tube walls.
+  double get barrelThickness => bore + 1.2;
+
   static const WeaponView _tennis = WeaponView(
     id: 'tennis',
     receiverX0: -2, receiverX1: 7, receiverH: 5,
-    barrelX0: 7, barrelX1: 18, barrelW: 2.6, muzzleX: 20,
+    barrelX0: 7, barrelX1: 18, bore: 4.05, muzzleX: 20,
     gripX: 0, gripY: 1.5,
     supportForeX: -3, supportForeY: 4,
     supportStyle: GripStyle.cup,
@@ -130,8 +142,8 @@ class WeaponView {
   static const WeaponView _grenade = WeaponView(
     id: 'grenade',
     receiverX0: -4, receiverX1: 8, receiverH: 6,
-    barrelX0: 8, barrelX1: 23, barrelW: 4.4, muzzleX: 25,
-    drumR: 4,
+    barrelX0: 8, barrelX1: 23, bore: 4.7, muzzleX: 25,
+    drumR: 4.2,
     pumpTravel: 4, pumpX0: 12, pumpX1: 16,
     gripX: -2, gripY: 1.5,
     supportForeX: 14, supportForeY: 0,
@@ -144,7 +156,7 @@ class WeaponView {
   static const WeaponView _bomb = WeaponView(
     id: 'bomb',
     receiverX0: -6, receiverX1: 6, receiverH: 7,
-    barrelX0: 6, barrelX1: 15, barrelW: 5.5, muzzleX: 17,
+    barrelX0: 6, barrelX1: 15, bore: 5.5, muzzleX: 17,
     stockLen: 6,
     gripX: -4, gripY: 1.5,
     supportForeX: -2, supportForeY: 2.5,
@@ -158,8 +170,8 @@ class WeaponView {
   static const WeaponView _cluster = WeaponView(
     id: 'cluster',
     receiverX0: -3, receiverX1: 8, receiverH: 5,
-    barrelX0: 8, barrelX1: 20, barrelW: 4, muzzleX: 24,
-    drumR: 3.5,
+    barrelX0: 8, barrelX1: 20, bore: 4.5, muzzleX: 24,
+    drumR: 3.6,
     prongLen: 4,
     gripX: -1.5, gripY: 1.5,
     supportForeX: 9, supportForeY: 0,
@@ -171,8 +183,8 @@ class WeaponView {
 
   static const WeaponView _anchor = WeaponView(
     id: 'anchor',
-    receiverX0: -5, receiverX1: 8, receiverH: 6,
-    barrelX0: 8, barrelX1: 28, barrelW: 3.6, muzzleX: 32,
+    receiverX0: -5, receiverX1: 8, receiverH: 7,
+    barrelX0: 8, barrelX1: 28, bore: 6.5, muzzleX: 32,
     prongLen: 4,
     gripX: -3, gripY: 1.5,
     supportForeX: 12, supportForeY: 0,
