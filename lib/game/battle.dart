@@ -1162,12 +1162,11 @@ class Fx {
 
   /// Cached unit-radius gradient paint for the gradient-heavy kinds ('boom',
   /// 'fire'). The radial gradient is rotation-invariant and its colours only
-  /// depend on the fx's own lifetime, so it is built once here and drawn
-  /// through a scaled canvas transform — instead of rebuilding the shader
-  /// object every frame for every explosion on screen (the old per-frame
-  /// allocation was the visible hitch when explosive volleys landed).
-  Paint? _unitPaint;
-
+  /// depend on the fx's own lifetime, so the shader is built once per
+  /// progress bucket and drawn through a scaled canvas transform — instead
+  /// of rebuilding the shader object every frame for every explosion on
+  /// screen (the old per-frame allocation was the visible hitch when
+  /// explosive volleys landed).
   /// The gradient paints, parameterised by how far into the fx's life we are
   /// — rebuilt only when the progress bucket changes, not every frame.
   Paint? _paint;
@@ -1178,24 +1177,37 @@ class Fx {
     if (bucket != _paintBucket) {
       _paintBucket = bucket;
       final p = 1 - bucket / 20;
-      final shader = RadialGradient(
-        colors: switch (kind) {
-          'boom' => [
-              Colors.white.withOpacity(p),
-              const Color(0xFFFFB347).withOpacity(p * 0.85),
-              const Color(0x00FF7A3C),
-            ],
-          'fire' => [
-              Colors.white.withOpacity(p * 0.95),
-              const Color(0xFFFFB347).withOpacity(p * 0.9),
-              const Color(0xFFE2541E).withOpacity(p * 0.55),
-              const Color(0xFFE2541E).withOpacity(0),
-            ],
-          _ => [accentLike(this).withOpacity(p), accentLike(this).withOpacity(0)],
-        },
-        stops: kind == 'fire' ? const [0.0, 0.4, 0.75, 1.0] : const [0.0, 0.55, 1.0],
-      ).createShader(Rect.fromCircle(center: Offset.zero, radius: 1));
-      _paint!.shader = shader;
+      final colors = <Color>[];
+      final stops = <double>[];
+      switch (kind) {
+        case 'boom':
+          colors.addAll([
+            const Color(0xFFFFFFFF).withOpacity(p),
+            const Color(0xFFFFB347).withOpacity(p * 0.85),
+            const Color(0x00FF7A3C),
+          ]);
+          stops.addAll(const [0.0, 0.55, 1.0]);
+          break;
+        case 'fire':
+          colors.addAll([
+            const Color(0xFFFFFFFF).withOpacity(p * 0.95),
+            const Color(0xFFFFB347).withOpacity(p * 0.9),
+            const Color(0xFFE2541E).withOpacity(p * 0.55),
+            const Color(0xFFE2541E).withOpacity(0),
+          ]);
+          stops.addAll(const [0.0, 0.4, 0.75, 1.0]);
+          break;
+        default:
+          colors.addAll([color.withOpacity(p), color.withOpacity(0)]);
+          stops.addAll(const [0.0, 1.0]);
+      }
+      _paint!.shader = Gradient.radial(
+        Offset.zero,
+        1,
+        colors,
+        stops,
+        TileMode.clamp,
+      );
     }
     return _paint!;
   }
@@ -2074,6 +2086,11 @@ class BattleWorld {
       fx.t += dt;
     }
     effects.removeWhere((f) => f.done);
+    // Safety cap: an explosive volley can stack boom/shock/fire/spark layers
+    // fast; past this, drop the oldest so the fx list can never balloon.
+    if (effects.length > 60) {
+      effects.removeRange(0, effects.length - 60);
+    }
     shake = max(0, shake - dt * BattleConst.shakeDecay);
 
     _bodyAccum += dt;

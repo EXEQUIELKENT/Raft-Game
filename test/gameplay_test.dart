@@ -334,4 +334,62 @@ void main() {
       expect(sum, closeTo(0, 0.001), reason: 'crew are centred on the deck');
     });
   });
+
+  group('AI accuracy', () {
+    /// Fires [shots] AI lobs (deterministic per seed) at the player's crew
+    /// and returns how many dealt damage. Crew state is reset between shots
+    /// so every roll is measured against a fresh target.
+    double hitRate(AiDifficulty difficulty, {int shots = 24, int seed = 5}) {
+      final ctrl = newMatch(seed: seed);
+      final me = ctrl.world.raftOf(1)!;
+      final target = ctrl.world.raftOf(0)!;
+      final targetPos = target.crewPos(0);
+      var hits = 0;
+      for (int i = 0; i < shots; i++) {
+        for (final c in target.crew) {
+          c.hp = c.maxHp;
+          c.pose = null;
+          c.ragdoll = false;
+          c.offset = Offset.zero;
+          c.grabT = 0;
+          c.clearPlant();
+        }
+        final shot = AiController(difficulty, seed: seed * 100 + i).plan(
+          from: me.muzzle(),
+          targetPos: targetPos,
+          facing: me.facing,
+          arsenal: [Weapons.starter],
+        );
+        ctrl.world.fire(
+          from: me.muzzle(),
+          angleDeg: shot.angle,
+          power: shot.power,
+          facing: me.facing,
+          weapon: shot.weapon,
+          owner: 1,
+        );
+        ShotOutcome? out;
+        for (int f = 0; f < 900 && out == null; f++) {
+          ctrl.world.update(1 / 60);
+          out = ctrl.world.stepShot();
+        }
+        if (out != null && out.damage > 0) hits++;
+      }
+      ctrl.dispose();
+      return hits / shots;
+    }
+
+    test('Hard AI actually lands shots on the player', () {
+      final rate = hitRate(AiDifficulty.hard);
+      expect(rate, greaterThanOrEqualTo(0.45),
+          reason: 'hard difficulty must connect with the player regularly');
+    });
+
+    test('Hard AI outperforms easy AI', () {
+      final hard = hitRate(AiDifficulty.hard);
+      final easy = hitRate(AiDifficulty.easy);
+      expect(hard, greaterThan(easy),
+          reason: 'difficulty must separate the hit rates');
+    });
+  });
 }
