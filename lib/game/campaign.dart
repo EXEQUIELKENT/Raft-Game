@@ -1,5 +1,7 @@
 import 'ai.dart';
 import 'battle.dart';
+import 'bosses.dart';
+import 'characters.dart';
 import 'controller.dart';
 import 'maps.dart';
 import 'raft.dart';
@@ -94,9 +96,24 @@ class CampaignLevel {
 class CampaignWorld {
   final String id; // matches MapDef.id
   final List<CampaignLevel> levels;
-  const CampaignWorld({required this.id, required this.levels});
+
+  /// Who crews this sea's rafts. The archetype table decides how tough and
+  /// how accurate a rival is; the theme decides who they *are*, so the
+  /// mountain sea is manned by parka-wrapped icebreakers and the volcano by
+  /// soot-blackened stokers instead of the same three silhouettes recoloured
+  /// six times.
+  final CharacterTheme theme;
+
+  const CampaignWorld({
+    required this.id,
+    required this.levels,
+    this.theme = CharacterTheme.scavenger,
+  });
 
   MapDef get map => GameMaps.byId(id);
+
+  /// This world's boss, if it has one.
+  BossDef? get boss => Bosses.forWorld(id);
 }
 
 class Campaign {
@@ -136,32 +153,32 @@ class Campaign {
   /// the weapon pool, so a world's three battles never feel like reruns of
   /// the same fight.
   static final List<CampaignWorld> worlds = [
-    CampaignWorld(id: 'ocean', levels: [
+    CampaignWorld(id: 'ocean', theme: CharacterTheme.scavenger, levels: [
       _lvl('ocean', 0, 'Salty Sam', AiDifficulty.easy, 0, [_raider, _ducker], kWeaponsBasic, 20),
       _lvl('ocean', 1, 'Wobbly Walt', AiDifficulty.normal, 10, [_raider, _ducker, _raider], kWeaponsMid, 30),
       _lvl('ocean', 2, 'Squall Sadie', AiDifficulty.hard, 20, [_ducker, _pirate, _raider], kWeaponsFull, 50, boss: true),
     ]),
-    CampaignWorld(id: 'island', levels: [
+    CampaignWorld(id: 'island', theme: CharacterTheme.buccaneer, levels: [
       _lvl('island', 0, 'Beach Bum Benny', AiDifficulty.easy, 5, [_raider, _ducker], kWeaponsBasic, 24),
       _lvl('island', 1, 'Tiki Tom', AiDifficulty.normal, 15, [_ducker, _pirate], kWeaponsMid, 34),
       _lvl('island', 2, 'Queen Palma', AiDifficulty.hard, 25, [_pirate, _ducker, _raider], kWeaponsFull, 55, boss: true),
     ]),
-    CampaignWorld(id: 'mountains', levels: [
+    CampaignWorld(id: 'mountains', theme: CharacterTheme.frostbound, levels: [
       _lvl('mountains', 0, 'Icy Ike', AiDifficulty.easy, 10, [_raider, _raider, _ducker], kWeaponsBasic, 28),
       _lvl('mountains', 1, 'Blizzard Belle', AiDifficulty.normal, 20, [_pirate, _ducker], kWeaponsMid, 38),
       _lvl('mountains', 2, 'The Glacier King', AiDifficulty.hard, 30, [_pirate, _captain], kWeaponsFull, 60, boss: true),
     ]),
-    CampaignWorld(id: 'desert', levels: [
+    CampaignWorld(id: 'desert', theme: CharacterTheme.sunbaked, levels: [
       _lvl('desert', 0, 'Sandstorm Sal', AiDifficulty.easy, 15, [_ducker, _raider, _ducker], kWeaponsBasic, 32),
       _lvl('desert', 1, 'Barrel Bart', AiDifficulty.normal, 25, [_pirate, _raider, _ducker], kWeaponsMid, 42),
       _lvl('desert', 2, 'Dune Baron Duke', AiDifficulty.hard, 35, [_captain, _pirate], kWeaponsFull, 65, boss: true),
     ]),
-    CampaignWorld(id: 'volcano', levels: [
+    CampaignWorld(id: 'volcano', theme: CharacterTheme.emberkin, levels: [
       _lvl('volcano', 0, 'Ember Eddie', AiDifficulty.normal, 20, [_pirate, _ducker], kWeaponsMid, 40),
       _lvl('volcano', 1, 'Magma Mabel', AiDifficulty.hard, 30, [_pirate, _pirate, _raider], kWeaponsMid, 50),
       _lvl('volcano', 2, 'The Volcano Vixen', AiDifficulty.hard, 40, [_captain, _pirate, _ducker], kWeaponsFull, 75, boss: true),
     ]),
-    CampaignWorld(id: 'city', levels: [
+    CampaignWorld(id: 'city', theme: CharacterTheme.harbour, levels: [
       _lvl('city', 0, 'Rookie Rex', AiDifficulty.normal, 25, [_pirate, _ducker, _raider], kWeaponsMid, 45),
       _lvl('city', 1, 'Skyline Sadie', AiDifficulty.hard, 35, [_captain, _pirate], kWeaponsFull, 60),
       _lvl('city', 2, 'Captain Chaos', AiDifficulty.expert, 50, [_captain, _pirate, _pirate, _captain], kWeaponsFull, 100, boss: true),
@@ -226,22 +243,40 @@ class Campaign {
       enabledWeapons: level.enabledWeapons,
       startHpPerPlayer: [
         basePlayerHp + save.bonusHp,
-        for (final e in fleet) e.hp + level.enemyHp,
+        for (int i = 0; i < fleet.length; i++)
+          fleet[i].hp +
+              level.enemyHp +
+              // The boss's own raft carries its extra HP; its escort does
+              // not. A boss that made its whole fleet tougher would just be
+              // a longer fight, and the interesting part of the fight is the
+              // signature round, not the health bar.
+              (level.isBoss && i == _flagshipIndex(fleet)
+                  ? (Bosses.forWorld(level.worldId)?.bonusHp ?? 0)
+                  : 0),
       ],
       ammo: save.battleAmmo(),
+      difficultyTier: difficultyTierOf(level),
+      isBoss: level.isBoss,
     );
+
+    final boss = level.isBoss ? Bosses.forWorld(level.worldId) : null;
+    final flagship = _flagshipIndex(fleet);
+    final theme = worldOf(level.worldId)?.theme;
 
     final players = [
       PlayerConfig(
         name: 'YOU',
         loadout: save.raftLoadout,
+        look: Cast.byId(save.character).look,
         powerMultiplier: save.powerMultiplier,
       ),
       for (int i = 0; i < fleet.length; i++)
         PlayerConfig(
           // The level's named captain commands the toughest raft in the
           // fleet; the rest are rank-and-file crew of their archetype.
-          name: i == _flagshipIndex(fleet) ? level.captainName : fleet[i].label,
+          name: i == flagship
+              ? (boss?.name ?? level.captainName)
+              : fleet[i].label,
           loadout: RaftLoadout.custom(
             hullId: fleet[i].hullId,
             sizeId: fleet[i].crew > 1 ? 'medium' : 'small',
@@ -249,13 +284,56 @@ class Campaign {
             // Enemy HP comes wholly from the level table above.
             hpBonus: 0,
           ),
-          look: fleet[i].look,
+          // The boss wears its own face; its escort and every ordinary rival
+          // are cast from the world's theme, so a sea's crews look like they
+          // belong to it.
+          look: i == flagship && boss != null
+              ? boss.look
+              : _castFor(theme, boss, i, fleet[i].look),
           isAi: true,
-          aiDifficulty: level.aiDifficulty,
+          // A boss is as sharp as its own definition says, not as sharp as
+          // the level table's blanket setting for the fleet.
+          aiDifficulty: i == flagship && boss != null
+              ? boss.difficulty
+              : level.aiDifficulty,
           aimJitter: fleet[i].jitter,
+          boss: i == flagship ? boss : null,
         ),
     ];
     return (settings, players);
+  }
+
+  /// Which character crews enemy raft [i].
+  ///
+  /// A boss's own escort list comes first, so a named opponent arrives with
+  /// the people the boss table says. Failing that the world's theme supplies
+  /// the cast, and failing *that* the archetype's original look stands —
+  /// which is what keeps a world with no theme set working unchanged.
+  static CrewLook _castFor(
+      CharacterTheme? theme, BossDef? boss, int i, CrewLook fallback) {
+    if (boss != null && boss.escort.isNotEmpty) {
+      return boss.escort[i % boss.escort.length];
+    }
+    if (theme == null) return fallback;
+    final pool = Cast.ofTheme(theme);
+    if (pool.isEmpty) return fallback;
+    return pool[i % pool.length].look;
+  }
+
+  static CampaignWorld? worldOf(String worldId) {
+    for (final w in worlds) {
+      if (w.id == worldId) return w;
+    }
+    return null;
+  }
+
+  /// How demanding a level is, on a scale that starts at 0 for the very first
+  /// battle and rises across the whole campaign. Feeds the XP award, which is
+  /// what makes pushing forward pay better than farming level one.
+  static int difficultyTierOf(CampaignLevel level) {
+    final idx = allLevels.indexWhere((l) => l.id == level.id);
+    if (idx < 0) return 0;
+    return idx ~/ 2;
   }
 
   /// Index of the toughest raft in a fleet — the one the level's named

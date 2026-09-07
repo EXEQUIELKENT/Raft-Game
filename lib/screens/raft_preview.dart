@@ -58,7 +58,7 @@ class _RaftPreviewPainter extends CustomPainter {
     );
 
     final w = lo.width;
-    final h = w * lo.hull.thickness;
+    final h = lo.hullHeight;
 
     // Fit the whole raft — hull, crew and any mast — inside the box on both
     // axes. Fitting width alone blows a short, wide preview far past its own

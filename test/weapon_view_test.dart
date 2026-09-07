@@ -1,3 +1,5 @@
+import 'dart:ui';
+
 import 'package:flutter_test/flutter_test.dart';
 import 'package:raft_rumble/game/controller.dart';
 import 'package:raft_rumble/game/maps.dart';
@@ -122,6 +124,94 @@ void main() {
       expect(WeaponView.forId('grenade').pumpTravel, 0);
       // The starter has no slide to work either.
       expect(WeaponView.forId('tennis').pumpTravel, 0);
+    });
+
+    test('No two calibers are held the same way', () {
+      // The hold is half of what tells two guns apart at a glance, so every
+      // GripStyle is spoken for exactly once. A new model that reused an
+      // existing hold would make two weapons pose identically.
+      final styles = <GripStyle, String>{};
+      for (final w in Weapons.all) {
+        final view = WeaponView.forId(w.id);
+        expect(styles.containsKey(view.supportStyle), false,
+            reason: '${w.id} duplicates ${styles[view.supportStyle]}\'s hold '
+                '(${view.supportStyle})');
+        styles[view.supportStyle] = w.id;
+      }
+      expect(styles.length, GripStyle.values.length,
+          reason: 'every declared grip style should be used by some weapon');
+      // And the declared pairing table agrees with the actual models.
+      WeaponView.gripStyleUsage.forEach((style, id) {
+        expect(WeaponView.forId(id).supportStyle, style,
+            reason: '$id should use $style');
+      });
+    });
+
+    test('Both fists sit somewhere different on every weapon', () {
+      // Firing hand and support hand are independent placements; two models
+      // that happened to share both would look like the same gun re-coloured.
+      final seen = <String>{};
+      for (final w in Weapons.all) {
+        final v = WeaponView.forId(w.id);
+        final key = '${v.gripX.toStringAsFixed(1)},${v.gripY.toStringAsFixed(1)}'
+            '/${v.supportForeX.toStringAsFixed(1)},${v.supportPalmY.toStringAsFixed(1)}';
+        expect(seen.contains(key), false,
+            reason: '${w.id} has the same two hand placements as another model');
+        seen.add(key);
+      }
+    });
+
+    test('Each model carries its own signature feature', () {
+      // One distinguishing lump of hardware per caliber, so the silhouettes
+      // never collapse into "same gun, different size".
+      int features(WeaponView v) => [
+            v.woodFurniture,
+            v.shroudVents > 0,
+            v.cylinderR > 0,
+            v.crankR > 0,
+            v.scopeLen > 0,
+            v.bipodX > 0,
+          ].where((f) => f).length;
+
+      expect(WeaponView.forId('grenade').woodFurniture, true,
+          reason: 'the rifle has wooden furniture');
+      expect(WeaponView.forId('bomb').shroudVents, greaterThan(0),
+          reason: 'the cannon has a vented shroud');
+      expect(WeaponView.forId('bomb').scopeLen, greaterThan(0),
+          reason: 'the cannon carries an optic');
+      expect(WeaponView.forId('cluster').cylinderR, greaterThan(0),
+          reason: 'the spreader is a revolver');
+      expect(WeaponView.forId('anchor').crankR, greaterThan(0),
+          reason: 'the harpoon gun has a winch crank');
+      expect(WeaponView.forId('anchor').bipodX, greaterThan(0),
+          reason: 'the harpoon gun rests on a bipod');
+
+      for (final w in Weapons.all) {
+        final v = WeaponView.forId(w.id);
+        // The starter is deliberately the plain one — it is identifiable by
+        // being the smallest and barest thing on the deck.
+        if (w.id == 'tennis') continue;
+        expect(features(v), greaterThan(0),
+            reason: '${w.id} needs at least one signature feature');
+      }
+    });
+
+    test('A crank hold orbits its wheel instead of sliding down the barrel', () {
+      final v = WeaponView.forId('anchor');
+      expect(v.supportStyle, GripStyle.crank);
+      final atRest = v.supportTarget(0);
+      final quarter = v.supportTarget(0.25);
+      final half = v.supportTarget(0.5);
+
+      // Every sample stays on the wheel rim, and the hand actually moves
+      // around it as the action is worked.
+      for (final p in [atRest, quarter, half]) {
+        final r = (p - Offset(v.crankX, v.supportForeY)).distance;
+        expect(r, closeTo(v.crankR * 0.72, 0.01),
+            reason: 'the fist stays on the crank rim');
+      }
+      expect((quarter - atRest).distance, greaterThan(1.0),
+          reason: 'working the crank visibly moves the hand');
     });
 
     test('Calibers with variants hand out distinct, stable models per crew', () {

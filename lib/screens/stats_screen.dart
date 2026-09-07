@@ -1,4 +1,4 @@
-import 'dart:math';
+
 import 'package:flutter/material.dart';
 import '../game/save.dart';
 import '../theme.dart';
@@ -10,7 +10,9 @@ class StatsScreen extends StatelessWidget {
   Widget build(BuildContext context) {
     final d = SaveService.instance.data;
     final winRate = d.wins + d.losses > 0 ? (d.wins / (d.wins + d.losses) * 100).round() : 0;
-    final xpFrac = d.level >= 10 ? 1.0 : ((d.xp - d.xpForCurrent) / max(1, d.xpForNext - d.xpForCurrent));
+    // Level, cap and bar all come from [Progression] now — the old hardcoded
+    // 10 was the top of a curve that no longer exists.
+    final xpFrac = d.levelProgress;
 
     return Scaffold(
       body: Container(
@@ -46,6 +48,12 @@ class StatsScreen extends StatelessWidget {
                       child: Column(
                         children: [
                           Text('LEVEL ${d.level}', style: RT.chunky(size: 30, color: RT.ink)),
+                          Text(d.rank.toUpperCase(),
+                              style: RT.body(
+                                  size: 11,
+                                  color: RT.ink.withOpacity(0.55),
+                                  weight: FontWeight.w800,
+                                  letterSpacing: 2)),
                           const SizedBox(height: 8),
                           ClipRRect(
                             borderRadius: BorderRadius.circular(10),
@@ -57,7 +65,7 @@ class StatsScreen extends StatelessWidget {
                             ),
                           ),
                           const SizedBox(height: 4),
-                          Text(d.level >= 10 ? 'MAX LEVEL!' : '${d.xp} / ${d.xpForNext} XP',
+                          Text(d.atMaxLevel ? 'MAX LEVEL!' : '${d.xp} / ${d.xpForNext} XP',
                               style: RT.chunky(size: 12, color: RT.ink.withOpacity(0.7))),
                         ],
                       ),

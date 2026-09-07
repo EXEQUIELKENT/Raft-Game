@@ -263,6 +263,100 @@ void main() {
           reason: 'the whip sets the body spinning (backflip energy)');
     });
 
+    /// Total rotation the body actually turns through, in radians, tracked
+    /// by following the hip->head vector frame by frame and accumulating the
+    /// signed angle change. Instantaneous spin says a body was *set* turning;
+    /// this says whether the somersault ever came round.
+    double rotationOver(BattleWorld w, Crew c, int frames) {
+      double angleOf(RagdollPose p) {
+        final v = p.head.pos - p.hip.pos;
+        return atan2(v.dy, v.dx);
+      }
+
+      var total = 0.0;
+      var prev = c.pose == null ? null : angleOf(c.pose!);
+      for (int i = 0; i < frames; i++) {
+        w.update(1 / 60);
+        final p = c.pose;
+        if (p == null) break;
+        final a = angleOf(p);
+        if (prev != null) {
+          var d = a - prev;
+          while (d > pi) {
+            d -= 2 * pi;
+          }
+          while (d < -pi) {
+            d += 2 * pi;
+          }
+          total += d;
+        }
+        prev = a;
+      }
+      return total.abs();
+    }
+
+    test('A backflip actually comes all the way round', () {
+      // The point of the tuck: the point speed cap bleeds rotation out of a
+      // sprawled body, so a flip that never curls in stalls at roughly half
+      // a turn. A real somersault has to pass a full rotation.
+      final w = world(raftXs: [const Offset(300, 0), const Offset(1300, 0)]);
+      final enemy = w.rafts[1];
+      final headY = enemy.crewPos(0).dy - 34;
+      fireAtHeight(w, dy: headY, reaction: 'flip');
+
+      final c = enemy.crew[0];
+      expect(c.pose, isNotNull);
+      expect(c.flipT, greaterThan(0), reason: 'the flip curl is engaged');
+      expect(c.pose!.tuck, lessThan(0.2), reason: 'the curl eases in, it does not snap');
+
+      final turned = rotationOver(w, c, 90);
+      expect(turned, greaterThan(2 * pi),
+          reason: 'a backflip must complete at least one full rotation '
+              '(turned ${(turned / (2 * pi)).toStringAsFixed(2)} revolutions)');
+    });
+
+    test('The curl lets go again so the body lands sprawled, not balled up', () {
+      final w = world(raftXs: [const Offset(300, 0), const Offset(1300, 0)]);
+      final enemy = w.rafts[1];
+      fireAtHeight(w, dy: enemy.crewPos(0).dy - 34, reaction: 'flip');
+      final c = enemy.crew[0];
+
+      // Peak curl during the tumble...
+      var peak = 0.0;
+      for (int i = 0; i < 60 && c.pose != null; i++) {
+        w.update(1 / 60);
+        peak = max(peak, c.pose!.tuck);
+      }
+      expect(peak, greaterThan(0.6), reason: 'the body genuinely curls up');
+
+      // ...and released by the time they are back on their feet.
+      for (int i = 0; i < 600 && c.pose != null; i++) {
+        w.update(1 / 60);
+      }
+      expect(c.flipT, 0);
+      expect(c.pose, isNull, reason: 'they get back up');
+      expect(c.alive, true);
+    });
+
+    test('Heavier rounds flip more often than light ones', () {
+      // Flip chance rises with the round's weight, so an anchor shell to the
+      // skull is near-certain comedy and a tennis ball is a coin toss. Tested
+      // on the chance function itself rather than by firing: a live shot also
+      // has to clear the hull, survive the damage and land in the head zone,
+      // none of which is what this rule is about.
+      double chance(String id) =>
+          BattleConst.flipChanceFor(Weapons.byId(id).weight);
+
+      expect(chance('anchor'), greaterThan(chance('bomb')));
+      expect(chance('bomb'), greaterThan(chance('grenade')));
+      expect(chance('grenade'), greaterThan(chance('tennis')));
+
+      // Even the lightest round flips sometimes, and even the heaviest
+      // sometimes just knocks them flat.
+      expect(chance('tennis'), greaterThan(0.1));
+      expect(chance('anchor'), lessThan(1.0));
+    });
+
     test('A leg hit can plant one boot while the body tumbles around it', () {
       final w = world(raftXs: [const Offset(300, 0), const Offset(1300, 0)]);
       final enemy = w.rafts[1];

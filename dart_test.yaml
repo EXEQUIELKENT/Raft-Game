@@ -1,0 +1,13 @@
+# Tests tagged `live` talk to a REAL server: the PHP backend and its database
+# have to be running, so they cannot be part of an ordinary `flutter test` —
+# a machine without XAMPP up would fail for reasons that say nothing about the
+# code. They are skipped by default and opted into explicitly:
+#
+#   flutter test --tags live --run-skipped
+#
+# (`--run-skipped` is what lifts the skip below; `--tags live` alone still
+# honours it.) See test/online_relay_live_test.dart for what they prove and
+# how to point them at a different server.
+tags:
+  live:
+    skip: "needs a running game server — run with: flutter test --tags live --run-skipped"

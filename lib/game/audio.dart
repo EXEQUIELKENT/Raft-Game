@@ -27,12 +27,23 @@ class AudioService {
   bool _ready = false;
   bool _available = true;
 
+  /// The voice lines that exist at three pitches (see
+  /// `tool/gen_voice_sfx.dart`): the bare name is the mid register, `_low`
+  /// and `_high` are the resampled variants a character's [VoiceType]
+  /// selects. All three are preloaded, because one deck can easily be
+  /// carrying all three registers at once.
+  static const List<String> voiceBases = [
+    'voice_grunt', 'voice_ouch1', 'voice_ouch2', 'voice_ouch3', 'voice_ouch4',
+    'voice_laugh', 'voice_yawn', 'voice_chatter', 'voice_hmm', 'voice_look',
+    'voice_cheer', 'voice_gasp', 'voice_hup',
+  ];
+
   /// Every clip the game plays, so [init] can preload them all.
-  static const List<String> _knownSounds = [
+  static final List<String> _knownSounds = [
     'click', 'bounce', 'hit', 'explosion', 'shockwave', 'splash',
     'eliminate', 'whoosh', 'swap', 'turn', 'place', 'fire',
-    'voice_grunt', 'voice_laugh', 'voice_ouch1', 'voice_ouch2',
-    'voice_ouch3', 'voice_ouch4', 'voice_swap',
+    'voice_whistle', 'voice_swap', 'voice_brr', 'voice_taunt',
+    for (final v in voiceBases) ...[v, '${v}_low', '${v}_high'],
   ];
 
   AudioService._();

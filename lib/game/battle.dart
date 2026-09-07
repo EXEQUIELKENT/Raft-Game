@@ -1,10 +1,16 @@
 import 'dart:math';
 import 'dart:ui';
 
+import 'characters.dart';
 import 'maps.dart';
 import 'models.dart';
 import 'raft.dart';
 import 'weapon_views.dart';
+
+// CrewLook and the character roster moved to characters.dart when the five
+// hardcoded archetypes grew into a full cast. Re-exported because this is
+// where every caller already imports it from.
+export 'characters.dart';
 
 /// ---------------------------------------------------------------------------
 /// The battle simulation.
@@ -224,12 +230,50 @@ class BattleConst {
   /// Extra angular kick thrown into a head-region hit — the "shoot off and
   /// backflip" tumble, delivered through [RagdollPose.applyImpulse]'s
   /// [spin]. Landed on top of the ordinary torque.
-  static const double headshotSpin = 0.26;
+  static const double headshotSpin = 0.58;
 
   /// Hard cap on angular velocity after a spin kick — above the ordinary
   /// torque clamp so a headshot visibly whips the body over, but still
   /// finite so nothing spins forever.
-  static const double ragdollSpinCap = 0.5;
+  static const double ragdollSpinCap = 0.82;
+
+  /// How long a struck crew member stays curled after a flip-inducing hit,
+  /// and how fast the curl comes on and lets go. The tuck is what converts
+  /// a modest hop into a readable somersault — see [RagdollPose.tuck]. The
+  /// rate is deliberately brisk: a flip only has [flipLift]'s worth of hang
+  /// time, so a curl that eased in over half a second would arrive after the
+  /// body had already landed.
+  static const double flipTuckTime = 1.1;
+  static const double flipTuckRate = 22.0;
+
+  /// Uniform upward velocity added to a somersaulting body, and the rise cap
+  /// that applies while the flip runs (ordinary knock-backs keep
+  /// [bodyMaxRise]).
+  ///
+  /// A somersault needs hang time as well as spin. With the tuck in place the
+  /// body turns at roughly 0.3 rad/frame, so a full revolution wants about 21
+  /// airborne frames — which is what this launch buys. It is a deliberately
+  /// small exception: the apex still sits well inside the world's scale, and
+  /// only a hit that actually triggered a flip is ever launched this way.
+  static const double flipLift = 4.5;
+  static const double flipRise = 4.7;
+
+  /// Chance a head hit sends the victim into a flip at all, and the extra
+  /// chance per unit of projectile weight on top — a tennis ball to the
+  /// skull sometimes does it, an anchor round nearly always does.
+  static const double flipChanceBase = 0.42;
+  static const double flipChancePerWeight = 0.30;
+
+  /// Probability that a head hit from a round of this [weight] somersaults
+  /// the victim. Capped short of certainty so even the heaviest round
+  /// occasionally just knocks someone flat.
+  static double flipChanceFor(double weight) =>
+      (flipChanceBase + weight * flipChancePerWeight).clamp(0.0, 0.92);
+
+  /// Chance a leg hit spins the victim out sideways instead of simply
+  /// sweeping their feet — the low-line counterpart to the head flip.
+  static const double sweepSpinChance = 0.35;
+  static const double sweepSpin = 0.3;
 
   /// How long a leg-region hit keeps its planted foot glued to the deck
   /// while the rest of the body flies — the "one leg still standing"
@@ -399,21 +443,50 @@ class RagdollPose {
     }
   }
 
+  /// How tightly the body is curled, 0 (spread out) to 1 (knees to chest).
+  ///
+  /// A tuck is what makes a backflip actually read as one. Every ragdoll
+  /// point is speed-capped ([BattleConst.bodyMaxSpeed]) so nothing can be
+  /// flung out of the world, and a point's speed under rotation is
+  /// `spin * radius` — so a sprawled body, whose head sits ~43 units from the
+  /// hip, cannot spin fast enough to come round inside the hang time a hop
+  /// affords — it turns about three quarters of a somersault and flops back,
+  /// which reads as being knocked over rather than flipped.
+  ///
+  /// Curling in is what fixes it, and the budget is tight in both directions:
+  /// a point's speed is `linear + spin * radius` against one shared cap, so
+  /// launching higher (more hang time) directly costs spin. Cutting the
+  /// radius is the only move that buys rotation without spending lift, and
+  /// [tuckShrink] is set where a flip clears a full turn with margin. A
+  /// cannonball silhouette is what a flip looks like anyway.
+  double tuck = 0;
+
+  /// How much a full tuck shortens the body's constraints — every rest
+  /// length, so the curl pulls head and boots toward the hip together.
+  static const double tuckShrink = 0.66;
+
   /// Relaxation pass over every constraint. Called [BattleConst.ragdollIters]
   /// times per step, after integration and after any collision response.
   void solve() {
+    // Curling scales every rest length, including the keep-apart minimums —
+    // those exist to stop the body folding flat, and would otherwise fight
+    // the tuck instead of merely limiting it.
+    final k = 1 - tuckShrink * tuck.clamp(0.0, 1.0);
     for (int it = 0; it < BattleConst.ragdollIters; it++) {
       for (final con in _constraints) {
         final delta = con.b.pos - con.a.pos;
         final d = delta.distance;
         if (d <= 1e-6) continue;
+        final len = con.len * k;
+        final cmin = con.min == null ? null : con.min! * k;
+        final cmax = con.max == null ? null : con.max! * k;
         double diff = 0;
-        if (con.min == null && con.max == null) {
-          diff = (d - con.len) / d;
-        } else if (con.max != null && d > con.max!) {
-          diff = (d - con.max!) / d;
-        } else if (con.min != null && d < con.min!) {
-          diff = (d - con.min!) / d;
+        if (cmin == null && cmax == null) {
+          diff = (d - len) / d;
+        } else if (cmax != null && d > cmax) {
+          diff = (d - cmax) / d;
+        } else if (cmin != null && d < cmin) {
+          diff = (d - cmin) / d;
         }
         if (diff == 0) continue;
         // Planted points are inert: they anchor the constraint like a wall.
@@ -455,6 +528,44 @@ class RagdollPose {
       final lin = impulse * BattleConst.ragdollLinear;
       final tan = Offset(-r.dy, r.dx) * w;
       p.setVel(p.vel + lin + tan);
+    }
+  }
+
+  /// Mass-weighted mean velocity of the whole body — its drift, with any
+  /// rotation about the centre of mass averaged out.
+  Offset get meanVel {
+    var sum = Offset.zero;
+    var mass = 0.0;
+    for (final p in points) {
+      final m = p.invMass > 0 ? 1 / p.invMass : 0.0;
+      sum += p.vel * m;
+      mass += m;
+    }
+    return mass <= 0 ? Offset.zero : sum / mass;
+  }
+
+  /// Limits how fast the body as a whole may rise, without touching the
+  /// rotation about its centre of mass.
+  ///
+  /// Applying the limit to each point separately would also shave the upward
+  /// half of any spin — which is exactly what stopped somersaults from
+  /// coming round. Correcting the mean and applying that same correction to
+  /// every point moves the body without changing its rotation at all.
+  void capRise(double maxRise) {
+    final v = meanVel;
+    if (v.dy >= -maxRise) return;
+    final delta = Offset(0, -maxRise - v.dy);
+    for (final p in points) {
+      p.setVel(p.vel + delta);
+    }
+  }
+
+  /// Adds a uniform upward velocity to the whole body — the launch that buys
+  /// a somersault enough hang time to finish. Uniform, so it lifts without
+  /// disturbing the spin already applied.
+  void addLift(double amount) {
+    for (final p in points) {
+      p.setVel(p.vel + Offset(0, -amount));
     }
   }
 
@@ -546,17 +657,90 @@ enum CrewIdle {
   /// Eyes dart left and right, scanning the horizon.
   lookAround,
 
-  /// A big slow yawn, eyes squeezing shut.
+  /// A big slow yawn, eyes squeezing shut — and the whole body stretches up
+  /// with it.
   yawn,
 
-  /// Puckered mouth with floating music notes.
+  /// Puckered mouth with floating music notes, and a gentle sway.
   whistle,
 
-  /// A brief bout of flapping-mouth chatter.
+  /// A brief bout of flapping-mouth chatter, hands talking along.
   chatter,
 
   /// Alternating brow bobs and a smirk.
   browWaggle,
+
+  /// A big overhead stretch, up on the toes.
+  stretch,
+
+  /// Bouncing on the spot out of sheer boredom.
+  hop,
+
+  /// A "search me" shrug, shoulders up and free hand out.
+  shrug,
+
+  /// Free hand up to the head, puzzled.
+  scratchHead,
+
+  /// A short private jig. Rare, and the funniest one.
+  jig,
+}
+
+/// How the whole body is carrying itself this frame.
+///
+/// Faces alone were doing all the acting, which reads as a row of mannequins
+/// with animated heads — at raft scale the face is barely fifteen pixels
+/// across, so an expression that lives only there is an expression nobody
+/// sees. Every value here moves the BODY: the knees, the spine, the free
+/// arm, the whole figure's height off the deck.
+///
+/// Deliberately a plain value object computed from crew state rather than an
+/// animation system: it is a pure function of (crew, time), so the renderer
+/// can ask for it every frame, the tests can assert on it directly, and
+/// nothing about how a body feels can drift out of sync with what it is
+/// actually doing.
+class BodyExpression {
+  /// 0..1 knee bend. Raises the hips when negative-going (a stretch).
+  final double crouch;
+
+  /// Forward (+) / back (−) lean of the whole upper body, in radians.
+  final double lean;
+
+  /// 0..1 of the free arm raised overhead.
+  final double armRaise;
+
+  /// Vertical offset in world units; negative is up off the deck.
+  final double bounce;
+
+  /// Horizontal shake in world units — shivering, or a laugh.
+  final double tremble;
+
+  /// 0..1 shoulder droop. Exhaustion, tar, or very low health.
+  final double slump;
+
+  /// 0..1 head tilt toward the gun side, for puzzlement and shrugs.
+  final double headTilt;
+
+  const BodyExpression({
+    this.crouch = 0,
+    this.lean = 0,
+    this.armRaise = 0,
+    this.bounce = 0,
+    this.tremble = 0,
+    this.slump = 0,
+    this.headTilt = 0,
+  });
+
+  static const none = BodyExpression();
+
+  bool get isNeutral =>
+      crouch == 0 &&
+      lean == 0 &&
+      armRaise == 0 &&
+      bounce == 0 &&
+      tremble == 0 &&
+      slump == 0 &&
+      headTilt == 0;
 }
 
 /// Which band of the body a given blow landed on — computed from the
@@ -640,6 +824,60 @@ class Crew {
   /// crew member the instant their own shot lands on an enemy.
   double gloatT = 0;
 
+  // --- Status effects -------------------------------------------------------
+
+  /// What a boss round left on this crew member, or null. See [StatusEffect]:
+  /// this is how a boss takes a turn's advantage away instead of simply
+  /// hitting harder.
+  StatusEffect? status;
+
+  /// Turns of [status] left. Counted down by the controller as the turn comes
+  /// back round to this seat, not by wall clock — an effect that expired
+  /// while somebody else was aiming would be no effect at all.
+  int statusTurns = 0;
+
+  /// Seconds of the "just applied" flash left, for the renderer.
+  double statusFlash = 0;
+
+  bool get afflicted => status != null && statusTurns > 0;
+
+  /// Launch power multiplier from the current status. 1.0 when clean.
+  double get statusPowerScale => afflicted ? status!.powerScale : 1.0;
+
+  /// How much knockback still lands. Tar makes a body harder to shift.
+  double get statusKnockScale => afflicted ? status!.knockScale : 1.0;
+
+  /// True while this crew member has to sit a turn out.
+  bool get snared => afflicted && status == StatusEffect.snared;
+
+  /// Applies [effect] for [turns]. A fresh application always replaces
+  /// whatever was there rather than stacking — two statuses at once, or a
+  /// long one topped up before it lapses, is exactly the runaway a boss
+  /// fight must not have.
+  void afflict(StatusEffect effect, int turns) {
+    status = effect;
+    statusTurns = turns;
+    statusFlash = 0.6;
+  }
+
+  void clearStatus() {
+    status = null;
+    statusTurns = 0;
+  }
+
+  /// Ticks the status down by one of this crew member's own turns. Returns
+  /// true if they are snared and must sit this one out.
+  bool consumeTurnStatus() {
+    if (!afflicted) {
+      status = null;
+      return false;
+    }
+    final wasSnared = snared;
+    statusTurns--;
+    if (statusTurns <= 0) clearStatus();
+    return wasSnared;
+  }
+
   // --- Ragdoll reactions ----------------------------------------------------
 
   /// Which foot is planted from a leg-hit tumble: −1 left, +1 right, 0
@@ -653,6 +891,11 @@ class Crew {
   /// Seconds left clutching the spot a torso hit landed on — the off hand
   /// grabs the belly while they tumble.
   double grabT = 0;
+
+  /// Seconds left of an active somersault. While this runs the ragdoll curls
+  /// in ([RagdollPose.tuck]), which is both what a flip looks like and what
+  /// lets it spin fast enough to complete under the point speed cap.
+  double flipT = 0;
 
   /// Frees a planted foot, if any.
   void clearPlant() {
@@ -708,12 +951,21 @@ class Crew {
     if (!allowNew) return null;
     idleNextIn -= dt;
     if (idleNextIn > 0) return null;
+    // Weighted toward the whole-body activities: a deck of people stretching,
+    // hopping and shrugging reads as alive from across the screen, where a
+    // deck of people making faces reads as a row of statues.
     const pool = [
       CrewIdle.lookAround,
       CrewIdle.yawn,
       CrewIdle.whistle,
       CrewIdle.chatter,
       CrewIdle.browWaggle,
+      CrewIdle.stretch,
+      CrewIdle.stretch,
+      CrewIdle.hop,
+      CrewIdle.shrug,
+      CrewIdle.scratchHead,
+      CrewIdle.jig,
     ];
     idle = pool[_idleRng.nextInt(pool.length)];
     idleDur = switch (idle) {
@@ -722,24 +974,237 @@ class Crew {
       CrewIdle.whistle => 2.4,
       CrewIdle.chatter => 1.9,
       CrewIdle.browWaggle => 1.5,
+      CrewIdle.stretch => 1.9,
+      CrewIdle.hop => 1.6,
+      CrewIdle.shrug => 1.3,
+      CrewIdle.scratchHead => 1.8,
+      CrewIdle.jig => 2.1,
       CrewIdle.none => 1,
     };
     idleT = idleDur;
-    return switch (idle) {
+    // Only the talkative fidgets get a line, and only sometimes: a bubble
+    // over every idle would be constant visual noise on a four-raft deck.
+    if (idle == CrewIdle.chatter ||
+        (idle == CrewIdle.shrug && _idleRng.nextInt(2) == 0)) {
+      say(idleLine, seconds: 1.8);
+    }
+    final blip = switch (idle) {
       CrewIdle.yawn => 'voice_yawn',
       CrewIdle.whistle => 'voice_whistle',
       CrewIdle.chatter => 'voice_chatter',
       CrewIdle.browWaggle => 'voice_hmm',
       CrewIdle.lookAround => 'voice_look',
+      CrewIdle.stretch => 'voice_yawn',
+      CrewIdle.hop => 'voice_hup',
+      CrewIdle.shrug => 'voice_hmm',
+      CrewIdle.scratchHead => 'voice_hmm',
+      CrewIdle.jig => 'voice_cheer',
       CrewIdle.none => null,
     };
+    return blip == null ? null : voiced(blip);
+  }
+
+  // --- Speech bubbles -------------------------------------------------------
+
+  /// What this crew member is saying, or null. Deliberately tiny: three or
+  /// four words, one at a time, above one head. A battle with four rafts on
+  /// screen would be unreadable if these were any bigger or any more
+  /// frequent, so [say] refuses to interrupt a line already showing and the
+  /// renderer draws them small and low-contrast.
+  String? bubble;
+
+  /// Seconds of bubble left.
+  double bubbleT = 0;
+
+  bool get talking => bubble != null && bubbleT > 0;
+
+  /// Says [text] for [seconds]. A line already on screen wins — a crew
+  /// member who gets hit twice in a row should not flicker between two
+  /// yelps, they should finish the first one.
+  void say(String text, {double seconds = 1.6}) {
+    if (talking) return;
+    bubble = text;
+    bubbleT = seconds;
+  }
+
+  /// One of the idle chatter lines, picked with this crew member's own RNG.
+  static const List<String> _idleLines = [
+    'Nice weather.',
+    'Still floating.',
+    'Any snacks?',
+    'My feet hurt.',
+    'Is it my turn?',
+    'Shhh. Aiming.',
+    'Hmm.',
+    'Look busy!',
+  ];
+
+  static const List<String> _hitLines = [
+    'Ow!',
+    'Rude!',
+    'Not the face!',
+    'Aaagh!',
+    'That stung!',
+  ];
+
+  static const List<String> _gloatLines = [
+    'Got one!',
+    'Ha!',
+    'Direct hit!',
+    'Too easy.',
+    'Bullseye!',
+  ];
+
+  String _pick(List<String> pool) => pool[_idleRng.nextInt(pool.length)];
+
+  String get idleLine => _pick(_idleLines);
+  String get hitLine => _pick(_hitLines);
+  String get gloatLine => _pick(_gloatLines);
+
+  // --- Whole-body expression ------------------------------------------------
+
+  /// How the body is carrying itself right now.
+  ///
+  /// Ordered by urgency, exactly like the face is: a wince beats a gloat
+  /// beats an idle fidget, so the body and the face are never telling two
+  /// different stories about the same moment.
+  BodyExpression bodyExpression(double time) {
+    if (!alive || ragdoll || pose != null) return BodyExpression.none;
+    final t = time + bobPhase;
+
+    // 1. A fresh hit doubles them over, whatever else was happening.
+    if (hitReactT > 0) {
+      final k = (hitReactT / BattleConst.hitReactTime).clamp(0.0, 1.0);
+      return BodyExpression(
+        crouch: 0.45 * k,
+        lean: 0.28 * k,
+        slump: 0.6 * k,
+        tremble: sin(t * 42) * 1.4 * k,
+      );
+    }
+
+    // 2. Landing one is worth a whole-body celebration — this is the beat
+    //    that used to be a slightly different mouth shape.
+    if (gloatT > 0) {
+      final k = (gloatT / BattleConst.gloatTime).clamp(0.0, 1.0);
+      return BodyExpression(
+        armRaise: k,
+        bounce: -(sin(t * 11).abs()) * 5.0 * k,
+        lean: -0.12 * k,
+        crouch: -0.18 * k,
+      );
+    }
+
+    // 3. Statuses are worn by the body: shivering, sagging under tar,
+    //    swaying while dazed. It is a second, always-visible read on a
+    //    condition the badge over their head also shows.
+    if (afflicted) {
+      switch (status!) {
+        case StatusEffect.chilled:
+          return BodyExpression(
+            crouch: 0.3,
+            slump: 0.4,
+            tremble: sin(t * 34) * 1.6,
+          );
+        case StatusEffect.tarred:
+          return const BodyExpression(crouch: 0.42, slump: 0.75, lean: 0.14);
+        case StatusEffect.dazed:
+          return BodyExpression(
+            lean: sin(t * 2.4) * 0.14,
+            headTilt: sin(t * 1.9) * 0.5,
+            slump: 0.3,
+          );
+        case StatusEffect.snared:
+          return BodyExpression(
+            crouch: 0.55,
+            tremble: sin(t * 26) * 2.2,
+            slump: 0.5,
+          );
+      }
+    }
+
+    // 4. Running out of health shows in the shoulders.
+    final hpFrac = maxHp <= 0 ? 1.0 : (hp / maxHp).clamp(0.0, 1.0);
+    if (hpFrac < 0.3) {
+      return BodyExpression(
+        slump: 0.55,
+        crouch: 0.2,
+        bounce: sin(t * 2.2) * 0.7,
+      );
+    }
+
+    // 5. Idle fidgets, eased in and out over the activity so nothing snaps.
+    if (idle != CrewIdle.none && idleDur > 0) {
+      final k = (idleT / idleDur).clamp(0.0, 1.0);
+      // Bell curve: 0 at both ends, 1 in the middle.
+      final ease = sin(pi * (1 - k));
+      switch (idle) {
+        case CrewIdle.stretch:
+          return BodyExpression(
+            armRaise: ease,
+            crouch: -0.3 * ease,
+            bounce: -3.0 * ease,
+            lean: -0.14 * ease,
+          );
+        case CrewIdle.yawn:
+          return BodyExpression(
+            armRaise: 0.7 * ease,
+            crouch: -0.16 * ease,
+            lean: -0.1 * ease,
+          );
+        case CrewIdle.hop:
+          return BodyExpression(
+            bounce: -(sin(t * 8.5).abs()) * 6.0 * ease,
+            crouch: 0.16 * ease,
+          );
+        case CrewIdle.shrug:
+          return BodyExpression(
+            armRaise: 0.42 * ease,
+            slump: -0.5 * ease,
+            headTilt: 0.6 * ease,
+          );
+        case CrewIdle.scratchHead:
+          return BodyExpression(
+            armRaise: 0.85 * ease,
+            headTilt: 0.45 * ease,
+            lean: 0.06 * ease,
+          );
+        case CrewIdle.jig:
+          return BodyExpression(
+            bounce: -(sin(t * 9.5).abs()) * 4.0 * ease,
+            tremble: sin(t * 9.5) * 3.2 * ease,
+            lean: sin(t * 4.75) * 0.1 * ease,
+          );
+        case CrewIdle.whistle:
+          return BodyExpression(
+            lean: sin(t * 1.8) * 0.07 * ease,
+            bounce: sin(t * 3.6) * 1.1 * ease,
+          );
+        case CrewIdle.chatter:
+          return BodyExpression(
+            armRaise: 0.2 * ease,
+            headTilt: sin(t * 6.5) * 0.3 * ease,
+          );
+        case CrewIdle.lookAround:
+          return BodyExpression(headTilt: sin(t * 2.1) * 0.5 * ease);
+        case CrewIdle.browWaggle:
+          return BodyExpression(
+            bounce: sin(t * 7.0) * 1.2 * ease,
+            headTilt: 0.2 * ease,
+          );
+        case CrewIdle.none:
+          break;
+      }
+    }
+
+    return BodyExpression.none;
   }
 
   /// Picks one of the "Awww" hit variations with this crew member's own
   /// RNG — every pained yelp is a little different.
   String hitVoice() {
     const pool = ['voice_ouch1', 'voice_ouch2', 'voice_ouch3', 'voice_ouch4'];
-    return pool[_idleRng.nextInt(pool.length)];
+    return voiced(pool[_idleRng.nextInt(pool.length)]);
   }
 
   // --- Dynamic health bar ---------------------------------------------------
@@ -817,9 +1282,29 @@ class Crew {
     swapSoundStarted = false;
   }
 
-  Crew({required this.hp, required this.maxHp, this.bobPhase = 0}) {
+  /// Which register this crew member speaks in, from their character. Only
+  /// the clips that have `_low`/`_high` variants are pitched — see
+  /// [AudioService.voiceBases]; anything else falls back to the mid clip via
+  /// [voiced].
+  final VoiceType voice;
+
+  Crew({
+    required this.hp,
+    required this.maxHp,
+    this.bobPhase = 0,
+    this.voice = VoiceType.mid,
+  }) {
     idleNextIn = 2.5 + bobPhase % 5;
   }
+
+  /// This crew member's own take on a voice clip.
+  ///
+  /// A deck used to be a row of people sharing one voice, which is most of
+  /// why they read as identical. Every character now carries a [VoiceType]
+  /// and this is where it is applied — one place, so nothing can play an
+  /// unpitched line by accident.
+  String voiced(String base) =>
+      voice == VoiceType.mid ? base : '$base${voice.suffix}';
 
   bool get alive => hp > 0;
 
@@ -874,6 +1359,11 @@ class Crew {
     double hitSide = 0,
   }) {
     final d = dir.distance <= 0 ? const Offset(1, 0) : dir / dir.distance;
+    // Tar makes a body harder to shift: the same blast that would send a
+    // clean crew member over the rail only slides a tarred one. That is the
+    // upside half of the effect, and it is why tar is a trade rather than a
+    // pure punishment.
+    force *= statusKnockScale;
     ragdoll = true;
     ragdollTime = 0;
     rest = 0;
@@ -887,6 +1377,13 @@ class Crew {
       // A headshot can "shoot off": the head gets an extra snap backward,
       // pitching the whole body over into a backflip.
       pose!.head.setVel(pose!.head.vel + Offset(0, -headKick));
+    }
+    // Any real spin curls them up and launches them: the tuck lets the
+    // rotation survive the speed cap, and the lift buys the hang time to
+    // bring it round. Without both, a flip stalls halfway and flops back.
+    if (spin.abs() > 0.05) {
+      flipT = BattleConst.flipTuckTime;
+      pose!.addLift(BattleConst.flipLift);
     }
     vel = pose!.hip.vel;
     if (plant && pose != null) {
@@ -927,6 +1424,10 @@ class Crew {
       Offset(d.dx * f, d.dy * f - 2.2),
       spin: spin,
     );
+    if (spin.abs() > 0.05) {
+      flipT = BattleConst.flipTuckTime;
+      pose!.addLift(BattleConst.flipLift);
+    }
     vel = pose!.hip.vel;
   }
 
@@ -941,10 +1442,6 @@ class Crew {
   static double impactForce(WeaponDef weapon) =>
       (1.2 + weapon.damage * 0.028) * (0.8 + 0.2 * weapon.weight);
 }
-
-/// Cosmetic archetype for an enemy crew — drives the renderer's hat/beard/
-/// bandana choices and the label shown above the raft.
-enum CrewLook { player, raider, ducker, pirate, captain }
 
 class Raft {
   final int playerIndex;
@@ -989,7 +1486,7 @@ class Raft {
   /// Deck surface height — the line the crew's feet rest on. Matches the
   /// renderer's own deck calculation so a body standing at offset zero is
   /// drawn exactly on the planks.
-  double get deckY => BattleConst.waterY - loadout.width * loadout.hull.thickness * 0.55;
+  double get deckY => BattleConst.waterY - loadout.deckRise;
 
   /// Half the walkable deck. Past this a crew member is over open water.
   double get deckHalf => loadout.deckHalf;
@@ -1000,7 +1497,7 @@ class Raft {
   double get hullHalf => loadout.width * 0.5;
 
   /// Bottom edge of the solid hull block, below the waterline.
-  double get hullBottom => deckY + loadout.width * loadout.hull.thickness;
+  double get hullBottom => deckY + loadout.hullHeight;
 
   /// The walkable surface at hull-local [x], as a y-offset from [deckY]
   /// (0 on the main deck, negative up on a raised platform), or null past
@@ -1011,8 +1508,29 @@ class Raft {
     return -profile.riseAt(x);
   }
 
+  /// Hull-local x of crew member [i]'s berth, taken from this raft's own
+  /// (facing-oriented) deck plan — so the high ground is always aft and the
+  /// crew stand on whatever tier the plan posted them to.
+  double stationX(int i) {
+    final st = profile.stations;
+    if (st.isEmpty) return loadout.crewOffset(i);
+    return st[i.clamp(0, st.length - 1)].x;
+  }
+
+  /// The body offset crew member [i] rests at when they are home and
+  /// undisturbed: no horizontal displacement, and standing on whatever
+  /// surface their berth sits on. Crew posted to a raised platform rest
+  /// *up there*, not at main-deck level.
+  Offset restOffset(int i) => Offset(0, surfaceY(stationX(i)) ?? 0);
+
+  /// True when crew member [i] is standing at their berth, rather than
+  /// displaced by a hit. Compares against [restOffset] — not `Offset.zero` —
+  /// because a berth on a platform has a non-zero resting height.
+  bool atStation(int i) => (crew[i].offset - restOffset(i)).distance < 0.4;
+
   /// World position of crew member [i]'s feet, following their body.
-  Offset feetPos(int i) => Offset(x + loadout.crewOffset(i) + crew[i].offset.dx, deckY + crew[i].offset.dy);
+  Offset feetPos(int i) =>
+      Offset(x + stationX(i) + crew[i].offset.dx, deckY + crew[i].offset.dy);
 
   /// World position of crew member [i]'s body centre — the point a shot has
   /// to land near. Sits a torso-and-a-bit above the feet.
@@ -1028,14 +1546,14 @@ class Raft {
       return (feet, feet - const Offset(0, BattleConst.bodyHeight));
     }
     final b = pose.bounds;
-    final cx = x + loadout.crewOffset(i) + b.center.dx;
+    final cx = x + stationX(i) + b.center.dx;
     return (Offset(cx, deckY + b.bottom), Offset(cx, deckY + b.top));
   }
 
   /// Which way leads off the nearest rail from crew member [i]'s current
   /// position: +1 toward the bow-side rail, -1 toward the stern-side one.
   double railDir(int i) =>
-      (loadout.crewOffset(i) + crew[i].offset.dx) >= 0 ? 1.0 : -1.0;
+      (stationX(i) + crew[i].offset.dx) >= 0 ? 1.0 : -1.0;
 
   /// The crew member currently taking this raft's shot, or null if none left.
   Crew? get activeCrew {
@@ -1066,17 +1584,23 @@ class Raft {
     // centre and 5 below the shoulder line.
     final shoulderY = deckY + crew[i].offset.dy - 15.0 - 27.0;
     final gunShoulder = Offset(
-      x + loadout.crewOffset(i) + crew[i].offset.dx + gunSide * 9.5,
+      x + stationX(i) + crew[i].offset.dx + gunSide * 9.5,
       shoulderY + 5,
     );
     final r = aimAngleDeg * pi / 180;
     // Mirrors the renderer's head-clearance blend (see [ArmIK.headClearance])
     // so the drawn grip and the actual shot-spawn point never drift apart.
     final steep = sin(r).clamp(0.0, 1.0);
-    final grip = gunShoulder +
+    final bodyAng = gunSide > 0 ? -r : r - pi;
+    // Carried by the barrel line, with the grip hanging below it — the same
+    // geometry the renderer uses (see its `barrelAnchor`). Anchoring the grip
+    // on the shoulder ray instead would sit the bore a grip-height too high,
+    // and the shot would leave from above the drawn muzzle.
+    final barrelAnchor = gunShoulder +
         Offset(gunSide * cos(r), -sin(r)) * wv.holdDist +
         Offset(gunSide * steep * ArmIK.headClearance, 0);
-    final bodyAng = gunSide > 0 ? -r : r - pi;
+    final grip = barrelAnchor +
+        Offset(-gunSide * sin(bodyAng), gunSide * cos(bodyAng)) * wv.gripY;
     final c = cos(bodyAng), s = sin(bodyAng);
     // Weapon-local muzzle tip -> body space: grip-centred frame, y mirrored
     // for left-facing rafts. Must stay in lockstep with the renderer's
@@ -1285,6 +1809,10 @@ class BattleWorld {
   /// [onVoice], separate hook so the controller can balance them apart.
   void Function(String sound)? onSfx;
 
+  /// A boss round landed a status on someone. The screen uses it to pop the
+  /// "CHILLED!" banner and the victim's speech bubble.
+  void Function(Crew victim, StatusEffect effect)? onStatus;
+
   /// Test/preview hook: forces the zone reaction of the next direct hit —
   /// 'flip' (headshot backflip), 'plant' (leg plant) or 'grab' (torso
   /// clutch) — instead of the deterministic dice roll. Null plays normally.
@@ -1303,7 +1831,16 @@ class BattleWorld {
   // Setup
   // ---------------------------------------------------------------------------
 
-  void addRaft(Raft raft) => rafts.add(raft);
+  void addRaft(Raft raft) {
+    // Seat the crew at their berths straight away. A berth on a raised tier
+    // rests above the main deck, so a crew member who starts at a bare zero
+    // offset would spend the first moments of the battle standing in mid-air
+    // and then walking down to a deck they were never posted to.
+    for (int i = 0; i < raft.crew.length; i++) {
+      raft.crew[i].offset = raft.restOffset(i);
+    }
+    rafts.add(raft);
+  }
 
   Raft? raftOf(int playerIndex) {
     for (final r in rafts) {
@@ -1604,7 +2141,9 @@ class BattleWorld {
       firedAt: elapsed,
     );
     // The effortful grunt that rides the recoil.
-    onVoice?.call('voice_grunt');
+    // The grunt belongs to whoever pulled the trigger, in their own voice.
+    final shooter = rafts.where((r) => r.playerIndex == owner).firstOrNull?.activeCrew;
+    onVoice?.call(shooter?.voiced('voice_grunt') ?? 'voice_grunt');
   }
 
   /// Advances the in-flight shot by one frame. Returns a [ShotOutcome] on the
@@ -1877,11 +2416,24 @@ class BattleWorld {
       // landed. A crew member the shot kills goes limp instead: they never
       // stand back up, and the body drifts off the deck into the water.
       final hitLocal = impact - Offset(
-        hitRaft.x + hitRaft.loadout.crewOffset(crewIndex),
+        hitRaft.x + hitRaft.stationX(crewIndex),
         hitRaft.deckY,
       );
       final zone = _hitZone(hitLocal);
       final boom = s.weapon.splash > 0;
+      // A boss round leaves its mark on whoever it landed on directly. Only
+      // on a direct hit and only on the living: splash spreading a snare
+      // across a whole deck would end the fight on one lucky shot.
+      final st = s.weapon.status;
+      if (st != null && c.alive) {
+        c.afflict(st, s.weapon.statusTurns);
+        c.say(st.bubble, seconds: 2.0);
+        // Chills get teeth-chatter; everything else gets a sharp gasp.
+        onVoice?.call(st == StatusEffect.chilled
+            ? 'voice_brr'
+            : c.voiced('voice_gasp'));
+        onStatus?.call(c, st);
+      }
       // Test/preview hook: when set ('flip' | 'plant' | 'grab'), the
       // matching zone reaction always fires instead of being dice-rolled.
       final forced = debugHitReaction;
@@ -1899,19 +2451,31 @@ class BattleWorld {
           c.grabT = BattleConst.grabTime;
           c.hitReactT = BattleConst.hitReactTime;
           onVoice?.call(c.hitVoice());
+          c.say(c.hitLine);
           onSfx?.call('hit');
           bumpShake(1.2);
         } else {
-          final spin = (zone == HitZone.head &&
-                  (forced == 'flip' || _hitChance(s, 0x11, 0.4)))
-              ? (_hitChance(s, 0x22, 0.5)
-                  ? BattleConst.headshotSpin
-                  : -BattleConst.headshotSpin)
-              : 0.0;
-          final headKick =
-              (zone == HitZone.head && (forced == 'flip' || _hitChance(s, 0x33, 0.3)))
-                  ? 4.2 + s.weapon.weight * 1.5
-                  : 0.0;
+          // Head hits somersault; the heavier the round, the likelier and
+          // the harder it whips. A backflip rotates *away* from the shot,
+          // which is the read that sells it — the occasional front flip is
+          // a rarer, funnier accident rather than a coin toss.
+          final flipChance = BattleConst.flipChanceFor(s.weapon.weight);
+          final flips =
+              zone == HitZone.head && (forced == 'flip' || _hitChance(s, 0x11, flipChance));
+          final backward = s.vel.dx >= 0 ? 1.0 : -1.0;
+          final frontFlip = _hitChance(s, 0x22, 0.22);
+          final spin = flips
+              ? backward *
+                  (frontFlip ? -1 : 1) *
+                  BattleConst.headshotSpin *
+                  (0.8 + s.weapon.weight * 0.35)
+              : (zone == HitZone.legs &&
+                      (forced == 'plant' || _hitChance(s, 0x66, BattleConst.sweepSpinChance))
+                  // Swept legs spin the body out low, the opposite way a
+                  // head hit throws it.
+                  ? -backward * BattleConst.sweepSpin
+                  : 0.0);
+          final headKick = flips ? 4.2 + s.weapon.weight * 1.5 : 0.0;
           c.knock(s.vel, Crew.impactForce(s.weapon) * (boom ? 1.35 : 1.0),
               hitLocal: hitLocal,
               lift: boom ? 0.12 : 0,
@@ -1923,20 +2487,26 @@ class BattleWorld {
               hitSide: hitLocal.dx);
           c.hitReactT = BattleConst.hitReactTime;
           onVoice?.call(c.hitVoice());
+          c.say(c.hitLine);
           // Impact audio: a thud for small arms, a proper bang for
           // explosives, and a whoosh riding any backflip launch.
           onSfx?.call(boom ? 'explosion' : 'hit');
           if (spin != 0) onSfx?.call('whoosh');
         }
       } else {
+        // A killing headshot still gets to somersault on the way over the
+        // rail — the same rotation as a survivable one, thrown away from
+        // the shot, and heavier rounds throw it harder.
+        final backward = s.vel.dx >= 0 ? 1.0 : -1.0;
         c.startDeath(s.vel, Crew.impactForce(s.weapon) * (boom ? 1.4 : 1.0),
             railDir: hitRaft.railDir(crewIndex),
             hitLocal: hitLocal,
-            spin: zone == HitZone.head && forced == 'flip'
-                ? BattleConst.headshotSpin
-                : (zone == HitZone.head
-                    ? BattleConst.headshotSpin * 0.6
-                    : 0));
+            spin: zone == HitZone.head
+                ? backward *
+                    BattleConst.headshotSpin *
+                    (forced == 'flip' ? 1.0 : 0.75) *
+                    (0.8 + s.weapon.weight * 0.35)
+                : 0);
         onSfx?.call(boom ? 'explosion' : 'hit');
         onSfx?.call('eliminate');
       }
@@ -1954,7 +2524,7 @@ class BattleWorld {
           final c = raft.crew[i];
           if (!c.alive) continue;
           final d = (impact - raft.crewPos(i)).distance;
-          final station = Offset(raft.x + raft.loadout.crewOffset(i), raft.deckY);
+          final station = Offset(raft.x + raft.stationX(i), raft.deckY);
           final away = raft.crewPos(i) - impact;
           if (d <= s.weapon.splash) {
             final falloff = 1 - (d / s.weapon.splash);
@@ -1972,6 +2542,7 @@ class BattleWorld {
                   zone: HitZone.torso);
               c.hitReactT = BattleConst.hitReactTime;
               onVoice?.call(c.hitVoice());
+              c.say(c.hitLine);
             } else {
               c.startDeath(Offset(away.dx, -1.0), max(3.0, force),
                   railDir: raft.railDir(i),
@@ -2041,7 +2612,10 @@ class BattleWorld {
     // whether it was a direct hit or splash damage caught someone.
     if (dealt > 0) {
       shooterCrew?.gloatT = BattleConst.gloatTime;
-      if (shooterCrew?.alive == true) onVoice?.call('voice_laugh');
+      shooterCrew?.say(shooterCrew.gloatLine);
+      if (shooterCrew?.alive == true) {
+        onVoice?.call(shooterCrew!.voiced('voice_laugh'));
+      }
     }
 
     shot = null;
@@ -2173,6 +2747,11 @@ class BattleWorld {
 
         if (c.hitReactT > 0) c.hitReactT = max(0, c.hitReactT - dt);
         if (c.gloatT > 0) c.gloatT = max(0, c.gloatT - dt);
+        if (c.statusFlash > 0) c.statusFlash = max(0, c.statusFlash - dt);
+        if (c.bubbleT > 0) {
+          c.bubbleT = max(0, c.bubbleT - dt);
+          if (c.bubbleT == 0) c.bubble = null;
+        }
 
         // Ragdoll-reaction timers: the leg plant releases after its window,
         // and a torso clutch fades once the body settles.
@@ -2189,17 +2768,19 @@ class BattleWorld {
 
         if (c.ragdoll) {
           _stepBody(raft, i, c);
-        } else if (c.alive && c.offset != Offset.zero) {
-          // Recovered: walk back to the station they were knocked off. The
+        } else if (c.alive && !raft.atStation(i)) {
+          // Recovered: walk back to the berth they were knocked off. The
           // renderer turns walkPhase/walkAmp into a proper leg swing, and
-          // the feet follow the deck surface — down a platform ramp, across
-          // the main deck — rather than gliding through it.
+          // the feet follow the deck surface — up or down a platform ramp,
+          // across the main deck — rather than gliding through it. Home is
+          // the berth's own resting height, which for crew posted to a
+          // castle or a barrel step is well above the main deck.
           c.walkAmp = min(1.0, c.walkAmp + dt * 5);
           c.walkPhase += BattleConst.walkCycleSpeed;
           final dx = c.offset.dx * (1 - BattleConst.bodyRecover);
-          final surface = raft.surfaceY(raft.loadout.crewOffset(i) + dx) ?? 0.0;
+          final surface = raft.surfaceY(raft.stationX(i) + dx) ?? 0.0;
           c.offset = Offset(dx, surface);
-          if (c.offset.distance < 0.4) c.offset = Offset.zero;
+          if (raft.atStation(i)) c.offset = raft.restOffset(i);
         } else if (c.alive) {
           // Arrived (or never left): ease the walk out.
           if (c.walkAmp > 0) {
@@ -2219,7 +2800,7 @@ class BattleWorld {
       c.ragdollTime = 0;
       return;
     }
-    final stationX = raft.loadout.crewOffset(index);
+    final stationX = raft.stationX(index);
 
     // Watchdog: a ragdoll that has been running far longer than any real
     // tumble — or whose hips have left the world's sane band entirely — is
@@ -2266,6 +2847,10 @@ class BattleWorld {
     if (c.getUpT >= 0) {
       c.clearPlant();
       c.grabT = 0;
+      // Uncurl before standing: blending to a standing pose while the solver
+      // still holds a tuck fights itself and the body pops.
+      c.flipT = 0;
+      pose.tuck = 0;
       c.getUpT = min(1.0, c.getUpT + (1 / 60) / BattleConst.bodyGetUpTime);
       final feet = raft.surfaceY(stationX + pose.hip.pos.dx) ?? 0.0;
       pose.blendTo(RagdollPose.standingAt(Offset(pose.hip.pos.dx, feet)), c.getUpT);
@@ -2283,6 +2868,14 @@ class BattleWorld {
     c.ragdollTime += 1 / 60;
 
     final dead = !c.alive && !c.drowned;
+
+    // Somersault curl: hold the tuck while the flip runs, then let it out so
+    // the body sprawls again for the landing. Easing rather than snapping
+    // keeps the constraint solver stable — yanking every rest length in one
+    // frame injects energy.
+    if (c.flipT > 0) c.flipT = max(0, c.flipT - 1 / 60);
+    final wantTuck = c.flipT > 0 ? 1.0 : 0.0;
+    pose.tuck += (wantTuck - pose.tuck) * (BattleConst.flipTuckRate / 60);
 
     pose.integrate(gravity: BattleConst.bodyGravity, drag: BattleConst.bodyDrag);
 
@@ -2311,11 +2904,20 @@ class BattleWorld {
         // Rail lip: a living body still at deck level and still over the
         // edge line is bounced back aboard. Corpses skip the lip entirely —
         // the death drift carries them over, and the water takes them.
+        //
+        // The lip's height window is measured from the deck surface *at that
+        // rail*, not from the main deck plane. Crew are berthed on raised
+        // tiers, and a body knocked off a forecastle starts a whole platform
+        // height above the main deck — measuring from the plane put it above
+        // the window before it ever reached the edge, so it sailed straight
+        // over a rail that should have caught it.
+        final side = (stationX + p.pos.dx) > 0 ? 1.0 : -1.0;
+        final railSurface = raft.surfaceY(side * raft.deckHalf) ?? 0.0;
         final over = (stationX + p.pos.dx).abs() - raft.deckHalf;
         if (over > 0 &&
             over < BattleConst.railWall &&
-            p.pos.dy > -BattleConst.railWallHeight &&
-            p.pos.dy < 4) {
+            p.pos.dy > railSurface - BattleConst.railWallHeight &&
+            p.pos.dy < railSurface + 4) {
           final inward = (stationX + p.pos.dx) > 0 ? -1.0 : 1.0;
           final v = p.vel;
           if (v.dx * inward < 0) {
@@ -2331,19 +2933,23 @@ class BattleWorld {
     pose.solve();
 
     // Energy cap: constraint relaxation and stacked impulses can otherwise
-    // fling points absurdly far — the "ragdoll into the sky" bug. Upward
-    // velocity is capped far tighter than overall speed: sideways reads as
-    // a knock-back, a high launch reads as a bug.
+    // fling points absurdly far — the "ragdoll into the sky" bug.
+    //
+    // The rise limit applies to the body's *mean* upward velocity, not to
+    // each point independently. Clipping per point also clipped the upward
+    // half of any rotation, which quietly bled the spin out of every
+    // somersault: a flip would start, stall halfway and flop back. Capping
+    // the whole-body drift keeps the "hop, not a launch" guarantee (it is
+    // the mean that carries the body up) while leaving rotation intact. The
+    // absolute per-point speed cap still applies, so nothing tunnels.
+    pose.capRise(
+        c.flipT > 0 ? BattleConst.flipRise : BattleConst.bodyMaxRise);
     for (final p in pose.points) {
-      var v = p.vel;
-      if (v.dy < -BattleConst.bodyMaxRise) {
-        v = Offset(v.dx, -BattleConst.bodyMaxRise);
-      }
+      final v = p.vel;
       final speed = v.distance;
       if (speed > BattleConst.bodyMaxSpeed) {
-        v = v / speed * BattleConst.bodyMaxSpeed;
+        p.setVel(v / speed * BattleConst.bodyMaxSpeed);
       }
-      p.setVel(v);
     }
 
     // Every death has to end in the water: a body that has all but stopped

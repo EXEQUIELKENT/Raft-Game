@@ -5,8 +5,10 @@ import 'package:flutter/foundation.dart';
 import 'ai.dart';
 import 'audio.dart';
 import 'battle.dart';
+import 'bosses.dart';
 import 'maps.dart';
 import 'models.dart';
+import 'progression.dart';
 import 'net.dart';
 import 'raft.dart';
 import 'save.dart';
@@ -15,7 +17,14 @@ import 'save.dart';
 /// more — a shot flies, resolves, and the turn passes.
 enum GamePhase { aiming, firing, resolving, turnTransition, gameOver }
 
-enum GameMode { vsAi, local, hotspot }
+/// How a match is being played.
+///
+/// [hotspot] and [online] differ only in which [GameLink] carries the
+/// protocol — a TCP socket on a shared network, or the server's relay over
+/// the internet. Every rule that follows from "there is a remote opponent"
+/// is the same for both, so the code asks [GameController.isNetworked]
+/// rather than naming either one.
+enum GameMode { vsAi, local, hotspot, online }
 
 class PlayerConfig {
   final String name;
@@ -37,6 +46,11 @@ class PlayerConfig {
   /// Innate aim sloppiness for AI seats (design's per-type `jitter`).
   final double aimJitter;
 
+  /// Set on a world boss's own seat. Null for every ordinary opponent —
+  /// which is what makes the signature round a boss thing rather than
+  /// something any enemy might suddenly do.
+  final BossDef? boss;
+
   PlayerConfig({
     required this.name,
     required this.loadout,
@@ -46,6 +60,7 @@ class PlayerConfig {
     this.netId,
     this.powerMultiplier = 1.0,
     this.aimJitter = 10,
+    this.boss,
   });
 }
 
@@ -62,6 +77,14 @@ class MatchSettings {
   /// absent from the map fall back to their [WeaponDef.startAmmo].
   Map<String, int>? ammo;
 
+  /// How demanding this battle is, 0 for a casual skirmish and rising through
+  /// the campaign. Feeds the XP award, so pushing forward always pays better
+  /// than farming the first level (see [Progression.battleXp]).
+  int difficultyTier;
+
+  /// True for a world's final battle. Worth half again as much XP.
+  bool isBoss;
+
   MatchSettings({
     MapDef? map,
     this.startHp = 100,
@@ -69,6 +92,8 @@ class MatchSettings {
     List<String>? enabledWeapons,
     this.startHpPerPlayer,
     this.ammo,
+    this.difficultyTier = 0,
+    this.isBoss = false,
   })  : map = map ?? GameMaps.all.first,
         enabledWeapons = enabledWeapons ?? Weapons.all.map((w) => w.id).toList();
 
@@ -119,6 +144,16 @@ class GameController extends ChangeNotifier {
   /// [_beginTurn]. The single guard that stops a double-tap, a racing network
   /// message and the AI from all queueing a shot for the same turn.
   bool _shotCommitted = false;
+
+  /// Shots each boss seat has taken, and the round its last signature went
+  /// out on. Keyed by seat so a fleet with two named opponents cannot share
+  /// one cooldown.
+  final Map<int, int> _bossShots = {};
+  final Map<int, int> _bossLastSignature = {};
+
+  /// Seats whose boss has already delivered its wounded line. It is a
+  /// once-per-fight beat, not something to repeat every turn it stays hurt.
+  final Set<int> _bossWounded = {};
 
   double _aiThinkTime = 0;
   bool _aiShotQueued = false;
@@ -186,7 +221,12 @@ class GameController extends ChangeNotifier {
         facing: isPlayerSide ? 1 : -1,
         crew: List.generate(
           p.loadout.crewCount,
-          (c) => Crew(hp: hp, maxHp: hp, bobPhase: c * 0.7),
+          (c) => Crew(
+            hp: hp,
+            maxHp: hp,
+            bobPhase: c * 0.7,
+            voice: Cast.of(p.look).voice,
+          ),
         ),
       ));
     }
@@ -252,7 +292,7 @@ class GameController extends ChangeNotifier {
       resetMatch(seed: seed);
       return;
     }
-    if (mode == GameMode.hotspot && net != null && net!.isHost) {
+    if (isNetworked && net!.isHost) {
       requestRematch();
     }
   }
@@ -274,8 +314,18 @@ class GameController extends ChangeNotifier {
     _doFire(a.toDouble(), p.toDouble(), Weapons.byId(w), fromNetwork: true);
   }
 
+  /// True when a remote opponent is on the other end, over either transport.
+  ///
+  /// Every networked rule below — seat mapping, who owns the turn clock, who
+  /// may fire, whether a turn handoff has to be announced — follows from
+  /// "there is somebody else out there", not from *how* we reach them. The
+  /// relay and the socket are both [GameLink]s, so asking this rather than
+  /// naming a mode is what let internet play reuse the hotspot rules whole.
+  bool get isNetworked =>
+      (mode == GameMode.hotspot || mode == GameMode.online) && net != null;
+
   int get myPlayerIndex {
-    if (mode == GameMode.hotspot && net != null) return net!.isHost ? 0 : 1;
+    if (isNetworked) return net!.isHost ? 0 : 1;
     return currentPlayer;
   }
 
@@ -284,13 +334,13 @@ class GameController extends ChangeNotifier {
   /// is player 0 (hot-seat play shares this device, and the campaign is
   /// single-player).
   int get localPlayerIndex =>
-      (mode == GameMode.hotspot && net != null) ? (net!.isHost ? 0 : 1) : 0;
+      isNetworked ? (net!.isHost ? 0 : 1) : 0;
 
   /// True when this device is the one that should be running the turn clock.
   /// Outside hotspot play that is always true; over the wire only the device
   /// whose turn it is counts down, for the drift reason in [_updateAiming].
   bool get _ownsTurnClock =>
-      mode != GameMode.hotspot || net == null || currentPlayer == myPlayerIndex;
+      !isNetworked || currentPlayer == myPlayerIndex;
 
   /// Identifies the turn currently being played. Both devices in a hotspot
   /// match end every turn locally and tell the other about it; the token lets
@@ -298,6 +348,11 @@ class GameController extends ChangeNotifier {
   /// it, instead of advancing a second time.
   int _turnSeq = 0;
   final Set<int> _endedTurns = {};
+
+  /// How many turns this device has begun. Monotonic within a match, which is
+  /// what lets two reconnecting hotspot devices work out whose account of the
+  /// battle is the later one — see [ResumeOffer].
+  int get turnSeq => _turnSeq;
 
   // ---------------------------------------------------------------------------
   // Ticker
@@ -356,11 +411,27 @@ class GameController extends ChangeNotifier {
     final raft = world.raftOf(player);
     raft?.ensureActiveReady();
     raft?.ensureActiveAlive();
+
+    // Boss statuses are counted down in the victim's OWN turns, here, rather
+    // than on a clock — an effect that lapsed while somebody else was
+    // aiming would be no effect at all. A snared crew member loses this one.
+    final shooter = raft?.activeCrew;
+    if (shooter != null && shooter.afflicted) {
+      final sitOut = shooter.consumeTurnStatus();
+      if (sitOut && !initial) {
+        statusMessage = '${players[player].name} is tangled up!';
+        world.onVoice?.call(shooter.hitVoice());
+        // Straight past them. Their status has already been consumed, so a
+        // snare can never cost the same crew member two turns in a row.
+        _skipSnaredTurn(player);
+        return;
+      }
+    }
     // Sync the active crew's firearm to this seat's selected weapon at turn
     // start (instant — the raise animation belongs to mid-turn swaps, and
     // over a hotspot link only the local seat's own crew is synced).
     final localSeat = !players[player].isAi &&
-        (mode != GameMode.hotspot || player == myPlayerIndex);
+        (!isNetworked || player == myPlayerIndex);
     if (localSeat) {
       world.raftOf(player)?.activeCrew?.equipInstant(selectedWeaponId);
     }
@@ -369,7 +440,7 @@ class GameController extends ChangeNotifier {
     // arrive rather than being teleported to the enemy's side on their turn.
     // The cut is a hard one on purpose: the rafts are far enough apart that
     // easing across would just be a long sideways pan past the enemy.
-    world.lockCam(mode == GameMode.hotspot ? localPlayerIndex : player);
+    world.lockCam(isNetworked ? localPlayerIndex : player);
 
     // A weapon the player has run out of must not stay selected into the next
     // turn, or the fire button would silently do nothing.
@@ -453,19 +524,67 @@ class GameController extends ChangeNotifier {
     if (liveIdx.isEmpty) return;
     final targetPos = targetRaft.crewPos(liveIdx[world.rng.nextInt(liveIdx.length)]);
 
-    final arsenal = Weapons.all
-        .where((w) => settings.enabledWeapons.contains(w.id))
-        .toList();
+    // A boss reaching for its signature round narrows the arsenal to exactly
+    // that one, so the planner solves the arc for the round it will actually
+    // fire. Everything about whether it *should* is in [BossDef] — the
+    // trigger, the cooldown, and the deliberate rule that the first shot of
+    // a fight is never the special one.
+    final boss = p.boss;
+    final useSignature = boss != null &&
+        boss.wantsSignature(
+          shotsTaken: _bossShots[currentPlayer] ?? 0,
+          selfHp: me.hpFrac,
+          playerHp: world.raftOf(0)?.hpFrac ?? 1,
+          turnsSinceSignature: round - (_bossLastSignature[currentPlayer] ?? -99),
+        );
+    final arsenal = useSignature
+        ? [boss.signature]
+        : Weapons.all
+            .where((w) => settings.enabledWeapons.contains(w.id))
+            .toList();
+    _bossShots[currentPlayer] = (_bossShots[currentPlayer] ?? 0) + 1;
+    if (boss != null) {
+      // The boss talks, in its own speech bubble over its own head. The
+      // opening line lands on its first shot rather than at match start, so
+      // it is not buried under the level's own intro card; the wounded line
+      // fires once, the first time it drops below half.
+      final crew = me.activeCrew;
+      if (_bossShots[currentPlayer] == 1) {
+        crew?.say(boss.openingLine, seconds: 2.4);
+      } else if (useSignature) {
+        crew?.say(boss.signatureLine, seconds: 2.0);
+        world.onVoice?.call('voice_taunt');
+      } else if (me.hpFrac <= 0.4 && _bossWounded.add(currentPlayer)) {
+        crew?.say(boss.woundedLine, seconds: 2.4);
+      }
+    }
+    if (useSignature) {
+      _bossLastSignature[currentPlayer] = round;
+      onEvent?.call('bossSignature', {
+        'name': boss.name,
+        'line': boss.signatureLine,
+        'weapon': boss.signatureWeaponId,
+      });
+    }
     final shot = AiController(p.aiDifficulty).plan(
-      // Planning origin: the muzzle at the nominal 45° lob. The shot itself
-      // is spawned from the exact live-angle muzzle in [_doFire]; the few
-      // units between the two are far below the AI's aim jitter.
+      // Planning origin: the muzzle for whichever arc the planner settles
+      // on. The muzzle swings out along the aim line (see [Raft.muzzle]), so
+      // a plan built at a nominal 45 degrees and then fired at a different
+      // elevation solves from an origin the shot never actually leaves.
       from: me.muzzle(),
+      muzzleAt: (angleDeg) => me.muzzle(aimAngleDeg: angleDeg),
       targetPos: targetPos,
       facing: me.facing,
       arsenal: arsenal.isEmpty ? [Weapons.starter] : arsenal,
-      baseJitter: p.aimJitter,
-      powerMultiplier: p.powerMultiplier,
+      // Dazed costs the player their trajectory arc. An AI has no arc to
+      // lose — it solves the ballistics internally — so without this the
+      // same status would be a real cost to a human and free to a computer,
+      // which matters the moment the player fires one back at a boss.
+      baseJitter: p.aimJitter *
+          (me.activeCrew?.status == StatusEffect.dazed ? 2.4 : 1.0),
+      // The AI solves against the power it will actually get, so a chilled
+      // enemy misses short exactly like a chilled player would.
+      powerMultiplier: p.powerMultiplier * (me.activeCrew?.statusPowerScale ?? 1.0),
     );
 
     _aiShotQueued = true;
@@ -567,7 +686,7 @@ class GameController extends ChangeNotifier {
     // their own deck, so we ease to the local player's raft if they are
     // the one coming up.
     final next = _nextAlivePlayer();
-    final camTarget = mode == GameMode.hotspot && net != null
+    final camTarget = isNetworked
         ? localPlayerIndex
         : next;
     world.returnCamTo(camTarget, dt);
@@ -579,7 +698,7 @@ class GameController extends ChangeNotifier {
   void _endTurn({bool fromNetwork = false}) {
     if (phase == GamePhase.gameOver) return;
     if (_checkGameOver()) return;
-    if (mode == GameMode.hotspot && net != null) {
+    if (isNetworked) {
       _endedTurns.add(_turnSeq);
       if (!fromNetwork) {
         net!.send({'t': 'endTurn', 'pl': currentPlayer, 'seq': _turnSeq});
@@ -597,6 +716,37 @@ class GameController extends ChangeNotifier {
   void _updateTransition(double dt) {
     _transitionTimer -= dt;
     if (_transitionTimer <= 0) _beginTurn(_nextAlivePlayer());
+  }
+
+  /// Starts [player]'s turn as the ordinary turn flow would.
+  ///
+  /// The turn flow is driven by a real timer, so the one thing a test cannot
+  /// easily reach is a *normal* turn beginning — which is exactly where a
+  /// snare is spent and the turn handed on. This is that seam, and nothing
+  /// else: it calls the same private path the game does.
+  @visibleForTesting
+  void beginTurnForTest(int player) => _beginTurn(player);
+
+  /// Hands the turn straight on because the shooter is snared.
+  ///
+  /// Guarded against the pathological case where every remaining seat is
+  /// snared at once: recursion through [_beginTurn] would run until the
+  /// stack gave out, so a full lap around the table simply plays the turn
+  /// anyway rather than skipping forever.
+  void _skipSnaredTurn(int from) {
+    for (int k = 1; k <= players.length; k++) {
+      final idx = (from + k) % players.length;
+      final raft = world.raftOf(idx);
+      if (raft == null || !raft.alive) continue;
+      if (raft.activeCrew?.snared ?? false) continue;
+      if (idx == 0) round++;
+      _beginTurn(idx);
+      return;
+    }
+    // Nobody is free. Give the turn back to the seat it started on and let
+    // them shoot: a stalemate is worse than an ignored status.
+    world.raftOf(from)?.activeCrew?.clearStatus();
+    _beginTurn(from);
   }
 
   int _nextAlivePlayer() {
@@ -636,6 +786,16 @@ class GameController extends ChangeNotifier {
         damageDealt: damageDealtByHuman,
         mode: mode.name,
         map: settings.map.name,
+        // How well, not just whether: HP left over and a short fight both
+        // pay, so a clean win is worth more than a grind to the same result.
+        hpFraction: world.raftOf(humanWon && mode == GameMode.local
+                ? winner!
+                : 0)
+            ?.hpFrac ??
+            0,
+        difficultyTier: settings.difficultyTier,
+        rounds: round,
+        isBoss: settings.isBoss,
       );
     }
     return true;
@@ -649,7 +809,7 @@ class GameController extends ChangeNotifier {
     if (phase != GamePhase.aiming || _shotCommitted) return false;
     if (currentPlayer < 0 || currentPlayer >= players.length) return false;
     if (players[currentPlayer].isAi) return false;
-    if (mode == GameMode.hotspot && net != null) return currentPlayer == myPlayerIndex;
+    if (isNetworked) return currentPlayer == myPlayerIndex;
     // The shooter must be on their feet: a body mid-ragdoll (tumbling, or
     // still airborne) cannot line up a shot — the turn waits for them.
     if (world.raftOf(currentPlayer)?.activeCrew?.ready != true) return false;
@@ -691,7 +851,7 @@ class GameController extends ChangeNotifier {
     if (changed &&
         phase == GamePhase.aiming &&
         !players[currentPlayer].isAi &&
-        (mode != GameMode.hotspot || currentPlayer == myPlayerIndex)) {
+        (!isNetworked || currentPlayer == myPlayerIndex)) {
       world.raftOf(currentPlayer)?.activeCrew?.equip(weaponId);
     }
     notifyListeners();
@@ -728,7 +888,7 @@ class GameController extends ChangeNotifier {
     if (!canHumanAct) return;
     if (!_hasAmmoFor(selectedWeaponId)) return;
     final w = selectedWeapon;
-    if (mode == GameMode.hotspot && net != null) {
+    if (isNetworked) {
       if (currentPlayer != myPlayerIndex) return;
       net!.send({'t': 'fire', 'a': aimAngle, 'p': aimPower, 'w': w.id, 'pl': currentPlayer});
     }
@@ -805,7 +965,11 @@ class GameController extends ChangeNotifier {
       facing: raft.facing,
       weapon: safeWeapon,
       owner: currentPlayer,
-      powerMultiplier: players[currentPlayer].powerMultiplier,
+      // A chilled or tarred shooter launches short. This is the whole of
+      // what those statuses cost: the shot still goes, it just needs a
+      // higher angle than the player was planning on.
+      powerMultiplier: players[currentPlayer].powerMultiplier *
+          (raft.activeCrew?.statusPowerScale ?? 1.0),
     );
 
     shotsFired++;
@@ -818,7 +982,7 @@ class GameController extends ChangeNotifier {
   /// local: both devices must land on the same seed, so the host picks one
   /// and tells the guest.
   void requestRematch() {
-    if (mode == GameMode.hotspot && net != null) {
+    if (isNetworked) {
       if (net!.isHost) {
         final seed = DateTime.now().millisecondsSinceEpoch;
         net!.send({'t': 'rematch', 'seed': seed});
@@ -869,6 +1033,104 @@ class GameController extends ChangeNotifier {
     _setup(seed ?? DateTime.now().millisecondsSinceEpoch);
   }
 
+
+  // ---------------------------------------------------------------------------
+  // Resume snapshots
+  // ---------------------------------------------------------------------------
+
+  /// Everything about the match that is not implied by its seed.
+  ///
+  /// A battle is lockstep: both devices build an identical world from the
+  /// same seed and thereafter exchange nothing but shots. So restoring one
+  /// does not mean serialising physics — it means rebuilding that world and
+  /// re-applying what has *happened* to it: who is up, which round, how much
+  /// HP each crew member has left, what ammo is spent.
+  ///
+  /// Transient state is deliberately absent. A ragdoll mid-tumble or a shot
+  /// mid-flight cannot be resumed coherently on both ends anyway (the two
+  /// devices would have to agree on a physics frame), and both settle within
+  /// a second of play. On resume everyone is standing at their station, which
+  /// is where they would have ended up.
+  Map<String, dynamic> snapshotState() => {
+        'currentPlayer': currentPlayer,
+        'round': round,
+        'turnSeq': _turnSeq,
+        'shotsFired': shotsFired,
+        'shotsHit': shotsHit,
+        'damage': damageDealtByHuman,
+        'ammo': Map<String, int>.from(ammo),
+        'weapon': selectedWeaponId,
+        'rafts': [
+          for (final r in world.rafts)
+            {
+              'player': r.playerIndex,
+              'active': r.activeIndex,
+              'hp': [for (final c in r.crew) c.hp],
+            },
+        ],
+      };
+
+  /// Puts a [snapshotState] back on top of a freshly built match.
+  ///
+  /// Anything missing or malformed is skipped rather than fatal: a snapshot
+  /// is a convenience, and a half-readable one must not stop the player
+  /// getting into the battle at all.
+  void restoreState(Map<String, dynamic> snap) {
+    final rafts = snap['rafts'];
+    if (rafts is List) {
+      for (final entry in rafts) {
+        if (entry is! Map) continue;
+        final raft = world.raftOf((entry['player'] as num?)?.toInt() ?? -1);
+        if (raft == null) continue;
+        final hp = entry['hp'];
+        if (hp is List) {
+          for (int i = 0; i < raft.crew.length && i < hp.length; i++) {
+            final v = hp[i];
+            if (v is num) {
+              raft.crew[i].hp = v.toDouble().clamp(0.0, raft.crew[i].maxHp);
+            }
+          }
+        }
+        final active = (entry['active'] as num?)?.toInt();
+        if (active != null && active >= 0 && active < raft.crew.length) {
+          raft.activeIndex = active;
+        }
+        raft.ensureActiveAlive();
+      }
+    }
+
+    final savedAmmo = snap['ammo'];
+    if (savedAmmo is Map) {
+      for (final e in savedAmmo.entries) {
+        final v = e.value;
+        if (v is num && ammo.containsKey(e.key)) {
+          ammo[e.key as String] = v.toInt();
+        }
+      }
+    }
+
+    round = (snap['round'] as num?)?.toInt() ?? round;
+    shotsFired = (snap['shotsFired'] as num?)?.toInt() ?? shotsFired;
+    shotsHit = (snap['shotsHit'] as num?)?.toInt() ?? shotsHit;
+    damageDealtByHuman = (snap['damage'] as num?)?.toInt() ?? damageDealtByHuman;
+    final weapon = snap['weapon'];
+    if (weapon is String && Weapons.all.any((w) => w.id == weapon)) {
+      selectedWeaponId = weapon;
+    }
+    // The turn counter has to come back too: it is what dedupes `endTurn`
+    // messages, and restarting it at zero would let a turn already played
+    // out before the restart be replayed by a stale message.
+    _turnSeq = (snap['turnSeq'] as num?)?.toInt() ?? _turnSeq;
+
+    // A crew member could have been eliminated while we were away; if the
+    // saved seat is gone the turn passes to whoever is left.
+    final resumeAt = (snap['currentPlayer'] as num?)?.toInt() ?? currentPlayer;
+    final alive = world.raftOf(resumeAt)?.alive ?? false;
+    _beginTurn(alive ? resumeAt : _nextAlivePlayer(), initial: true);
+    // _beginTurn bumps the sequence; keep the restored value authoritative.
+    _turnSeq = (snap['turnSeq'] as num?)?.toInt() ?? _turnSeq;
+    notifyListeners();
+  }
   @override
   void dispose() {
     _disposed = true;

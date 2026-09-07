@@ -7,13 +7,24 @@ import 'models.dart';
 /// ---------------------------------------------------------------------------
 /// Per-projectile weapon views.
 ///
-/// Every [WeaponDef] has its own firearm: geometry (receiver, shaft barrel,
-/// bell mouth, stock, drum, prongs, pump), grip layout — expressed as IK hand
-/// targets on the weapon's local frame — and a firing animation spec (recoil
-/// kick, muzzle climb, slide/pump travel, muzzle flash) that scales with the
+/// Every [WeaponDef] has its own firearm: a distinct silhouette (receiver,
+/// shaft barrel, bell mouth, plus exactly one signature feature per model —
+/// wood furniture, a vented shroud and scope, a revolver cylinder, a winch
+/// crank and bipod), its own grip layout — expressed as IK hand targets on
+/// the weapon's local frame — and a firing animation spec (recoil kick,
+/// muzzle climb, slide/pump travel, muzzle flash) that scales with the
 /// projectile's weight and caliber. The renderer draws the weapon and solves
 /// the arms against the grip targets; nothing is shared between calibers
 /// except the resolution machinery.
+///
+/// ## No two models are held the same way
+/// [GripStyle] has one entry per caliber and each is used exactly once, so
+/// the *pose* identifies the weapon as much as the outline does: the starter
+/// is cupped in two stacked fists, the rifle's support hand clamps a
+/// handguard, the spreader hangs from a carry handle, the bomb gun is hefted
+/// from underneath at the receiver, and the harpoon gun's off hand works a
+/// winch crank behind the breech. See [_gripStyleUsage] for the pairing, which
+/// a test pins.
 ///
 /// ## Size match
 /// The projectile renderer draws each ball at radius `9 * weight` — rounds
@@ -30,7 +41,8 @@ import 'models.dart';
 /// [muzzleX].
 /// ---------------------------------------------------------------------------
 
-/// How the support (off) hand holds this particular firearm.
+/// How the support (off) hand holds this particular firearm. Exactly one
+/// caliber uses each style, so no two guns are carried alike.
 enum GripStyle {
   /// Hand cups under the trigger hand — light one-hand-ish guns.
   cup,
@@ -44,6 +56,10 @@ enum GripStyle {
 
   /// A second fist under the receiver front, hefting the weight.
   heft,
+
+  /// Hand closes on a winch crank mounted behind the breech, knuckles out —
+  /// the two-stage loading action on the heaviest launcher.
+  crank,
 }
 
 class WeaponView {
@@ -63,7 +79,7 @@ class WeaponView {
   final double barrelX0;
   final double barrelX1;
 
-  /// Bell-mouth bore diameter at the rim — 76% of the round's drawn
+  /// Bell-mouth bore diameter at the rim — ~98% of the round's drawn
   /// diameter (see [boreFor]): the visible proof that this firearm is sized
   /// to the projectile it fires.
   final double bore;
@@ -90,7 +106,7 @@ class WeaponView {
   final double gripY;
 
   /// The support hand's hold: its x along the weapon and resting palm y for
-  /// cup/heft styles (a tube/foregrip grip hangs the palm off the shaft
+  /// cup/heft/crank styles (a tube/foregrip grip hangs the palm off the shaft
   /// instead — see [supportPalmY]) — and the wrist bend that makes the arm
   /// match. Cup stacks sit well clear below the firing hand so the two
   /// fists read as two hands, not one blob.
@@ -133,6 +149,32 @@ class WeaponView {
   /// Wooden handguard furniture over the front of the shaft (AK-style).
   final bool woodFurniture;
 
+  // --- Signature features: one per model, so silhouettes never collide ---
+
+  /// Optical sight above the receiver: centre x and tube length (0 = none).
+  final double scopeX;
+  final double scopeLen;
+
+  /// Vented barrel shroud over the shaft — this many cooling slots
+  /// (0 = none). Reads as a heavy, heat-soaked weapon.
+  final int shroudVents;
+
+  /// Revolver cylinder between receiver and barrel, radius (0 = none).
+  final double cylinderR;
+
+  /// Winch crank behind the breech: wheel radius and centre x (0 = none).
+  /// The [GripStyle.crank] support hand closes on its rim.
+  final double crankR;
+  final double crankX;
+
+  /// Folding bipod under the barrel at this x (0 = none).
+  final double bipodX;
+
+  /// Angled box magazine under the receiver: length and forward rake in
+  /// radians (0 = none). Distinct from the round [drumR] feed.
+  final double magLen;
+  final double magTilt;
+
   const WeaponView({
     required this.id,
     required this.receiverX0,
@@ -153,6 +195,15 @@ class WeaponView {
     this.sightX = 0,
     this.handleX = 0,
     this.woodFurniture = false,
+    this.scopeX = 0,
+    this.scopeLen = 0,
+    this.shroudVents = 0,
+    this.cylinderR = 0,
+    this.crankR = 0,
+    this.crankX = 0,
+    this.bipodX = 0,
+    this.magLen = 0,
+    this.magTilt = 0,
     required this.gripX,
     required this.gripY,
     required this.supportForeX,
@@ -183,8 +234,8 @@ class WeaponView {
   /// Weapon-local y of the support fist's palm CENTRE — the IK wrist
   /// target. A foregrip hangs the palm just under the shaft so fingers can
   /// curl up over it; a top handle raises the palm above the weapon so
-  /// fingers curl down; cup/heft stacks sit at [supportForeY], clear below
-  /// the firing hand.
+  /// fingers curl down; cup/heft/crank stacks sit at [supportForeY], clear
+  /// of the firing hand.
   double get supportPalmY => switch (supportStyle) {
         GripStyle.foregrip => barrelThickness / 2 + 3.0,
         GripStyle.topHandle => -(barrelThickness / 2 + 3.5),
@@ -206,50 +257,77 @@ class WeaponView {
   Offset get muzzle => Offset(muzzleX - 1.6, 0);
 
   /// Support-fist target: the grip/pump handle position, sliding rearward
-  /// with the pump cycle.
-  Offset supportTarget(double pumpT) =>
-      Offset(supportForeX - pumpT * pumpTravel, supportPalmY);
+  /// with the pump cycle. A crank hold instead orbits the wheel rim as the
+  /// action is worked.
+  Offset supportTarget(double pumpT) {
+    if (supportStyle == GripStyle.crank && crankR > 0) {
+      final a = pumpT * pi * 2;
+      return Offset(crankX + cos(a) * crankR * 0.72,
+          supportForeY + sin(a) * crankR * 0.72);
+    }
+    return Offset(supportForeX - pumpT * pumpTravel, supportPalmY);
+  }
 
   // Bores below are `2 * ballR * weight * 0.98` for each weapon's caliber
   // (see [boreFor]) — the muzzle mouth matches the ball it fires, and the
   // bell flare spans ~45% of the bore so it reads as a flare, not a wall.
 
+  /// **Starter — "pop carbine".** The smallest frame: a stubby receiver, a
+  /// short box magazine and a rib sight, with both fists stacked on the
+  /// grip. No stock, no furniture — it reads as a toy next to the rest.
   static const WeaponView _tennis = WeaponView(
     id: 'tennis',
     receiverX0: -2, receiverX1: 6, receiverH: 18,
     barrelX0: 6, barrelX1: 20, bore: 17.6, muzzleX: 29,
+    magLen: 8.5, magTilt: 0.22,
+    sightX: 17,
     gripX: 0, gripY: 12.5,
-    supportForeX: -2, supportForeY: 18.5,
+    supportForeX: -1.5, supportForeY: 19.5,
     supportStyle: GripStyle.cup,
-    holdDist: 14,
+    holdDist: 21,
     kick: 3.5, climb: 0.22, recoilDur: 0.20,
     flashR: 13, flashDur: 0.10, sway: 0.8,
   );
 
-  /// The grenade launcher is an AK-pattern rifle: slim barrel, wooden
-  /// handguard and stock, front sight post, curved magazine — firing the
-  /// round out of a grenade-launcher cup at the muzzle. Held like a real
-  /// rifle: firing hand at the pistol grip, support hand clamping the
-  /// handguard.
+  /// Starter variant: a sawn-off shorty — barrel cut back to almost
+  /// nothing, drum-fed, hands stacked tighter still.
+  static const WeaponView _tennisShorty = WeaponView(
+    id: 'tennis',
+    variant: 1,
+    receiverX0: -3, receiverX1: 6, receiverH: 18,
+    barrelX0: 6, barrelX1: 15, bore: 17.6, muzzleX: 24,
+    drumR: 5.2,
+    gripX: -2.5, gripY: 13,
+    supportForeX: -2.5, supportForeY: 18.5,
+    supportStyle: GripStyle.cup,
+    holdDist: 19,
+    kick: 3.5, climb: 0.22, recoilDur: 0.20,
+    flashR: 12, flashDur: 0.10, sway: 0.8,
+  );
+
+  /// **Grenade — AK-pattern rifle.** Slim barrel, wooden handguard and
+  /// stock, front sight post and a raked box magazine, firing the round out
+  /// of a launcher cup at the muzzle. Held like a real rifle: firing hand at
+  /// the pistol grip, support hand clamping the handguard well forward.
   static const WeaponView _grenade = WeaponView(
     id: 'grenade',
     receiverX0: -12, receiverX1: 8, receiverH: 20.5,
     barrelX0: 8, barrelX1: 26, bore: 20.3, muzzleX: 34,
     barrelT: 9,
     stockLen: 11,
-    drumR: 6.5,
+    magLen: 13, magTilt: 0.42,
     sightX: 28,
     woodFurniture: true,
     gripX: -8, gripY: 14,
-    supportForeX: 13, supportForeY: 0,
+    supportForeX: 11, supportForeY: 0,
     supportStyle: GripStyle.foregrip,
-    holdDist: 14,
+    holdDist: 25,
     kick: 5.5, climb: 0.30, recoilDur: 0.30,
     flashR: 16, flashDur: 0.16, sway: 1.1,
   );
 
   /// Grenade variant: the old drum-fed lobber — a fat tube with a pump
-  /// slide, held under the barrel.
+  /// slide worked under the barrel.
   static const WeaponView _grenadeLobber = WeaponView(
     id: 'grenade',
     variant: 1,
@@ -259,69 +337,69 @@ class WeaponView {
     drumR: 6.5,
     pumpTravel: 4.5, pumpX0: 12.5, pumpX1: 17.5,
     gripX: -3, gripY: 14,
-    supportForeX: 15, supportForeY: 0,
+    supportForeX: 12, supportForeY: 0,
     supportStyle: GripStyle.foregrip,
-    holdDist: 15,
+    holdDist: 24,
     kick: 5.5, climb: 0.30, recoilDur: 0.30,
     flashR: 16, flashDur: 0.16, sway: 1.1,
   );
 
-  /// Tennis variant: a sawn-off carbine — short barrel, big bell, no
-  /// stock, cupped two-hand hold.
-  static const WeaponView _tennisShorty = WeaponView(
-    id: 'tennis',
-    variant: 1,
-    receiverX0: -3, receiverX1: 6, receiverH: 18,
-    barrelX0: 6, barrelX1: 15, bore: 17.6, muzzleX: 24,
-    gripX: -2.5, gripY: 13,
-    supportForeX: -2, supportForeY: 18.5,
-    supportStyle: GripStyle.cup,
-    holdDist: 13,
-    kick: 3.5, climb: 0.22, recoilDur: 0.20,
-    flashR: 12, flashDur: 0.10, sway: 0.8,
-  );
-
+  /// **Bomb — shoulder cannon.** A vented heat shroud over the barrel and a
+  /// stubby optic on the receiver. Too heavy for a foregrip: the off hand
+  /// goes *under* the receiver and hefts, elbow tucked in and bent the
+  /// opposite way from every other model.
   static const WeaponView _bomb = WeaponView(
     id: 'bomb',
     receiverX0: -10, receiverX1: 3, receiverH: 24,
     barrelX0: 3, barrelX1: 24, bore: 23.8, muzzleX: 36,
     stockLen: 9.5,
     drumR: 8,
+    shroudVents: 4,
+    scopeX: -3, scopeLen: 11,
     gripX: -6, gripY: 15.5,
-    supportForeX: 1, supportForeY: 17.5,
+    supportForeX: 0, supportForeY: 18.0,
     supportStyle: GripStyle.heft,
     supportBend: -1,
-    holdDist: 14,
+    holdDist: 23,
     kick: 8, climb: 0.38, recoilDur: 0.38,
     flashR: 19, flashDur: 0.20, sway: 1.3,
   );
 
+  /// **Cluster — revolver spreader.** A fat cylinder between breech and
+  /// barrel and splayed brake prongs at the mouth. Carried from a handle on
+  /// TOP, so the support arm comes over the weapon instead of under it.
   static const WeaponView _cluster = WeaponView(
     id: 'cluster',
     receiverX0: -4, receiverX1: 6, receiverH: 19.5,
     barrelX0: 6, barrelX1: 19, bore: 19.4, muzzleX: 28,
     stockLen: 4,
-    drumR: 6,
+    cylinderR: 7.4,
     prongLen: 4.5,
-    handleX: 11,
+    handleX: 10,
     gripX: -2.5, gripY: 13.5,
-    supportForeX: 11, supportForeY: 0,
+    supportForeX: 10, supportForeY: 0,
     supportStyle: GripStyle.topHandle,
-    holdDist: 14.5,
+    holdDist: 24,
     kick: 5, climb: 0.26, recoilDur: 0.28,
     flashR: 15, flashDur: 0.14, sway: 1.0,
   );
 
+  /// **Anchor — harpoon mortar.** The biggest bore in the game, a folding
+  /// bipod under the barrel and a winch crank behind the breech that the
+  /// off hand cranks between shots. Nothing else is held like it.
   static const WeaponView _anchor = WeaponView(
     id: 'anchor',
-    receiverX0: -10, receiverX1: 8, receiverH: 28.5,
+    receiverX0: -12, receiverX1: 8, receiverH: 28.5,
     barrelX0: 8, barrelX1: 30, bore: 28.2, muzzleX: 44,
     stockLen: 10,
     prongLen: 5,
+    bipodX: 24,
+    crankR: 6.6, crankX: -13,
     gripX: -5, gripY: 18.5,
-    supportForeX: 19, supportForeY: 0,
-    supportStyle: GripStyle.foregrip,
-    holdDist: 15.5,
+    supportForeX: -13, supportForeY: 16.0,
+    supportStyle: GripStyle.crank,
+    supportBend: -1,
+    holdDist: 26,
     kick: 9.5, climb: 0.45, recoilDur: 0.45,
     flashR: 23, flashDur: 0.22, sway: 1.4,
   );
@@ -334,6 +412,20 @@ class WeaponView {
     'cluster': _cluster,
     'anchor': _anchor,
   };
+
+  /// Which caliber owns each hold. Every [GripStyle] appears exactly once,
+  /// which is the property that keeps the poses as distinguishable as the
+  /// silhouettes; a test pins it so a future model cannot quietly duplicate
+  /// another weapon's hold.
+  static const Map<GripStyle, String> _gripStyleUsage = {
+    GripStyle.cup: 'tennis',
+    GripStyle.foregrip: 'grenade',
+    GripStyle.heft: 'bomb',
+    GripStyle.topHandle: 'cluster',
+    GripStyle.crank: 'anchor',
+  };
+
+  static Map<GripStyle, String> get gripStyleUsage => _gripStyleUsage;
 
   /// The visual variants each caliber can show up with: crew members are
   /// assigned one deterministically from their bob phase, so a deck carries
@@ -375,8 +467,8 @@ class WeaponView {
 /// Analytic two-bone IK: given a shoulder and a hand target, returns the
 /// elbow position that reaches it, bending to the side [bend] picks. This is
 /// what makes every grip target — pistol cup, barrel foregrip, stacked rear
-/// heft — read as an actual held weapon rather than arms glued to a
-/// rectangle.
+/// heft, winch crank — read as an actual held weapon rather than arms glued
+/// to a rectangle.
 ///
 /// The rig is a chunky cartoon: bones stretch proportionally (up to
 /// [softStretch]) when a grip sits beyond nominal span, exactly like the

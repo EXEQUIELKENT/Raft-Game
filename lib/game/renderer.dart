@@ -5,8 +5,11 @@ import 'package:flutter/material.dart';
 
 import '../theme.dart';
 import 'battle.dart';
+import 'character_art.dart';
+import 'characters.dart';
 import 'maps.dart';
 import 'models.dart';
+import 'raft.dart';
 import 'weapon_views.dart';
 
 /// ---------------------------------------------------------------------------
@@ -365,6 +368,13 @@ class WorldRenderer {
       if (raft.loadout.hull.hasMast) _mast(canvas, raft);
       _hull(canvas, raft);
       _platforms(canvas, raft);
+      // Everything a working raft accumulates: fenders over the side, a
+      // lantern, a flag, coiled rope, stowed oars. Drawn after the deck so
+      // it sits on top of the planks, and before the crew so nobody is
+      // hidden behind a barrel. All of it is placed from the raft's own
+      // seat index and hull width, so it is stable frame to frame and
+      // identical on both devices of a networked match.
+      _rigging(canvas, raft, time);
 
       for (int i = 0; i < raft.crew.length; i++) {
         final c = raft.crew[i];
@@ -380,12 +390,12 @@ class WorldRenderer {
           // height goes into the translate here; omitting it (as before)
           // left every ragdoll rendering near world-y 0 — up near the sky —
           // instead of down on the raft where the physics actually put it.
-          canvas.translate(raft.loadout.crewOffset(i), raft.deckY);
+          canvas.translate(raft.stationX(i), raft.deckY);
         } else {
           // The standing body's own displacement from its station — a crew
           // member walking back after a knock-down is drawn wherever the
           // shuffle actually is.
-          canvas.translate(raft.loadout.crewOffset(i) + c.offset.dx, c.offset.dy);
+          canvas.translate(raft.stationX(i) + c.offset.dx, c.offset.dy);
         }
         // Defeated crew go through the death sequence: they never fade
         // while still airborne on the deck — the sink only starts once the
@@ -426,6 +436,12 @@ class WorldRenderer {
           // gone again once its animation finishes.
           _crewHealthBar(canvas, raft, c, pose);
         }
+        // A boss status stays visible for as long as it is costing the
+        // player something. Unlike the health bar it does NOT time out —
+        // an effect you cannot see is an effect that reads as the game
+        // misbehaving when your shot lands short.
+        if (c.alive && c.afflicted) _statusMark(canvas, raft, c, pose, time);
+        if (c.alive && c.talking) _speechBubble(canvas, raft, c, pose);
         canvas.restore();
       }
 
@@ -494,6 +510,135 @@ class WorldRenderer {
   /// quick fade-in, a red ghost bar drains from the HP the character *had*
   /// down to the live value, and the whole thing fades out once the drain
   /// completes.
+  /// A crew member's speech bubble.
+  ///
+  /// Deliberately small and quiet. Four rafts of two or three crew each can
+  /// all be talking at once, and the one thing a bubble must never do is get
+  /// between the player and the shot they are lining up — so it is 9pt, it
+  /// is translucent, it sits well above the head where the trajectory arc
+  /// does not run, and it never grows past a couple of words (the lines in
+  /// [Crew] are all short by construction). It also fades over its last
+  /// third rather than vanishing, which stops a deck of bubbles from
+  /// flickering.
+  void _speechBubble(Canvas canvas, Raft raft, Crew c, RagdollPose? pose) {
+    final text = c.bubble;
+    if (text == null) return;
+    // Fade in over the first 12%, out over the last 30%.
+    final fadeIn = ((1.6 - c.bubbleT) / 0.19).clamp(0.0, 1.0);
+    final fadeOut = (c.bubbleT / 0.5).clamp(0.0, 1.0);
+    final alpha = (fadeIn * fadeOut).clamp(0.0, 1.0);
+    if (alpha <= 0.02) return;
+
+    final cx = pose != null ? pose.head.pos.dx : 0.0;
+    final headTop =
+        pose != null ? pose.head.pos.dy : raft.deckY - BattleConst.bodyHeight;
+    // Above the status badge when both are showing, so they never overlap.
+    final y = headTop - (c.afflicted ? 44 : 28);
+
+    final tp = TextPainter(
+      text: TextSpan(
+        text: text,
+        style: RT.body(
+          size: 9,
+          color: RT.ink.withOpacity(alpha),
+          weight: FontWeight.w800,
+          letterSpacing: 0.2,
+        ),
+      ),
+      textDirection: TextDirection.ltr,
+    )..layout(maxWidth: 96);
+
+    final w = tp.width + 12;
+    final h = tp.height + 7;
+    final rect = Rect.fromCenter(center: Offset(cx, y), width: w, height: h);
+    canvas.drawRRect(
+      RRect.fromRectAndRadius(rect, const Radius.circular(7)),
+      Paint()..color = Colors.white.withOpacity(alpha * 0.88),
+    );
+    canvas.drawRRect(
+      RRect.fromRectAndRadius(rect, const Radius.circular(7)),
+      Paint()
+        ..color = RT.ink.withOpacity(alpha * 0.5)
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 1.6,
+    );
+    // Tail pointing down at the speaker.
+    canvas.drawPath(
+      Path()
+        ..moveTo(cx - 3.5, rect.bottom - 1)
+        ..lineTo(cx, rect.bottom + 5)
+        ..lineTo(cx + 3.5, rect.bottom - 1)
+        ..close(),
+      Paint()..color = Colors.white.withOpacity(alpha * 0.88),
+    );
+    tp.paint(canvas, Offset(cx - tp.width / 2, y - tp.height / 2));
+  }
+
+  /// The badge over an afflicted crew member, plus the fresh-hit flash.
+  ///
+  /// Sits above the head rather than on the body so it survives a tumble,
+  /// and pulses gently so it reads as an ongoing condition rather than a
+  /// one-off hit marker.
+  void _statusMark(
+      Canvas canvas, Raft raft, Crew c, RagdollPose? pose, double time) {
+    final st = c.status;
+    if (st == null) return;
+    final cx = pose != null ? pose.head.pos.dx : 0.0;
+    final topY = (pose != null
+            ? pose.head.pos.dy
+            : raft.deckY - BattleConst.bodyHeight) -
+        26;
+    final pulse = 0.72 + 0.28 * sin(time * 5.2 + c.bobPhase);
+    final tint = st.tint;
+
+    // A short white burst on the frame it lands, so the moment is unmissable.
+    if (c.statusFlash > 0) {
+      canvas.drawCircle(
+        Offset(cx, topY + 18),
+        30 * (1 - c.statusFlash / 0.6) + 8,
+        Paint()..color = tint.withOpacity(c.statusFlash * 0.5),
+      );
+    }
+
+    canvas.drawCircle(
+        Offset(cx, topY), 8.5, Paint()..color = tint.withOpacity(pulse));
+    canvas.drawCircle(
+      Offset(cx, topY),
+      8.5,
+      Paint()
+        ..color = RT.ink.withOpacity(0.7)
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 2,
+    );
+
+    // A tiny glyph per effect — no text at this scale, it would be unreadable.
+    final glyph = Paint()
+      ..color = RT.ink
+      ..strokeWidth = 1.8
+      ..strokeCap = StrokeCap.round;
+    final o = Offset(cx, topY);
+    switch (st) {
+      case StatusEffect.chilled:
+        for (int i = 0; i < 3; i++) {
+          final a = i * pi / 3;
+          canvas.drawLine(o + Offset(cos(a), sin(a)) * 4.5,
+              o - Offset(cos(a), sin(a)) * 4.5, glyph);
+        }
+        break;
+      case StatusEffect.tarred:
+        canvas.drawCircle(o + const Offset(0, 1), 3.4, Paint()..color = RT.ink);
+        break;
+      case StatusEffect.dazed:
+        canvas.drawArc(Rect.fromCircle(center: o, radius: 4.2), 0.6, pi * 1.4,
+            false, glyph..style = PaintingStyle.stroke);
+        break;
+      case StatusEffect.snared:
+        canvas.drawLine(o + const Offset(-4, -4), o + const Offset(4, 4), glyph);
+        canvas.drawLine(o + const Offset(4, -4), o + const Offset(-4, 4), glyph);
+        break;
+    }
+  }
+
   void _crewHealthBar(Canvas canvas, Raft raft, Crew c, RagdollPose? pose) {
     final double cx;
     final double topY;
@@ -573,7 +718,7 @@ class WorldRenderer {
   void _hull(Canvas canvas, Raft raft) {
     final lo = raft.loadout;
     final w = lo.width;
-    final h = w * lo.hull.thickness;
+    final h = lo.hullHeight;
     final top = BattleConst.waterY - h * 0.55;
     final rect = Rect.fromLTWH(-w / 2, top, w, h);
     final radius = Radius.circular(h * lo.hull.rounding.clamp(0.0, 1.0) * 0.5 + 3);
@@ -597,15 +742,428 @@ class WorldRenderer {
         Paint()..color = Colors.black.withOpacity(0.12),
       );
     }
+
+    // Per-hull waterline detail. The deck above already differs; this is what
+    // stops the five hulls sharing one bathtub outline down at the water.
+    final trim = Color.lerp(lo.color, const Color(0xFF5A3D24), 0.5)!;
+    switch (lo.hull.id) {
+      case 'tube':
+        // Inflatable ring: valve stub and a bright highlight along the top.
+        canvas.drawRRect(
+          RRect.fromRectAndRadius(
+            Rect.fromLTWH(-w * 0.30, top + h * 0.18, w * 0.60, h * 0.16),
+            Radius.circular(h * 0.1),
+          ),
+          Paint()..color = Colors.white.withOpacity(0.22),
+        );
+        canvas.drawRRect(
+          RRect.fromRectAndRadius(
+            Rect.fromLTWH(w * 0.36, top + h * 0.30, 9, h * 0.34),
+            const Radius.circular(3),
+          ),
+          Paint()..color = trim,
+        );
+        break;
+
+      case 'log':
+        // Cut log ends along the hull, and the rope binding them together.
+        final r = h * 0.44;
+        final n = (w / (r * 2.2)).floor().clamp(3, 8);
+        for (int k = 0; k < n; k++) {
+          final c = Offset(-w / 2 + w * (k + 0.5) / n, top + h * 0.52);
+          canvas.drawCircle(c, r, Paint()..color = trim);
+          canvas.drawCircle(c, r * 0.42,
+              Paint()..color = Color.lerp(trim, Colors.black, 0.3)!);
+        }
+        canvas.drawLine(
+          Offset(-w / 2 + 4, top + h * 0.2),
+          Offset(w / 2 - 4, top + h * 0.2),
+          Paint()
+            ..color = const Color(0xFFCBB68B)
+            ..strokeWidth = 2.4,
+        );
+        break;
+
+      case 'barrel':
+        // Barrel float bellies hanging below the plank deck.
+        final br = h * 0.5;
+        final n = (w / (br * 2.4)).floor().clamp(2, 6);
+        for (int k = 0; k < n; k++) {
+          final c = Offset(-w / 2 + w * (k + 0.5) / n, top + h * 0.62);
+          canvas.drawOval(
+            Rect.fromCenter(center: c, width: br * 2.1, height: br * 1.7),
+            Paint()..color = trim,
+          );
+          canvas.drawLine(
+            Offset(c.dx - br * 0.9, c.dy),
+            Offset(c.dx + br * 0.9, c.dy),
+            Paint()
+              ..color = Colors.black.withOpacity(0.22)
+              ..strokeWidth = 1.6,
+          );
+        }
+        break;
+
+      case 'sloop':
+      case 'galleon':
+        // A real hull: a rubbing strake down the side, and a raked stem at
+        // the bow so it reads as a ship with a front.
+        canvas.drawRRect(
+          RRect.fromRectAndRadius(
+            Rect.fromLTWH(-w / 2 + 3, top + h * 0.44, w - 6, 3.6),
+            const Radius.circular(1.8),
+          ),
+          Paint()..color = trim,
+        );
+        final bow = raft.facing >= 0 ? 1.0 : -1.0;
+        canvas.drawPath(
+          Path()
+            ..moveTo(bow * (w / 2 - 2), top + h * 0.06)
+            ..lineTo(bow * (w / 2 + h * 0.16), top + h * 0.36)
+            ..lineTo(bow * (w / 2 - 2), top + h * 0.62)
+            ..close(),
+          Paint()..color = trim,
+        );
+        if (lo.hull.id == 'galleon') {
+          // Gun ports along the side of the biggest hull.
+          final ports = (w / 46).floor().clamp(2, 5);
+          final portH = min(h * 0.16, 9.0);
+          for (int k = 0; k < ports; k++) {
+            canvas.drawRRect(
+              RRect.fromRectAndRadius(
+                Rect.fromLTWH(-w / 2 + 16 + (w - 32) * k / (ports - 1) - portH / 2,
+                    top + h * 0.16, portH, portH),
+                const Radius.circular(1.5),
+              ),
+              Paint()..color = Colors.black.withOpacity(0.26),
+            );
+          }
+        }
+        break;
+    }
   }
 
+
+  /// The clutter that makes a raft look lived on.
+  ///
+  /// A hull, a deck and some platforms read as a *diagram* of a raft. What
+  /// sells it as somebody's boat is the stuff hanging off it: fenders bumping
+  /// the waterline, a lantern swinging on the stern post, a flag, a coil of
+  /// rope, oars stowed along the rail, patches where it has been repaired.
+  ///
+  /// Every piece is per-hull, so the five hulls no longer differ only in
+  /// outline: a pool tube gets a valve and a grab rope, a log raft gets
+  /// lashings and a paddle, a barrel float gets bungs and a bailing bucket, a
+  /// sloop gets rigging and a lantern, a galleon gets all of it plus a
+  /// stern lamp and a name board.
+  ///
+  /// Placement is derived from the hull width and the raft's seat index —
+  /// never from a random source — so decoration is stable across frames and
+  /// byte-identical on both devices of a networked match.
+  void _rigging(Canvas canvas, Raft raft, double time) {
+    final lo = raft.loadout;
+    final w = lo.width;
+    final deckTop = BattleConst.waterY - lo.deckRise;
+    final hullTop = deckTop;
+    final hullH = lo.hullHeight;
+    final dir = raft.facing.toDouble();
+    final timber = Color.lerp(lo.color, const Color(0xFF5A3D24), 0.5)!;
+    final rope = const Color(0xFFCBB68B);
+    final dark = Color.lerp(lo.color, Colors.black, 0.35)!;
+    // A gentle sway shared by everything that hangs, so the lantern and the
+    // flag move together with the raft's own bob rather than independently.
+    final sway = sin(time * 1.3 + raft.playerIndex * 1.7) * 0.09;
+
+    void ropeCoil(double x, double y, double r) {
+      for (int i = 0; i < 3; i++) {
+        canvas.drawCircle(
+          Offset(x, y - i * 1.6),
+          r - i * 0.8,
+          Paint()
+            ..color = rope
+            ..style = PaintingStyle.stroke
+            ..strokeWidth = 1.8,
+        );
+      }
+    }
+
+    /// A lantern hanging from [x], swinging with the raft.
+    void lantern(double x, double y) {
+      final hang = 11.0;
+      final tip = Offset(x + sin(sway * 3) * hang * 0.5, y + hang);
+      canvas.drawLine(
+        Offset(x, y),
+        tip,
+        Paint()
+          ..color = timber
+          ..strokeWidth = 1.6,
+      );
+      // Warm pool of light first, so the body of the lamp sits inside it.
+      canvas.drawCircle(
+        tip + const Offset(0, 4),
+        9,
+        Paint()..color = const Color(0xFFFFD98A).withOpacity(0.35),
+      );
+      canvas.drawRRect(
+        RRect.fromRectAndRadius(
+          Rect.fromCenter(center: tip + const Offset(0, 4), width: 7, height: 9),
+          const Radius.circular(2),
+        ),
+        Paint()..color = const Color(0xFFFFD98A),
+      );
+      canvas.drawRRect(
+        RRect.fromRectAndRadius(
+          Rect.fromCenter(center: tip + const Offset(0, 4), width: 7, height: 9),
+          const Radius.circular(2),
+        ),
+        Paint()
+          ..color = timber
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = 1.4,
+      );
+    }
+
+    /// A pennant on a short staff at the stern.
+    void flag(double x, double y, Color cloth) {
+      final h = 22.0;
+      canvas.drawLine(
+        Offset(x, y),
+        Offset(x, y - h),
+        Paint()
+          ..color = timber
+          ..strokeWidth = 2.2
+          ..strokeCap = StrokeCap.round,
+      );
+      // The pennant ripples: two waves along its length, phase-shifted by
+      // the raft's own sway so neighbouring rafts never flap in lockstep.
+      final p = Path()..moveTo(x, y - h);
+      const seg = 4;
+      for (int i = 1; i <= seg; i++) {
+        final t = i / seg;
+        p.lineTo(
+          x - dir * 20 * t,
+          y - h + sin(time * 5 + t * 3 + raft.playerIndex) * 2.2 * t + 1,
+        );
+      }
+      for (int i = seg; i >= 0; i--) {
+        final t = i / seg;
+        p.lineTo(
+          x - dir * 20 * t,
+          y - h + 8 + sin(time * 5 + t * 3 + raft.playerIndex) * 2.2 * t,
+        );
+      }
+      p.close();
+      canvas.drawPath(p, Paint()..color = cloth);
+    }
+
+    /// A fender — a bumper slung over the side at the waterline.
+    void fender(double x) {
+      final y = hullTop + hullH * 0.42;
+      canvas.drawLine(
+        Offset(x, hullTop + 1),
+        Offset(x, y - 4),
+        Paint()
+          ..color = rope
+          ..strokeWidth = 1.4,
+      );
+      canvas.drawOval(
+        Rect.fromCenter(center: Offset(x, y + 1), width: 8, height: 12),
+        Paint()..color = dark,
+      );
+      canvas.drawOval(
+        Rect.fromCenter(center: Offset(x, y - 1), width: 5, height: 4),
+        Paint()..color = Colors.white.withOpacity(0.18),
+      );
+    }
+
+    /// An oar or paddle stowed flat along the deck.
+    void oar(double x0, double x1, double y) {
+      canvas.drawLine(
+        Offset(x0, y),
+        Offset(x1, y),
+        Paint()
+          ..color = timber
+          ..strokeWidth = 3
+          ..strokeCap = StrokeCap.round,
+      );
+      canvas.drawOval(
+        Rect.fromCenter(center: Offset(x1, y), width: 11, height: 6),
+        Paint()..color = timber,
+      );
+    }
+
+    switch (lo.hull.id) {
+      case 'tube':
+        // An inflatable: a valve, a grab rope looped around the ring, and a
+        // patch where somebody has already fixed a puncture.
+        final valve = Offset(-dir * (w / 2 - 10), hullTop + hullH * 0.3);
+        canvas.drawRRect(
+          RRect.fromRectAndRadius(
+            Rect.fromCenter(center: valve, width: 7, height: 5),
+            const Radius.circular(2),
+          ),
+          Paint()..color = dark,
+        );
+        // Grab rope: short loops along the outer face.
+        final loops = (w / 34).floor().clamp(3, 7);
+        for (int i = 0; i < loops; i++) {
+          final x = -w / 2 + 14 + (w - 28) * i / (loops - 1);
+          canvas.drawArc(
+            Rect.fromCenter(
+                center: Offset(x, hullTop + hullH * 0.2), width: 12, height: 12),
+            0.15,
+            pi * 0.7,
+            false,
+            Paint()
+              ..color = rope
+              ..style = PaintingStyle.stroke
+              ..strokeWidth = 1.8,
+          );
+        }
+        canvas.drawCircle(
+          Offset(dir * (w * 0.18), hullTop + hullH * 0.5),
+          5,
+          Paint()..color = Colors.white.withOpacity(0.22),
+        );
+        ropeCoil(-dir * (w / 2 - 22), deckTop - 3, 5);
+        break;
+
+      case 'log':
+        // Lashed timber: cross-lashings over the log ends, a paddle stowed
+        // flat, and a coil of spare line.
+        final lash = Paint()
+          ..color = rope
+          ..strokeWidth = 2.0
+          ..strokeCap = StrokeCap.round;
+        for (final s in [-1.0, 1.0]) {
+          final x = s * (w / 2 - 12);
+          canvas.drawLine(Offset(x - 6, hullTop + 2),
+              Offset(x + 6, hullTop + hullH * 0.7), lash);
+          canvas.drawLine(Offset(x + 6, hullTop + 2),
+              Offset(x - 6, hullTop + hullH * 0.7), lash);
+        }
+        oar(-dir * (w * 0.34), -dir * (w * 0.06), deckTop - 2);
+        ropeCoil(dir * (w * 0.3), deckTop - 3, 5);
+        flag(-dir * (w / 2 - 14), deckTop - 2, lo.color);
+        break;
+
+      case 'barrel':
+        // Sealed barrels: bungs on the ends, a bailing bucket, fenders.
+        for (final s in [-1.0, 1.0]) {
+          canvas.drawCircle(
+            Offset(s * (w / 2 - 9), hullTop + hullH * 0.34),
+            3.2,
+            Paint()..color = dark,
+          );
+        }
+        fender(dir * (w / 2 - 6));
+        fender(-dir * (w / 2 - 6));
+        // Bucket.
+        final bx = dir * (w * 0.28);
+        canvas.drawPath(
+          Path()
+            ..moveTo(bx - 6, deckTop - 11)
+            ..lineTo(bx + 6, deckTop - 11)
+            ..lineTo(bx + 4.5, deckTop - 1)
+            ..lineTo(bx - 4.5, deckTop - 1)
+            ..close(),
+          Paint()..color = timber,
+        );
+        canvas.drawArc(
+          Rect.fromCenter(
+              center: Offset(bx, deckTop - 11), width: 12, height: 9),
+          pi,
+          pi,
+          false,
+          Paint()
+            ..color = rope
+            ..style = PaintingStyle.stroke
+            ..strokeWidth = 1.5,
+        );
+        ropeCoil(-dir * (w * 0.32), deckTop - 3, 5.5);
+        break;
+
+      case 'sloop':
+        // A proper little boat: shrouds up to the mast, a lantern on the
+        // stern post, fenders, and a coil by the bow cleat.
+        final mastX = -dir * 26;
+        final shroud = Paint()
+          ..color = rope
+          ..strokeWidth = 1.4;
+        for (final s in [-1.0, 1.0]) {
+          canvas.drawLine(
+            Offset(mastX, BattleConst.waterY - lo.hullHeight * 0.5 - 96),
+            Offset(mastX + s * (w * 0.26), deckTop - 1),
+            shroud,
+          );
+        }
+        lantern(-dir * (w / 2 - 12), deckTop - 20);
+        fender(dir * (w / 2 - 7));
+        ropeCoil(dir * (w * 0.3), deckTop - 3, 5);
+        break;
+
+      case 'galleon':
+        // The full kit: shrouds, a stern lantern, a name board, gun-port
+        // rigging, fenders down both sides and a flag at the taffrail.
+        final mastX = -dir * 26;
+        final shroud = Paint()
+          ..color = rope
+          ..strokeWidth = 1.4;
+        for (int i = -2; i <= 2; i++) {
+          if (i == 0) continue;
+          canvas.drawLine(
+            Offset(mastX, BattleConst.waterY - lo.hullHeight * 0.5 - 100),
+            Offset(mastX + i * (w * 0.13), deckTop - 1),
+            shroud,
+          );
+        }
+        lantern(-dir * (w / 2 - 10), deckTop - 26);
+        flag(-dir * (w / 2 - 20), deckTop - 4, lo.color);
+        fender(dir * (w / 2 - 8));
+        fender(dir * (w / 2 - 22));
+        fender(-dir * (w / 2 - 8));
+        // Name board along the stern quarter.
+        canvas.drawRRect(
+          RRect.fromRectAndRadius(
+            Rect.fromCenter(
+              center: Offset(-dir * (w * 0.26), hullTop + hullH * 0.3),
+              width: w * 0.22,
+              height: 7,
+            ),
+            const Radius.circular(2),
+          ),
+          Paint()..color = timber,
+        );
+        ropeCoil(dir * (w * 0.34), deckTop - 3, 6);
+        break;
+    }
+
+    // Repair patches: every raft has taken a beating at some point. Placed
+    // off the seat index so each raft in a fleet is patched differently, and
+    // deliberately subtle — this is texture, not damage state.
+    final patches = 1 + raft.playerIndex % 2;
+    for (int i = 0; i < patches; i++) {
+      final x = -w / 2 + w * (0.25 + 0.4 * i + raft.playerIndex * 0.07) % (w - 20);
+      canvas.drawRRect(
+        RRect.fromRectAndRadius(
+          Rect.fromCenter(
+            center: Offset(x - w / 2 + 10, hullTop + hullH * (0.5 + 0.12 * i)),
+            width: 12,
+            height: 8,
+          ),
+          const Radius.circular(2),
+        ),
+        Paint()..color = Colors.black.withOpacity(0.1),
+      );
+    }
+  }
   /// The deck's raised platforms, drawn from the same [DeckProfile] the
   /// physics collides against — blocks render as solid slabs with a lit top
   /// and a shaded front wall, ramps as wedges. Coordinates are hull-local,
   /// rises measured up from the main deck plane (y-down, so negative).
   void _platforms(Canvas canvas, Raft raft) {
     final lo = raft.loadout;
-    final deckTop = BattleConst.waterY - lo.width * lo.hull.thickness * 0.55;
+    final deckTop = BattleConst.waterY - lo.deckRise;
     final w = lo.width;
 
     for (final s in raft.profile.segments) {
@@ -660,6 +1218,25 @@ class WorldRenderer {
           Rect.fromLTWH(left, deckTop - 3, span, 5),
           Paint()..color = Colors.black.withOpacity(0.16),
         );
+      } else {
+        // Ramp treads, so a slope reads as something you can walk up rather
+        // than a plain wedge.
+        final tread = Paint()
+          ..color = Colors.black.withOpacity(0.13)
+          ..strokeWidth = 1.4;
+        final steps = ((right - left) / 7).floor().clamp(1, 6);
+        for (int k = 1; k < steps; k++) {
+          final f = k / steps;
+          final x = left + (right - left) * f;
+          final y = topL + (topR - topL) * f;
+          canvas.drawLine(Offset(x, y), Offset(x, y + 4), tread);
+        }
+      }
+
+      // Per-tier furniture: what actually tells the five hulls apart at a
+      // glance, on top of the shared plank language above.
+      if (!isRamp && s.rise0 > 0.5) {
+        _deckFurniture(canvas, s, lo, deckTop, topL);
       }
       // Keep the planks' horizontal seam language but bound it to the hull.
       assert(right <= w / 2 + 0.01 && left >= -w / 2 - 0.01);
@@ -670,11 +1247,16 @@ class WorldRenderer {
     final lip = Color.lerp(lo.color, const Color(0xFF23262B), 0.5)!;
     for (final side in [-1.0, 1.0]) {
       final x = side * raft.deckHalf;
+      // Stand the post on whatever surface reaches that rail. Drawing it at
+      // the main deck plane on a hull whose stern castle runs out to the edge
+      // buried the post in the platform, so the boundary a body actually
+      // bounces off was invisible exactly where it mattered most.
+      final surface = deckTop - raft.profile.riseAt(x);
       canvas.drawRRect(
         RRect.fromRectAndRadius(
           Rect.fromLTWH(
             x - 2.5,
-            deckTop - BattleConst.railWallHeight,
+            surface - BattleConst.railWallHeight,
             5,
             BattleConst.railWallHeight,
           ),
@@ -685,8 +1267,116 @@ class WorldRenderer {
     }
   }
 
+  /// Dresses one raised deck tier according to its [DeckStyle].
+  ///
+  /// The height-field is identical for every style — this is purely what a
+  /// tier is *built out of*, and it is most of what makes a log raft read as
+  /// lashed timber and a galleon as a proper ship rather than the same slab
+  /// in a different colour. Drawn in hull-local coordinates, with [topY] the
+  /// tier's walking surface and [deckTop] the main deck plane below it.
+  void _deckFurniture(
+    Canvas canvas,
+    DeckSegment s,
+    RaftLoadout lo,
+    double deckTop,
+    double topY,
+  ) {
+    final left = s.x0;
+    final right = s.x1;
+    final span = right - left;
+    final wallH = deckTop - topY;
+    final timber = Color.lerp(lo.color, const Color(0xFF5A3D24), 0.45)!;
+    final rope = const Color(0xFFCBB68B);
+
+    switch (s.style) {
+      case DeckStyle.lashed:
+        // Rope bindings wrapping the platform onto the logs beneath.
+        final bind = Paint()
+          ..color = rope
+          ..strokeWidth = 2.2
+          ..strokeCap = StrokeCap.round;
+        final knots = (span / 26).floor().clamp(1, 4);
+        for (int k = 0; k < knots; k++) {
+          final x = left + span * (k + 0.5) / knots;
+          canvas.drawLine(Offset(x - 4, topY + 1), Offset(x + 4, deckTop - 1), bind);
+          canvas.drawLine(Offset(x + 4, topY + 1), Offset(x - 4, deckTop - 1), bind);
+        }
+        break;
+
+      case DeckStyle.barrels:
+        // Barrel ends showing through the front wall of the platform.
+        final r = min(wallH * 0.42, 7.0);
+        if (r > 2) {
+          final n = (span / (r * 2.6)).floor().clamp(1, 5);
+          for (int k = 0; k < n; k++) {
+            final c = Offset(left + span * (k + 0.5) / n, deckTop - r - 1);
+            canvas.drawCircle(c, r, Paint()..color = timber);
+            canvas.drawCircle(c, r * 0.55,
+                Paint()..color = Color.lerp(timber, Colors.black, 0.25)!);
+            canvas.drawCircle(
+              c,
+              r,
+              Paint()
+                ..color = Colors.black.withOpacity(0.18)
+                ..style = PaintingStyle.stroke
+                ..strokeWidth = 1.2,
+            );
+          }
+        }
+        break;
+
+      case DeckStyle.castle:
+        // Railing posts with a top rail along the castle's outer edge — the
+        // detail that makes a raised tier read as somewhere crew stand.
+        final railY = topY - 9;
+        final post = Paint()
+          ..color = timber
+          ..strokeWidth = 2.2
+          ..strokeCap = StrokeCap.round;
+        final posts = (span / 16).floor().clamp(2, 6);
+        for (int k = 0; k <= posts; k++) {
+          final x = left + span * k / posts;
+          canvas.drawLine(Offset(x, topY), Offset(x, railY), post);
+        }
+        canvas.drawRRect(
+          RRect.fromRectAndRadius(
+            Rect.fromLTWH(left, railY - 1.6, span, 3.2),
+            const Radius.circular(1.6),
+          ),
+          Paint()..color = timber,
+        );
+        break;
+
+      case DeckStyle.cargo:
+        // A roped-down crate stack. Cargo tiers carry no crew, so this is
+        // the one piece of deck furniture that is purely scenery.
+        final crateH = min(wallH * 0.9, 14.0);
+        final crates = (span / 18).floor().clamp(1, 3);
+        for (int k = 0; k < crates; k++) {
+          final cw = span / crates - 4;
+          final x = left + 2 + (span / crates) * k;
+          final rect = Rect.fromLTWH(x, topY - crateH, cw, crateH);
+          canvas.drawRRect(
+            RRect.fromRectAndRadius(rect, const Radius.circular(2)),
+            Paint()..color = timber,
+          );
+          canvas.drawLine(
+            Offset(rect.left, rect.center.dy),
+            Offset(rect.right, rect.center.dy),
+            Paint()
+              ..color = rope
+              ..strokeWidth = 1.6,
+          );
+        }
+        break;
+
+      case DeckStyle.planks:
+        break;
+    }
+  }
+
   void _mast(Canvas canvas, Raft raft) {    final lo = raft.loadout;
-    final baseY = BattleConst.waterY - lo.width * lo.hull.thickness * 0.5;
+    final baseY = BattleConst.waterY - lo.hullHeight * 0.5;
     final dir = raft.facing.toDouble();
     canvas.drawRRect(
       RRect.fromRectAndRadius(
@@ -717,7 +1407,7 @@ class WorldRenderer {
   }) {
     final lo = raft.loadout;
     final dir = raft.facing.toDouble();
-    final deck = BattleConst.waterY - lo.width * lo.hull.thickness * 0.55;
+    final deck = BattleConst.waterY - lo.deckRise;
 
     if (crew.pose != null) {
       _ragdollBody(canvas, raft, crew, dir, weapon, time);
@@ -758,7 +1448,11 @@ class WorldRenderer {
           recoil = u * u * (3 - 2 * u); // snap, then decay
         }
         if (dt < wv.flashDur) flashT = (1 - dt / wv.flashDur).clamp(0.0, 1.0);
-        if (wv.pumpTravel > 0 && dt < 0.34) pumpT = sin(pi * dt / 0.34);
+        // Pump slides cycle once; a winch crank spins its wheel through a
+        // full turn on the same beat, so both actions animate off one clock.
+        if ((wv.pumpTravel > 0 || wv.crankR > 0) && dt < 0.34) {
+          pumpT = wv.crankR > 0 ? (dt / 0.34) : sin(pi * dt / 0.34);
+        }
       }
     }
 
@@ -774,15 +1468,30 @@ class WorldRenderer {
     const torsoW = 29.0;
     const headR = 14.0;
 
+    // How the whole body is carrying itself — a wince doubles them over, a
+    // gloat throws an arm up and bounces them off the deck, tar sags the
+    // shoulders. Computed in the simulation ([Crew.bodyExpression]) so the
+    // face and the body can never tell two different stories, and applied
+    // here to the actual skeleton rather than as an afterthought overlay.
+    final bx = crew.bodyExpression(time);
+
     final footY = deck;
     // Recoil crouches the body — scaled by the caliber's kick, so a tennis
     // ball barely moves the stance and an anchor shot drives the heels in.
-    final hipY = footY - legLen + recoil * wv.kick * 0.4;
-    final shoulderY = hipY - torsoH;
-    final headC = Offset(0, shoulderY - headR - 2);
+    // The expression's own crouch rides on top: negative values (a stretch)
+    // lift the hips and put them up on their toes.
+    final hipY = footY -
+        legLen * (1 - bx.crouch * 0.42) +
+        recoil * wv.kick * 0.4 +
+        bx.bounce;
+    final shoulderY = hipY - torsoH * (1 - bx.slump * 0.14);
+    final headC = Offset(
+      bx.tremble * 0.5 + bx.headTilt * 3.2,
+      shoulderY - headR - 2 + bx.slump * 2.4,
+    );
 
     final skin = _skinFor(raft.look);
-    final suit = raft.playerIndex == 0 ? const Color(0xFF2D4F8F) : lo.color;
+    final suit = _outfitFor(raft);
     const boot = Color(0xFF23262B);
     const metal = Color(0xFF3B3F45);
 
@@ -797,7 +1506,10 @@ class WorldRenderer {
     // inside it so they pivot as one.
     final lean = -leanBack * gunSide +
         crew.walkAmp * 0.04 * gunSide -
-        (grabbing ? 0.09 : 0) * gunSide;
+        (grabbing ? 0.09 : 0) * gunSide +
+        // The expression's lean is in body space, so it flips with the
+        // facing exactly like the recoil rock does.
+        bx.lean * gunSide;
     final hipBobWalk = sin(crew.walkPhase * pi * 2 * 2).abs() * 1.2 * crew.walkAmp;
 
     // ---- Legs ----
@@ -833,7 +1545,22 @@ class WorldRenderer {
     // its grip target — foregrip, pump handle or stacked rear heft, chosen
     // per caliber — and the weapon frame hangs off the firing hand.
     final gunShoulder = Offset(gunSide * (torsoW / 2 - 5), shoulderY + 5);
-    final suppShoulder = Offset(-gunSide * (torsoW / 2 - 5), shoulderY + 5);
+    // Torso twist while the weapon is up. A shooter turns into the target, so
+    // the off shoulder comes round toward the gun side; drawn side-on, that
+    // shows as the far shoulder sitting much closer to the near one.
+    //
+    // This is not just flavour. The off shoulder is otherwise a full torso
+    // width *behind* the weapon, and with the arms only [ArmIK.upper] +
+    // [ArmIK.fore] long the support hand could not reach any foregrip: it
+    // choked all the way back down the weapon and landed on top of the firing
+    // fist, so every crew member appeared to hold their gun one-handed with a
+    // blob of hands at the grip. The twist is what puts the off hand out on
+    // the barrel where it belongs.
+    final twist = (aiming || recoil > 0) && lift > 0.2 ? 0.66 : 0.0;
+    final suppShoulder = Offset(
+      -gunSide * (torsoW / 2 - 5) + gunSide * (torsoW - 10) * twist,
+      shoulderY + 5 + twist * 7.0,
+    );
     final sway = sin(time * 1.4 + crew.bobPhase) * 1.6 * wv.sway;
 
     // Weapon frame transform: weapon-local (0,0) is the forward face of the
@@ -847,22 +1574,29 @@ class WorldRenderer {
     if (levelled) {
       final angleRad = aimAngleDeg * pi / 180;
       final aimDir = Offset(gunSide * cos(angleRad), -sin(angleRad));
-      // Near max elevation the pure aim-line offset lands the grip inside
+      // Near max elevation the pure aim-line offset lands the weapon inside
       // the head's own silhouette (both hands + weapon read as jammed into
       // the face) — blend in sideways clearance as the shot steepens so it
       // swings out beside the head instead. See [ArmIK.headClearance].
       final steep = sin(angleRad).clamp(0.0, 1.0);
-      gripBody = gunShoulder +
-          aimDir * wv.holdDist +
-          Offset(gunSide * steep * ArmIK.headClearance, 0);
       // Local +x must point along the aim. Screen y-down: a positive canvas
       // rotation tips the muzzle toward the ground, so right-facing aims
       // rotate by NEGATIVE elevation, and a left-facing raft's aim line is
       // the same ray past vertical (angleRad - pi) — never `pi - angleRad`,
-      // which mirrors the muzzle height. The bell mouth and receiver
-      // underside (the grip hangs at +y) stay below the tube line either
-      // way.
+      // which mirrors the muzzle height.
       bodyAng = gunSide > 0 ? -angleRad : angleRad - pi;
+      // Carry the weapon by its BARREL LINE, not by its grip.
+      //
+      // The grip hangs [WeaponView.gripY] *below* the bore (that is what the
+      // weapon-local frame means), so putting the grip itself on the ray out
+      // of the shoulder lifts the whole receiver a grip's height above the
+      // shoulder — straight across the chin. Anchoring the bore on that ray
+      // and hanging the grip off it underneath puts the gun where a shooter
+      // actually holds one, and leaves the face clear at every elevation.
+      final barrelAnchor = gunShoulder +
+          aimDir * wv.holdDist +
+          Offset(gunSide * steep * ArmIK.headClearance, 0);
+      gripBody = barrelAnchor + _weaponDown(bodyAng, gunSide) * wv.gripY;
     } else {
       // Low ready: grip at the hip, muzzle angled down-and-forward, with a
       // walk-cycle sway. Mid-swap the weapon drops toward the other hip.
@@ -902,21 +1636,36 @@ class WorldRenderer {
     // above it.
     final pumpBack = pumpT * wv.pumpTravel;
     final suppAxis = Offset(cos(drawnAng), sin(drawnAng));
-    final suppT = ArmIK.chokeUp(
-      anchor: drawnOrigin,
-      axis: suppAxis,
-      shoulder: suppShoulder,
-      preferredT: wv.supportForeX - pumpBack - wv.gripX,
-      minT: wv.receiverX0 - wv.gripX,
-      maxT: (wv.muzzleX - wv.gripX) * 0.85,
-    );
-    final suppLocal = Offset(wv.gripX + suppT, wv.supportPalmY);
+    final Offset suppLocal;
+    if (wv.supportStyle == GripStyle.crank) {
+      // A crank hold is anchored to the wheel, not slid along the barrel:
+      // the fist orbits the rim as the action is worked, so choking up
+      // along the weapon axis would pull it off the thing it is turning.
+      suppLocal = wv.supportTarget(pumpT);
+    } else {
+      final suppT = ArmIK.chokeUp(
+        anchor: drawnOrigin,
+        axis: suppAxis,
+        shoulder: suppShoulder,
+        preferredT: wv.supportForeX - pumpBack - wv.gripX,
+        minT: wv.receiverX0 - wv.gripX,
+        maxT: (wv.muzzleX - wv.gripX) * 0.85,
+      );
+      suppLocal = Offset(wv.gripX + suppT, wv.supportPalmY);
+    }
     var suppHand = toBody(suppLocal.dx, suppLocal.dy);
 
     // Torso clutch: the free hand abandons its grip point and presses the
     // wound instead — the lean above already doubles the body over it.
     if (grabbing) {
       suppHand = Offset(-gunSide * 3.5, shoulderY + torsoH * 0.66);
+    } else if (bx.armRaise > 0 && !aiming) {
+      // The free arm goes up: a fist punched overhead for a gloat, a big
+      // overhead reach for a stretch, a hand to the temple for a scratch.
+      // Only while NOT aiming — a raised arm mid-shot would fight the grip
+      // IK for the same limb and read as a broken pose.
+      final up = Offset(-gunSide * 10.0, shoulderY - 28.0 * bx.armRaise);
+      suppHand = Offset.lerp(suppHand, up, bx.armRaise.clamp(0.0, 1.0))!;
     }
 
     // The hands only look right if the arms don't: both elbows break
@@ -940,7 +1689,17 @@ class WorldRenderer {
     canvas.rotate(lean);
     canvas.translate(0, -hipY);
 
-    _taperedLimb(canvas, suppShoulder, suppElbow, 13, 11, suit);
+    // Depth: the support arm is on the far side of the body, so it is drawn
+    // a shade darker than the near arm. Without this both arms read as one
+    // flat tangle in front of the chest — the single biggest reason the old
+    // pose looked wrong when the hands crossed.
+    final farSuit = Color.lerp(suit, Colors.black, 0.22)!;
+    final farSkin = Color.lerp(skin, Colors.black, 0.18)!;
+
+    _taperedLimb(canvas, suppShoulder, suppElbow, 13, 10.5, farSuit);
+    // Deltoid cap: rounds the arm into the shoulder so the bone does not
+    // read as a stick pinned to the torso edge.
+    canvas.drawCircle(suppShoulder, 6.5, Paint()..color = farSuit);
 
     canvas.drawRRect(
       RRect.fromRectAndCorners(
@@ -960,9 +1719,35 @@ class WorldRenderer {
       Paint()..color = Colors.black.withOpacity(0.1),
     );
 
-    // Elbow: a shallow dark crease over the joint so the IK kink reads as
-    // a bent arm, not a sharp fold.
-    void elbows(Offset e) {
+    // Sash and belt. The sash is the character's own trim colour and the
+    // belt is the raft's, which is what keeps sides readable now that the
+    // torso belongs to the character rather than the hull: two rival crews
+    // can wear completely different outfits and still be told apart by the
+    // stripe at their waist.
+    canvas.drawPath(
+      Path()
+        ..moveTo(-gunSide * torsoW / 2, shoulderY + torsoH * 0.12)
+        ..lineTo(gunSide * torsoW / 2, shoulderY + torsoH * 0.52)
+        ..lineTo(gunSide * torsoW / 2, shoulderY + torsoH * 0.72)
+        ..lineTo(-gunSide * torsoW / 2, shoulderY + torsoH * 0.32)
+        ..close(),
+      Paint()..color = _accentFor(raft).withOpacity(0.9),
+    );
+    canvas.drawRRect(
+      RRect.fromRectAndRadius(
+        Rect.fromLTWH(-torsoW / 2, shoulderY + torsoH * 0.78, torsoW, 4),
+        const Radius.circular(2),
+      ),
+      Paint()..color = lo.color,
+    );
+
+    // Elbow joint: a filled cap in the *sleeve* colour sized to the upper
+    // arm's end, then a shallow crease over it. Filling the joint is what
+    // removes the notch that a bare taper leaves at a sharp bend — the
+    // forearm's narrower cap used to under-cover the upper arm's, so a
+    // hard-bent elbow showed a visible bite out of the limb.
+    void elbowJoint(Offset e, Color sleeve) {
+      canvas.drawCircle(e, 5.2, Paint()..color = sleeve);
       canvas.drawCircle(
         e,
         5.4,
@@ -973,11 +1758,15 @@ class WorldRenderer {
       );
     }
 
-    _taperedLimb(canvas, suppElbow, suppHandSolved, 8, 6.5, skin);
-    elbows(suppElbow);
-    _taperedLimb(canvas, gunShoulder, gunElbow, 13, 11, suit);
-    _taperedLimb(canvas, gunElbow, gunHand, 8, 6.5, skin);
-    elbows(gunElbow);
+    // Forearms start at the sleeve width the upper arm ended on, so the
+    // skin/sleeve transition reads as a rolled cuff instead of a step.
+    elbowJoint(suppElbow, farSuit);
+    _taperedLimb(canvas, suppElbow, suppHandSolved, 9.5, 6.8, farSkin);
+
+    _taperedLimb(canvas, gunShoulder, gunElbow, 13, 10.5, suit);
+    canvas.drawCircle(gunShoulder, 6.5, Paint()..color = suit);
+    elbowJoint(gunElbow, suit);
+    _taperedLimb(canvas, gunElbow, gunHand, 9.5, 6.8, skin);
 
     // ---- The equipped firearm + gripping hands ----
     // One transform carries the model AND both fists: the weapon-local
@@ -1095,11 +1884,24 @@ class WorldRenderer {
     _face(canvas, headC2, headR, dir, crew,
         time: time, aiming: aiming, firing: recoil > 0);
 
-    _headgear(canvas, raft.look, headC2, headR, dir);
+    CharacterArt.headgear(canvas, raft.look, headC2, headR, dir);
 
     canvas.restore();
     canvas.restore();
   }
+
+  /// The weapon-local "down" direction (from the bore toward the grip stub)
+  /// expressed in body space, for a weapon drawn at [bodyAng] on [gunSide].
+  ///
+  /// Mirrors exactly what the drawing transform does to a local (0, 1):
+  /// translate to the origin, rotate by the body angle, scale y by the facing.
+  /// Shared by the renderer and [Raft.muzzle] so the drawn gun and the actual
+  /// shot-spawn point can never disagree about which way is down.
+  static Offset weaponDown(double bodyAng, double gunSide) =>
+      Offset(-gunSide * sin(bodyAng), gunSide * cos(bodyAng));
+
+  Offset _weaponDown(double bodyAng, double gunSide) =>
+      weaponDown(bodyAng, gunSide);
 
   /// Fist body + knuckle shading shared by the wraps below: a rounded palm
   /// block with a soft outline so hands read against the weapon, not as
@@ -1249,6 +2051,61 @@ class WorldRenderer {
       canvas.drawCircle(drumC, wv.drumR * 0.55, Paint()..color = accent);
     }
 
+    // Raked box magazine under the receiver — the rifle/carbine feed, and
+    // visually the opposite of the round drum above.
+    if (wv.magLen > 0) {
+      canvas.save();
+      canvas.translate((wv.receiverX0 + wv.receiverX1) / 2 + 1, wv.receiverHalf - 1);
+      canvas.rotate(wv.magTilt);
+      final magW = wv.receiverH * 0.30;
+      canvas.drawRRect(
+        RRect.fromRectAndRadius(
+          Rect.fromLTWH(-magW / 2, 0, magW, wv.magLen),
+          const Radius.circular(2),
+        ),
+        Paint()..color = darkMetal,
+      );
+      canvas.drawRRect(
+        RRect.fromRectAndRadius(
+          Rect.fromLTWH(-magW / 2 + 1.1, wv.magLen * 0.45, magW - 2.2, 2.0),
+          const Radius.circular(1),
+        ),
+        Paint()..color = accent.withOpacity(0.8),
+      );
+      canvas.restore();
+    }
+
+    // Winch crank behind the breech — the harpoon gun's loading action, and
+    // the thing its off hand actually holds ([GripStyle.crank]).
+    if (wv.crankR > 0) {
+      final c = Offset(wv.crankX, wv.supportForeY);
+      canvas.drawCircle(c, wv.crankR, Paint()..color = darkMetal);
+      canvas.drawCircle(c, wv.crankR * 0.52, Paint()..color = metal);
+      canvas.drawCircle(c, wv.crankR * 0.2, Paint()..color = accent);
+      // Spokes, and an arm back up to the receiver so the wheel reads
+      // mounted rather than floating.
+      final spoke = Paint()
+        ..color = metal
+        ..strokeWidth = 1.8
+        ..strokeCap = StrokeCap.round;
+      for (int k = 0; k < 4; k++) {
+        final a = k * pi / 4 + 0.3;
+        canvas.drawLine(
+          c + Offset(cos(a), sin(a)) * wv.crankR * 0.25,
+          c + Offset(cos(a), sin(a)) * wv.crankR * 0.86,
+          spoke,
+        );
+      }
+      canvas.drawLine(
+        c + Offset(0, -wv.crankR * 0.7),
+        Offset(wv.crankX + 2, wv.receiverHalf - 1),
+        Paint()
+          ..color = darkMetal
+          ..strokeWidth = 3.0
+          ..strokeCap = StrokeCap.round,
+      );
+    }
+
     // Shaft barrel: slim, so both fists can actually close around it.
     canvas.drawRRect(
       RRect.fromRectAndRadius(
@@ -1277,6 +2134,60 @@ class WorldRenderer {
         ),
         Paint()..color = wood,
       );
+    }
+
+    // Vented cooling shroud over the shaft — the heavy cannon's signature.
+    // Slots are cut as gaps in a sleeve, so the barrel shows through.
+    if (wv.shroudVents > 0) {
+      final x0 = wv.barrelX0 + 2;
+      final x1 = wv.barrelX1 - 1.5;
+      canvas.drawRRect(
+        RRect.fromRectAndRadius(
+          Rect.fromLTWH(x0, -t / 2 - 1.8, x1 - x0, t + 3.6),
+          const Radius.circular(3),
+        ),
+        Paint()..color = Color.lerp(metal, Colors.white, 0.05)!,
+      );
+      final slotPaint = Paint()..color = darkMetal;
+      final pitch = (x1 - x0) / (wv.shroudVents + 1);
+      for (int k = 1; k <= wv.shroudVents; k++) {
+        canvas.drawRRect(
+          RRect.fromRectAndRadius(
+            Rect.fromLTWH(x0 + pitch * k - 1.4, -t / 2 - 0.4, 2.8, t + 0.8),
+            const Radius.circular(1.4),
+          ),
+          slotPaint,
+        );
+      }
+    }
+
+    // Revolver cylinder between breech and barrel — the spreader's feed.
+    if (wv.cylinderR > 0) {
+      final c = Offset(wv.barrelX0 + 1.5, 0);
+      canvas.drawCircle(c, wv.cylinderR, Paint()..color = darkMetal);
+      canvas.drawCircle(c, wv.cylinderR * 0.78, Paint()..color = metal);
+      // Chambers around the rim, so it reads as a revolver at a glance.
+      for (int k = 0; k < 6; k++) {
+        final a = k * pi / 3 + 0.25;
+        canvas.drawCircle(
+          c + Offset(cos(a), sin(a)) * wv.cylinderR * 0.5,
+          wv.cylinderR * 0.19,
+          Paint()..color = accent.withOpacity(0.9),
+        );
+      }
+    }
+
+    // Folding bipod under the barrel — only the heaviest launcher carries one.
+    if (wv.bipodX > 0) {
+      final legPaint = Paint()
+        ..color = darkMetal
+        ..strokeWidth = 2.2
+        ..strokeCap = StrokeCap.round;
+      final top = Offset(wv.bipodX, t / 2);
+      for (final s in [-1.0, 1.0]) {
+        canvas.drawLine(top, top + Offset(s * 7.0, 13.0), legPaint);
+      }
+      canvas.drawCircle(top, 2.2, Paint()..color = metal);
     }
 
     // Bell mouth: the flare that matches the muzzle to the round's size.
@@ -1395,6 +2306,32 @@ class WorldRenderer {
       );
     }
 
+    // Optical sight riding the receiver — the bomb cannon's signature. Drawn
+    // after the receiver so its mounts sit on top of the housing.
+    if (wv.scopeLen > 0) {
+      final y = -wv.receiverHalf - 3.4;
+      canvas.drawRRect(
+        RRect.fromRectAndRadius(
+          Rect.fromLTWH(wv.scopeX - wv.scopeLen / 2, y - 2.6, wv.scopeLen, 5.2),
+          const Radius.circular(2.6),
+        ),
+        Paint()..color = darkMetal,
+      );
+      // Objective bell at the muzzle end and a glint of glass in it.
+      canvas.drawCircle(Offset(wv.scopeX + wv.scopeLen / 2, y), 3.4,
+          Paint()..color = darkMetal);
+      canvas.drawCircle(Offset(wv.scopeX + wv.scopeLen / 2, y), 2.0,
+          Paint()..color = accent.withOpacity(0.85));
+      // Mounts down to the receiver.
+      final mount = Paint()
+        ..color = darkMetal
+        ..strokeWidth = 2.2;
+      for (final dx in [-wv.scopeLen * 0.3, wv.scopeLen * 0.28]) {
+        canvas.drawLine(Offset(wv.scopeX + dx, y + 2.2),
+            Offset(wv.scopeX + dx, -wv.receiverHalf), mount);
+      }
+    }
+
     // Rifle front sight post (AK-pattern models).
     if (wv.sightX > 0) {
       final paint = Paint()
@@ -1422,7 +2359,7 @@ class WorldRenderer {
   ) {
     final pose = crew.pose!;
     final skin = _skinFor(raft.look);
-    final suit = raft.playerIndex == 0 ? const Color(0xFF2D4F8F) : raft.loadout.color;
+    final suit = _outfitFor(raft);
     const boot = Color(0xFF23262B);
     const metal = Color(0xFF3B3F45);
 
@@ -1563,7 +2500,7 @@ class WorldRenderer {
     // tumble is exactly what's still showing while the body flies.
     _face(canvas, Offset.zero, headR, dir, crew,
         time: time, aiming: false, firing: false);
-    _headgear(canvas, raft.look, Offset.zero, headR, dir);
+    CharacterArt.headgear(canvas, raft.look, Offset.zero, headR, dir);
     canvas.restore();
   }
 
@@ -1969,55 +2906,24 @@ class WorldRenderer {
         ..strokeCap = StrokeCap.round,
     );
   }
+  Color _skinFor(CrewLook look) => Cast.of(look).skin;
 
-  Color _skinFor(CrewLook look) => switch (look) {
-        CrewLook.player => const Color(0xFFEFD79F),
-        CrewLook.raider => const Color(0xFFE8C98C),
-        CrewLook.ducker => const Color(0xFFEFD79F),
-        CrewLook.pirate => const Color(0xFFE0BD7C),
-        CrewLook.captain => const Color(0xFFDCB877),
-      };
+  /// The character's own outfit colour, with the raft's colour kept as trim.
+  ///
+  /// The torso used to be "blue if you, otherwise the raft hull's colour",
+  /// which made every enemy on a red raft the same red person. Letting the
+  /// character own the outfit is what makes a parka-wrapped icebreaker and a
+  /// soot-blackened stoker read as different people at a glance; the raft
+  /// colour moves to the sash and cuffs, where it still says which side a
+  /// body belongs to without flattening the cast.
+  Color _outfitFor(Raft raft) => Cast.of(raft.look).outfit;
 
-  void _headgear(Canvas canvas, CrewLook look, Offset headC, double r, double dir) {
-    switch (look) {
-      case CrewLook.player:
-      case CrewLook.ducker:
-        break;
-      case CrewLook.raider:
-        // Red bandana
-        canvas.drawRRect(
-          RRect.fromRectAndCorners(
-            Rect.fromCenter(center: headC + Offset(0, -r * 0.72), width: r * 2.1, height: r * 0.62),
-            topLeft: Radius.circular(r * 0.6),
-            topRight: Radius.circular(r * 0.6),
-          ),
-          Paint()..color = const Color(0xFFC9483C),
-        );
-        break;
-      case CrewLook.pirate:
-      case CrewLook.captain:
-        // Black tricorn + beard
-        canvas.drawRRect(
-          RRect.fromRectAndRadius(
-            Rect.fromCenter(center: headC + Offset(0, -r * 0.86), width: r * 2.7, height: r * 0.62),
-            Radius.circular(r * 0.3),
-          ),
-          Paint()..color = const Color(0xFF1D1D20),
-        );
-        canvas.drawPath(
-          Path()
-            ..moveTo(headC.dx - r * 0.62, headC.dy + r * 0.42)
-            ..quadraticBezierTo(headC.dx, headC.dy + r * 1.35, headC.dx + r * 0.62, headC.dy + r * 0.42)
-            ..close(),
-          Paint()..color = const Color(0xFF3B2A1C),
-        );
-        break;
-    }
-  }
+  Color _accentFor(Raft raft) => Cast.of(raft.look).accent;
+
 
   void _enemyLabel(Canvas canvas, Raft raft, double bob) {
     final lo = raft.loadout;
-    final top = BattleConst.waterY - lo.width * lo.hull.thickness * 0.55 - 104 + bob;
+    final top = BattleConst.waterY - lo.deckRise - 104 + bob;
 
     final tp = TextPainter(
       text: TextSpan(text: raft.label, style: RT.body(size: 10, color: RT.ink, weight: FontWeight.w800, letterSpacing: 1.2)),
@@ -2046,7 +2952,117 @@ class WorldRenderer {
     }
     final r = WeaponView.ballR * s.weapon.weight;
     canvas.drawCircle(s.pos, r + 2, Paint()..color = Colors.black.withOpacity(0.18));
-    canvas.drawCircle(s.pos, r, Paint()..color = s.weapon.color);
+    _projectile(canvas, s, r);
+  }
+
+  /// The round itself.
+  ///
+  /// Ordinary ordnance is a coloured ball, as it always was. A boss's
+  /// signature round is not: it spins, it trails, and it is shaped like the
+  /// thing it does. That silhouette in the air is the ONLY warning the
+  /// player gets that this shot is about to take a turn's advantage away
+  /// from them, so it has to be legible at a glance and never mistakable for
+  /// an ordinary round.
+  void _projectile(Canvas canvas, Shot s, double r) {
+    final c = s.weapon.color;
+    // Spin rate follows the flight, so a shard cartwheels visibly and a
+    // heavy tar pot wallows.
+    final spin = (world.elapsed - s.firedAt) * (6.5 / max(0.4, s.weapon.weight));
+
+    switch (s.weapon.projectile) {
+      case 'shard':
+        // A frost shard: a four-pointed spike that glitters as it turns.
+        canvas.save();
+        canvas.translate(s.pos.dx, s.pos.dy);
+        canvas.rotate(spin);
+        final p = Path();
+        for (int i = 0; i < 4; i++) {
+          final a = i * pi / 2;
+          p.moveTo(0, 0);
+          p.lineTo(cos(a) * r * 2.1, sin(a) * r * 2.1);
+          p.lineTo(cos(a + 0.42) * r * 0.75, sin(a + 0.42) * r * 0.75);
+          p.close();
+        }
+        canvas.drawPath(p, Paint()..color = c);
+        canvas.drawCircle(Offset.zero, r * 0.6, Paint()..color = Colors.white.withOpacity(0.85));
+        canvas.restore();
+        break;
+
+      case 'blob':
+        // A tar pot: a fat wobbling drop with a drip hanging off the back.
+        final wob = sin(spin * 1.6) * r * 0.16;
+        canvas.drawOval(
+          Rect.fromCenter(
+              center: s.pos, width: r * 2.3 + wob, height: r * 2.1 - wob),
+          Paint()..color = c,
+        );
+        canvas.drawCircle(
+          s.pos - Offset(s.vel.dx, s.vel.dy) * 0.22,
+          r * 0.55,
+          Paint()..color = c.withOpacity(0.7),
+        );
+        canvas.drawCircle(
+          s.pos + Offset(-r * 0.4, -r * 0.5),
+          r * 0.32,
+          Paint()..color = Colors.white.withOpacity(0.35),
+        );
+        break;
+
+      case 'ember':
+        // Burning grit: a hot core inside a flickering halo.
+        final flick = 0.75 + 0.25 * sin(spin * 3.1);
+        canvas.drawCircle(
+            s.pos, r * 1.9 * flick, Paint()..color = c.withOpacity(0.35));
+        canvas.drawCircle(s.pos, r * 1.15, Paint()..color = c);
+        canvas.drawCircle(
+            s.pos, r * 0.55, Paint()..color = Colors.white.withOpacity(0.9));
+        break;
+
+      case 'net':
+        // A weighted net, drawn as a spinning mesh square with corner shot.
+        canvas.save();
+        canvas.translate(s.pos.dx, s.pos.dy);
+        canvas.rotate(spin * 0.6);
+        final half = r * 1.7;
+        final mesh = Paint()
+          ..color = c
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = 1.6;
+        for (int i = -1; i <= 1; i++) {
+          canvas.drawLine(Offset(i * half * 0.7, -half),
+              Offset(i * half * 0.7, half), mesh);
+          canvas.drawLine(Offset(-half, i * half * 0.7),
+              Offset(half, i * half * 0.7), mesh);
+        }
+        for (final sx in [-1.0, 1.0]) {
+          for (final sy in [-1.0, 1.0]) {
+            canvas.drawCircle(Offset(sx * half, sy * half), r * 0.42,
+                Paint()..color = Color.lerp(c, Colors.black, 0.4)!);
+          }
+        }
+        canvas.restore();
+        break;
+
+      case 'disc':
+        // A saw disc: a toothed wheel, edge-on to the flight path.
+        canvas.save();
+        canvas.translate(s.pos.dx, s.pos.dy);
+        canvas.rotate(spin * 1.8);
+        canvas.drawCircle(Offset.zero, r * 1.5, Paint()..color = c);
+        final teeth = Paint()..color = Color.lerp(c, Colors.black, 0.35)!;
+        for (int i = 0; i < 8; i++) {
+          final a = i * pi / 4;
+          canvas.drawCircle(
+              Offset(cos(a), sin(a)) * r * 1.5, r * 0.38, teeth);
+        }
+        canvas.drawCircle(Offset.zero, r * 0.45,
+            Paint()..color = Colors.white.withOpacity(0.8));
+        canvas.restore();
+        break;
+
+      default:
+        canvas.drawCircle(s.pos, r, Paint()..color = c);
+    }
   }
 
   void _drawEffects(Canvas canvas) {

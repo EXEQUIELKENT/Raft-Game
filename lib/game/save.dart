@@ -1,11 +1,13 @@
 import 'dart:convert';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'campaign.dart';
+import 'characters.dart';
 import 'models.dart';
+import 'progression.dart';
 import 'raft.dart';
 
-/// Player level -> XP thresholds (cumulative)
-const List<int> xpLevels = [0, 100, 250, 450, 700, 1000, 1400, 1900, 2500, 3200, 4000];
+
+
 
 class SaveData {
   int xp = 0;
@@ -13,7 +15,17 @@ class SaveData {
   int losses = 0;
   int shotsFired = 0;
   int totalDamage = 0;
-  String character = 'captain';
+  /// Which of the [Cast] the player sails as, by [CharacterDef.id].
+  ///
+  /// Defaults to the castaway captain — NOT the string 'captain', which used
+  /// to be a meaningless legacy label and now names the *rival* captain, an
+  /// enemy-only character. [fromJson] rewrites any save still carrying it.
+  String character = CrewLook.player.name;
+
+  /// The name other captains see — over a hotspot link, and on the online
+  /// server's friends lists. Kept here rather than in the online service
+  /// because a LAN match needs it too, with no account involved.
+  String playerName = 'Captain';
   int hatIndex = 0;
   int colorIndex = 0;
 
@@ -44,19 +56,30 @@ class SaveData {
 
   int upgradeTier(UpgradeKind k) => upgradeTiers[k.name] ?? 0;
   double get powerMultiplier => Upgrades.powerMultiplierAt(upgradeTier(UpgradeKind.power));
-  double get bonusHp => Upgrades.bonusHpAt(upgradeTier(UpgradeKind.plating));
+  /// Bonus HP from both progression tracks: what the shop's Extra Plating was
+  /// bought up to, plus the small permanent grants every fifth captain level
+  /// hands over. They stack on purpose — one is spent for, the other is
+  /// played for — but both are deliberately small next to the campaign's
+  /// enemy HP curve.
+  double get bonusHp =>
+      Upgrades.bonusHpAt(upgradeTier(UpgradeKind.plating)) +
+      Progression.bonusHpAt(level);
   int get trajectoryDots => Upgrades.trajectoryDotsAt(upgradeTier(UpgradeKind.aim));
 
-  int get level {
-    int lvl = 1;
-    for (int i = 0; i < xpLevels.length; i++) {
-      if (xp >= xpLevels[i]) lvl = i + 1;
-    }
-    return lvl.clamp(1, 10);
-  }
+  /// Captain level, from the generated curve in [Progression]. The old
+  /// hand-typed `xpLevels` list stopped at 10 and is gone; existing saves
+  /// carry only `xp`, so they simply re-derive their level on the new curve.
+  int get level => Progression.levelForXp(xp);
 
-  int get xpForNext => level >= 10 ? xpLevels.last : xpLevels[level];
-  int get xpForCurrent => level >= 10 ? xpLevels.last : xpLevels[level - 1];
+  String get rank => Rank.forLevel(level);
+
+  int get xpForNext => Progression.xpForNext(level);
+  int get xpForCurrent => Progression.xpAtLevel(level);
+
+  /// 0..1 through the current level, for the XP bar.
+  double get levelProgress => Progression.progress(xp);
+
+  bool get atMaxLevel => level >= kMaxLevel;
 
   List<WeaponDef> get unlockedWeapons => Weapons.unlockedAt(level);
 
@@ -87,6 +110,7 @@ class SaveData {
   Map<String, dynamic> toJson() => {
         'xp': xp, 'wins': wins, 'losses': losses, 'shotsFired': shotsFired,
         'totalDamage': totalDamage,
+        'playerName': playerName,
         'character': character, 'hatIndex': hatIndex, 'colorIndex': colorIndex,
         'raftHullId': raftHullId, 'raftColorIndex': raftColorIndex,
         'raftTier': raftTier, 'ammo': ammo,
@@ -103,7 +127,14 @@ class SaveData {
     losses = j['losses'] ?? 0;
     shotsFired = j['shotsFired'] ?? 0;
     totalDamage = j['totalDamage'] ?? 0;
-    character = j['character'] ?? 'captain';
+    playerName = j['playerName'] ?? 'Captain';
+    // Old saves stored 'captain', a label with no character behind it. It
+    // now names an enemy-only definition, so anything that is not a playable
+    // character falls back to the default rather than dressing the player as
+    // one of their rivals.
+    final savedLook = j['character'] as String?;
+    final match = Cast.playable.where((c) => c.id == savedLook);
+    character = match.isEmpty ? CrewLook.player.name : match.first.id;
     hatIndex = j['hatIndex'] ?? 0;
     colorIndex = j['colorIndex'] ?? 0;
     raftHullId = j['raftHullId'] ?? 'tube';
@@ -155,17 +186,54 @@ class SaveService {
     await save();
   }
 
+  /// Levels crossed by the last [recordMatch], and what they handed over.
+  /// Read by the game-over screen; cleared at the start of each record.
+  List<LevelReward> lastLevelUps = [];
+
+  /// XP awarded by the last [recordMatch].
+  int lastXpGain = 0;
+
   /// Award XP & record a match result. Returns newly unlocked achievements.
-  List<String> recordMatch({required bool won, required int damageDealt, String mode = 'AI', String map = 'Ocean'}) {
+  ///
+  /// [hpFraction], [difficultyTier], [rounds] and [isBoss] shape the award —
+  /// see [Progression.battleXp]. They all default to the shape of a casual
+  /// skirmish, so callers that do not know them still work.
+  List<String> recordMatch({
+    required bool won,
+    required int damageDealt,
+    String mode = 'AI',
+    String map = 'Ocean',
+    double hpFraction = 0,
+    int difficultyTier = 0,
+    int rounds = 0,
+    bool isBoss = false,
+  }) {
     data.shotsFired += 0; // shots tracked separately
+    final levelBefore = data.level;
     if (won) {
       data.wins++;
-      data.xp += 60;
     } else {
       data.losses++;
-      data.xp += 20;
     }
-    data.xp += (damageDealt / 10).round();
+    lastXpGain = Progression.battleXp(
+      won: won,
+      damageDealt: damageDealt,
+      hpFraction: hpFraction,
+      difficultyTier: difficultyTier,
+      rounds: rounds,
+      isBoss: isBoss,
+    );
+    data.xp += lastXpGain;
+    // Hand over everything the crossed levels promised. Doing it here rather
+    // than in the UI is what stops a player who skips the level-up card from
+    // silently losing the reward.
+    lastLevelUps = Progression.rewardsBetween(levelBefore, data.level);
+    for (final r in lastLevelUps) {
+      data.doubloons += r.doubloons;
+      for (final e in r.ammo.entries) {
+        data.ammo[e.key] = data.ammoFor(e.key) + e.value;
+      }
+    }
     data.totalDamage += damageDealt;
     data.matchHistory.insert(0, {
       'won': won,

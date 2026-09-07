@@ -77,6 +77,10 @@ class _GameScreenState extends State<GameScreen> {
   String _lastWeapon = '';
   List<int> _lastHp = const [];
 
+  /// Whether the in-match chat panel is expanded. Collapsed by default so
+  /// it never covers the deck a player is aiming at.
+  bool _chatOpen = false;
+
   int? _campaignStars;
   int? _campaignReward;
 
@@ -331,6 +335,7 @@ class _GameScreenState extends State<GameScreen> {
                 ),
               ),
               SafeArea(child: _buildHud()),
+              if (ctrl.net?.isNetworked ?? false) _chatOverlay(),
               if (ctrl.phase == GamePhase.aiming && ctrl.canHumanAct)
                 _pullReadout(),
               if (ctrl.phase == GamePhase.gameOver) _buildResult(),
@@ -341,6 +346,119 @@ class _GameScreenState extends State<GameScreen> {
     );
   }
 
+
+  // ------------------------------------------------------------------ chat
+
+  /// Chat, shown only in a networked match.
+  ///
+  /// Lines ride the ordinary match protocol (see `NetService.sendChat`), so
+  /// this widget neither knows nor cares whether the opponent is across the
+  /// room on a hotspot or across the world on the relay.
+  Widget _chatOverlay() {
+    final net = ctrl.net!;
+    return Positioned(
+      right: 12,
+      top: 92,
+      child: SafeArea(
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.end,
+          children: [
+            if (_chatOpen)
+              Container(
+                width: 230,
+                constraints: const BoxConstraints(maxHeight: 172),
+                padding: const EdgeInsets.all(10),
+                decoration: RT.pill(color: RT.ink, opacity: 0.72, radius: 14),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    Flexible(
+                      child: net.chat.isEmpty
+                          ? Text('Say something…',
+                              style: RT.body(
+                                  size: 11, color: Colors.white.withOpacity(0.6)))
+                          : ListView(
+                              shrinkWrap: true,
+                              reverse: true,
+                              children: [
+                                for (final line in net.chat.reversed)
+                                  Padding(
+                                    padding: const EdgeInsets.only(bottom: 4),
+                                    child: Text(
+                                      '${line.mine ? "You" : line.name}: ${line.text}',
+                                      style: RT.body(
+                                        size: 11,
+                                        color: line.mine
+                                            ? RT.yellow
+                                            : Colors.white,
+                                        weight: FontWeight.w700,
+                                      ),
+                                    ),
+                                  ),
+                              ],
+                            ),
+                    ),
+                    const SizedBox(height: 6),
+                    // Quick lines rather than a keyboard: the battle is a
+                    // landscape, one-thumb game and an on-screen keyboard
+                    // would cover the deck the player is aiming at.
+                    Wrap(
+                      spacing: 5,
+                      runSpacing: 5,
+                      children: [
+                        for (final phrase in _quickChat)
+                          GestureDetector(
+                            onTap: () {
+                              AudioService.instance.sfx('click');
+                              net.sendChat(phrase);
+                              setState(() {});
+                            },
+                            child: Container(
+                              padding: const EdgeInsets.symmetric(
+                                  horizontal: 8, vertical: 5),
+                              decoration: RT.pill(opacity: 0.9, radius: 9),
+                              child: Text(phrase,
+                                  style: RT.body(
+                                      size: 10,
+                                      color: RT.ink,
+                                      weight: FontWeight.w800)),
+                            ),
+                          ),
+                      ],
+                    ),
+                  ],
+                ),
+              ),
+            const SizedBox(height: 6),
+            GestureDetector(
+              onTap: () {
+                AudioService.instance.sfx('click');
+                setState(() => _chatOpen = !_chatOpen);
+              },
+              child: Container(
+                padding: const EdgeInsets.all(9),
+                decoration: RT.pill(opacity: 0.85, radius: 12),
+                child: Icon(
+                  _chatOpen ? Icons.close : Icons.chat_bubble,
+                  size: 18,
+                  color: RT.ink,
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  static const List<String> _quickChat = [
+    'Nice shot!',
+    'So close',
+    'Good game',
+    'Ouch!',
+    'My turn',
+  ];
   Widget _buildHud() {
     return Column(
       children: [
@@ -680,11 +798,95 @@ class _GameScreenState extends State<GameScreen> {
                   ],
                 ],
               ),
-              const SizedBox(height: 18),
+              const SizedBox(height: 14),
+              _xpPanel(),
+              const SizedBox(height: 14),
               if (level != null) ..._campaignButtons(level, won) else ..._quickButtons(),
             ],
           ),
         ),
+      ),
+    );
+  }
+
+  /// XP earned, the bar, and anything the crossed levels handed over.
+  ///
+  /// Levelling used to happen silently: XP went up, a level occasionally
+  /// ticked over, and nothing on screen said so or gave you anything. Every
+  /// level now carries a reward and this is where the player is told about
+  /// it — the rewards themselves are already banked by [SaveService], so
+  /// dismissing this card never costs anything.
+  Widget _xpPanel() {
+    final save = SaveService.instance.data;
+    final svc = SaveService.instance;
+    if (svc.lastXpGain <= 0) return const SizedBox.shrink();
+    final ups = svc.lastLevelUps;
+
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: RT.ink.withOpacity(0.05),
+        borderRadius: BorderRadius.circular(16),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Text('LV ${save.level}',
+                  style: RT.chunky(size: 14, color: RT.ink)),
+              const SizedBox(width: 6),
+              Text(save.rank,
+                  style: RT.body(
+                      size: 10,
+                      color: RT.ink.withOpacity(0.55),
+                      weight: FontWeight.w800,
+                      letterSpacing: 1.2)),
+              const Spacer(),
+              Text('+${svc.lastXpGain} XP',
+                  style: RT.chunky(size: 14, color: RT.green)),
+            ],
+          ),
+          const SizedBox(height: 7),
+          ClipRRect(
+            borderRadius: BorderRadius.circular(5),
+            child: LinearProgressIndicator(
+              value: save.levelProgress,
+              minHeight: 8,
+              backgroundColor: RT.ink.withOpacity(0.12),
+              valueColor: const AlwaysStoppedAnimation(RT.orange),
+            ),
+          ),
+          if (ups.isNotEmpty) ...[
+            const SizedBox(height: 9),
+            for (final r in ups)
+              Padding(
+                padding: const EdgeInsets.only(bottom: 3),
+                child: Row(
+                  children: [
+                    const Icon(Icons.arrow_upward, size: 13, color: RT.orange),
+                    const SizedBox(width: 5),
+                    Text('LEVEL ${r.level}',
+                        style: RT.body(
+                            size: 10,
+                            color: RT.ink,
+                            weight: FontWeight.w800,
+                            letterSpacing: 1)),
+                    const SizedBox(width: 7),
+                    Expanded(
+                      child: Text(r.headline,
+                          overflow: TextOverflow.ellipsis,
+                          style: RT.body(
+                              size: 11,
+                              color: RT.ink.withOpacity(0.75),
+                              weight: FontWeight.w700)),
+                    ),
+                  ],
+                ),
+              ),
+          ],
+        ],
       ),
     );
   }
@@ -794,6 +996,10 @@ class _ScenePainter extends CustomPainter {
     if (!SaveService.instance.data.showTrajectory && !ctrl.isCharging) return;
     final raft = ctrl.currentRaft;
     if (raft == null) return;
+    // A dazed shooter has no arc — sand in the eyes. It takes nothing off
+    // the shot itself, it just makes the player aim by eye for one turn,
+    // which is the game underneath the aim assist.
+    if (raft.activeCrew?.status == StatusEffect.dazed) return;
     final dots = ctrl.world.trajectory(
       // Same origin the shot will actually spawn from (the drawn muzzle at
       // the live aim angle), so the dots lie exactly on the flight path.

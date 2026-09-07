@@ -2,13 +2,13 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import '../game/audio.dart';
-import '../game/controller.dart';
+import '../game/characters.dart';
 import '../game/maps.dart';
+import '../game/match_store.dart';
 import '../game/net.dart';
 import '../game/raft.dart';
-import '../game/save.dart';
 import '../theme.dart';
-import 'game_screen.dart';
+import 'net_match.dart';
 
 /// Hotspot multiplayer: host or join over the same Wi-Fi / mobile hotspot.
 ///
@@ -29,12 +29,17 @@ class _HotspotScreenState extends State<HotspotScreen> {
   final NetService _net = NetService.instance;
   String _status = '';
   bool _busy = false;
+  bool _resuming = false;
   MapDef _map = GameMaps.all.first;
   double _startHp = 100;
 
   @override
   void initState() {
     super.initState();
+    // Announced in our greeting so the host can build the match with the
+    // character we actually picked. Set here, before anything can host or
+    // join, so no code path can greet without it.
+    _net.selfLook = myLook().name;
     _net.onConnected = _onConnected;
     _net.onDisconnected = () {
       if (mounted) setState(() => _status = 'Opponent disconnected');
@@ -47,8 +52,16 @@ class _HotspotScreenState extends State<HotspotScreen> {
     _net.onConnected = null;
     _net.onDisconnected = null;
     _net.onMessage = null;
+    _net.onResumeAgreed = null;
+    _net.onResumeFailed = null;
     _ipController.dispose();
     super.dispose();
+  }
+
+  /// The hotspot battle waiting to be picked back up, if there is one.
+  MatchSnapshot? get _resumable {
+    final snap = MatchStore.instance.saved;
+    return (snap != null && snap.isHotspot) ? snap : null;
   }
 
   void _onConnected() {
@@ -66,15 +79,118 @@ class _HotspotScreenState extends State<HotspotScreen> {
     // Lobby-phase messages only; once a match is running GameController owns
     // the connection and re-points onMessage at itself.
     if (msg['t'] == 'start' && !_net.isHost) {
-      final hp = msg['hp'];
-      final seed = msg['seed'];
-      final settings = MatchSettings(
-        map: GameMaps.byId(msg['map'] as String? ?? _map.id),
-        startHp: hp is num ? hp.toDouble() : 100,
-        turnSeconds: 30,
+      launchNetMatch(
+        context,
+        net: _net,
+        setup: NetMatchSetup.fromStart(msg, guestName: myName()),
+        startPayload: msg,
       );
-      _startGame(settings, seed: seed is int ? seed : DateTime.now().millisecondsSinceEpoch);
     }
+  }
+
+  // -------------------------------------------------------------- resume ---
+
+  /// Walks back into an interrupted match.
+  ///
+  /// Which half of the rendezvous this device performs is decided by the seat
+  /// it held: the host re-opens its old room and waits, the guest dials the
+  /// host back. Getting that backwards would leave two hosts, or two guests,
+  /// both waiting for someone who is also waiting.
+  Future<void> _resume() async {
+    final snap = _resumable;
+    if (snap == null || _resuming) return;
+    AudioService.instance.sfx('click');
+    setState(() {
+      _resuming = true;
+      _status = snap.iAmHost
+          ? 'Re-opening room ${snap.roomCode}…'
+          : 'Looking for ${snap.peerName}…';
+    });
+
+    _net.onResumeFailed = (why) {
+      if (!mounted) return;
+      setState(() {
+        _resuming = false;
+        _status = why;
+      });
+    };
+    _net.onResumeAgreed = (state) {
+      if (!mounted) return;
+      // Both devices have settled on one account of the battle; this is the
+      // only place a resumed match is launched, so whichever side won the
+      // reconciliation, the two enter with the same state.
+      launchNetMatch(
+        context,
+        net: _net,
+        setup: NetMatchSetup.fromStart(
+          snap.start,
+          guestName: snap.iAmHost ? _net.peerName : myName(),
+        ),
+        startPayload: snap.start,
+        restore: state,
+      );
+    };
+
+    final ok = snap.iAmHost
+        ? (await _net.resumeHost(
+              playerName: myName(),
+              roomCode: snap.roomCode,
+              offer: snap.offer,
+            )) !=
+            null
+        : await _rejoinHost(snap);
+
+    if (!mounted) return;
+    // The host is now listening; the guest either connected or ran out of
+    // patience. Either way the resume finishes on the handshake, not here.
+    setState(() {
+      if (!ok && !snap.iAmHost) _resuming = false;
+      _status = _net.status;
+    });
+  }
+
+  /// Dials the host back, then falls back to a scan.
+  ///
+  /// The saved address is right almost always, but not quite always: a phone
+  /// that reconnects to the hotspot can come back on a different lease. The
+  /// room CODE does not change, so when the address goes quiet it is worth one
+  /// broadcast scan to find where that room moved to before giving up.
+  Future<bool> _rejoinHost(MatchSnapshot snap) async {
+    if (await _net.resumeJoin(
+      snap.hostAddress,
+      playerName: myName(),
+      offer: snap.offer,
+      timeout: const Duration(seconds: 25),
+    )) {
+      return true;
+    }
+    if (!mounted || !_resuming) return false;
+    setState(() => _status = 'Not at the old address — scanning for the room…');
+    await _net.scanRooms();
+    await Future<void>.delayed(const Duration(milliseconds: 6500));
+    if (!mounted || !_resuming) return false;
+    final moved = _net.foundRooms.where(
+      (r) => r.code.toUpperCase() == snap.roomCode.toUpperCase(),
+    );
+    if (moved.isEmpty) return false;
+    return _net.resumeJoin(
+      moved.first.host,
+      playerName: myName(),
+      offer: snap.offer,
+      timeout: const Duration(seconds: 20),
+    );
+  }
+
+  Future<void> _forfeit() async {
+    AudioService.instance.sfx('click');
+    _net.cancelResume();
+    await _net.close();
+    await MatchStore.instance.clear();
+    if (!mounted) return;
+    setState(() {
+      _resuming = false;
+      _status = 'Match forfeited.';
+    });
   }
 
   Future<void> _host() async {
@@ -83,7 +199,7 @@ class _HotspotScreenState extends State<HotspotScreen> {
       _status = 'Starting host…';
     });
     AudioService.instance.sfx('click');
-    final code = await _net.host(playerName: 'Host');
+    final code = await _net.host(playerName: myName());
     if (!mounted) return;
     setState(() {
       _busy = false;
@@ -115,7 +231,7 @@ class _HotspotScreenState extends State<HotspotScreen> {
       _status = 'Joining ${room.code}…';
     });
     AudioService.instance.sfx('click');
-    await _net.join(room.host, playerName: 'Guest');
+    await _net.join(room.host, playerName: myName());
     if (!mounted) return;
     setState(() {
       _busy = false;
@@ -131,7 +247,7 @@ class _HotspotScreenState extends State<HotspotScreen> {
       _status = 'Connecting…';
     });
     AudioService.instance.sfx('click');
-    await _net.join(ip, playerName: 'Guest');
+    await _net.join(ip, playerName: myName());
     if (!mounted) return;
     setState(() {
       _busy = false;
@@ -141,50 +257,43 @@ class _HotspotScreenState extends State<HotspotScreen> {
 
   void _hostStart() {
     final seed = DateTime.now().millisecondsSinceEpoch;
-    _net.send({
-      't': 'start',
-      'map': _map.id,
-      'hp': _startHp,
-      'seed': seed,
-    });
-    final settings = MatchSettings(map: _map, startHp: _startHp, turnSeconds: 30);
-    _startGame(settings, seed: seed);
+    // The guest's raft is chosen here, by the host, and shipped along with
+    // the host's own — see NetMatchSetup for why both have to travel.
+    final hostRaft = myRaft();
+    final guestRaft =
+        RaftLoadout.custom(hullId: 'log', sizeId: 'medium', colorIndex: 1);
+    final payload = NetMatchSetup.startPayload(
+      map: _map,
+      startHp: _startHp,
+      seed: seed,
+      hostRaft: hostRaft,
+      guestRaft: guestRaft,
+      hostName: myName(),
+      hostLook: myLook(),
+      // The guest told us who they sail as in their greeting; the host
+      // decides both sides' setup, so without this their choice would be
+      // silently replaced by a default on both screens.
+      guestLook: NetMatchSetup.lookOf(_net.peerLook, CrewLook.raider),
+    );
+    _net.send(payload);
+    launchNetMatch(
+      context,
+      net: _net,
+      startPayload: payload,
+      setup: NetMatchSetup.forHost(
+        map: _map,
+        startHp: _startHp,
+        seed: seed,
+        hostRaft: hostRaft,
+        guestRaft: guestRaft,
+        hostName: myName(),
+        guestName: _net.peerName,
+        hostLook: myLook(),
+        guestLook: NetMatchSetup.lookOf(_net.peerLook, CrewLook.raider),
+      ),
+    );
   }
 
-  void _startGame(MatchSettings settings, {required int seed}) {
-    final save = SaveService.instance.data;
-    final players = [
-      PlayerConfig(
-        name: 'HOST',
-        loadout: save.raftLoadout,
-        netId: 0,
-      ),
-      PlayerConfig(
-        name: 'GUEST',
-        loadout: RaftLoadout.custom(hullId: 'log', sizeId: 'medium', colorIndex: 1),
-        netId: 1,
-      ),
-    ];
-    final controller = GameController(
-      settings: settings,
-      players: players,
-      mode: GameMode.hotspot,
-      net: _net,
-      seed: seed,
-    );
-    Navigator.pushReplacement(
-      context,
-      MaterialPageRoute(
-        builder: (_) => GameScreen(
-          settings: settings,
-          players: players,
-          mode: GameMode.hotspot,
-          seed: seed,
-          controller: controller,
-        ),
-      ),
-    );
-  }
 
   @override
   Widget build(BuildContext context) {
@@ -220,6 +329,10 @@ class _HotspotScreenState extends State<HotspotScreen> {
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.stretch,
                     children: [
+                      if (_resumable != null) ...[
+                        _resumeCard(_resumable!),
+                        const SizedBox(height: 14),
+                      ],
                       _infoCard(),
                       const SizedBox(height: 14),
                       _hostCard(),
@@ -246,6 +359,62 @@ class _HotspotScreenState extends State<HotspotScreen> {
             ],
           ),
         ),
+      ),
+    );
+  }
+
+  /// Offers the interrupted battle back, rather than dropping the player
+  /// straight into it. Someone who closed the app to get out of a losing
+  /// match should not be dragged back in by opening the lobby.
+  Widget _resumeCard(MatchSnapshot snap) {
+    return Container(
+      padding: const EdgeInsets.all(14),
+      decoration: RT.card(color: RT.green, border: 0),
+      child: Column(
+        children: [
+          Text('BATTLE IN PROGRESS', style: RT.chunky(size: 16, color: Colors.white)),
+          const SizedBox(height: 4),
+          Text(
+            'against ${snap.peerName} • room ${snap.roomCode}',
+            style: RT.body(size: 12, color: Colors.white.withOpacity(0.85)),
+            textAlign: TextAlign.center,
+          ),
+          const SizedBox(height: 4),
+          Text(
+            snap.iAmHost
+                ? 'You were hosting — RESUME re-opens the room and waits.'
+                : 'You joined — RESUME dials the host back.',
+            style: RT.body(size: 10, color: Colors.white.withOpacity(0.75)),
+            textAlign: TextAlign.center,
+          ),
+          const SizedBox(height: 10),
+          Row(
+            children: [
+              Expanded(
+                child: ChunkyButton(
+                  label: _resuming ? 'WAITING…' : 'RESUME',
+                  icon: Icons.play_arrow,
+                  color: RT.orange,
+                  width: double.infinity,
+                  height: 48,
+                  fontSize: 16,
+                  onPressed: _resuming ? null : _resume,
+                ),
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: ChunkyButton(
+                  label: 'FORFEIT',
+                  color: RT.red,
+                  width: double.infinity,
+                  height: 48,
+                  fontSize: 15,
+                  onPressed: _forfeit,
+                ),
+              ),
+            ],
+          ),
+        ],
       ),
     );
   }

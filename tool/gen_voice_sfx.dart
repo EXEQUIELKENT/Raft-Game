@@ -8,6 +8,7 @@
 // personality without any recorded dialogue.
 import 'dart:io';
 import 'dart:math';
+import 'dart:typed_data';
 
 const int sampleRate = 22050;
 
@@ -26,8 +27,139 @@ void main() {
   writeWav('voice_hmm.wav', hmm());
   writeWav('voice_look.wav', look());
   writeWav('voice_swap.wav', hup());
+  writeWav('voice_hup.wav', hup());
   writeWav('swap.wav', swapClack());
+
+  // New reactions the crew needed once their bodies started acting too: a
+  // whole-body cheer wants a whoop, a status hit wants a gasp, and a boss
+  // landing its signature wants something smug to say it with.
+  writeWav('voice_cheer.wav', cheer());
+  writeWav('voice_gasp.wav', gasp());
+  writeWav('voice_brr.wav', brr());
+  writeWav('voice_taunt.wav', taunt());
+
+  // ---- Pitch variants -------------------------------------------------
+  //
+  // A deck used to be a row of people with one identical voice. Every
+  // character now carries a [VoiceType], and these are what it selects: the
+  // same clip resampled down for the heavies and up for the wiry ones, so a
+  // dockhand and a dune runner do not yelp in the same register.
+  //
+  // Resampling rather than re-synthesising on purpose — it keeps every
+  // variant recognisably the *same* vocalism, which is what makes a crew
+  // sound like a crew instead of four unrelated cartoons.
+  const pitched = [
+    'voice_grunt', 'voice_ouch1', 'voice_ouch2', 'voice_ouch3', 'voice_ouch4',
+    'voice_laugh', 'voice_yawn', 'voice_chatter', 'voice_hmm', 'voice_look',
+    'voice_cheer', 'voice_gasp', 'voice_hup',
+  ];
+  for (final name in pitched) {
+    final base = readWav('$name.wav');
+    writeWav('${name}_low.wav', resample(base, 1.28));
+    writeWav('${name}_high.wav', resample(base, 0.78));
+  }
+
   stdout.writeln('voice blips written to assets/sfx/');
+}
+
+/// A short rising whoop — the sound of both arms going up.
+List<double> cheer() {
+  const dur = 0.4;
+  final out = <double>[];
+  for (int i = 0; i < (dur * sampleRate).round(); i++) {
+    final t = i / sampleRate;
+    final k = t / dur;
+    // Rises then breaks, like a voice cracking on the way up.
+    final f = 240 + 210 * smooth(min(1.0, k * 1.4)) + 14 * sin(2 * pi * 9 * t);
+    final s = 0.55 * sin(2 * pi * f * t) +
+        0.28 * sin(2 * pi * 2 * f * t) +
+        0.12 * sin(2 * pi * 3 * f * t);
+    out.add(s * env(k, attack: 0.08, release: 0.4) * 0.9);
+  }
+  return out;
+}
+
+/// A sharp inward gasp — what a status round lands on.
+List<double> gasp() {
+  const dur = 0.26;
+  final out = <double>[];
+  final rnd = Random(4242);
+  for (int i = 0; i < (dur * sampleRate).round(); i++) {
+    final t = i / sampleRate;
+    final k = t / dur;
+    // Mostly breath: filtered noise with a faint pitched edge climbing.
+    final noise = (rnd.nextDouble() * 2 - 1) * 0.5;
+    final f = 300 + 260 * smooth(k);
+    final s = noise * 0.7 + 0.3 * sin(2 * pi * f * t);
+    out.add(s * env(k, attack: 0.25, release: 0.5) * 0.75);
+  }
+  return out;
+}
+
+/// A shivering "brrr" — a low tone chopped by a fast tremolo.
+List<double> brr() {
+  const dur = 0.5;
+  final out = <double>[];
+  for (int i = 0; i < (dur * sampleRate).round(); i++) {
+    final t = i / sampleRate;
+    final k = t / dur;
+    final f = 150 - 25 * k;
+    // The chatter of teeth: a 22Hz gate over the tone.
+    final gate = 0.45 + 0.55 * (sin(2 * pi * 22 * t) > 0 ? 1.0 : 0.25);
+    final s = 0.6 * sin(2 * pi * f * t) + 0.3 * sin(2 * pi * 2 * f * t);
+    out.add(s * gate * env(k, attack: 0.06, release: 0.3) * 0.8);
+  }
+  return out;
+}
+
+/// Two smug descending notes — a boss reaching for its signature round.
+List<double> taunt() {
+  const dur = 0.46;
+  final out = <double>[];
+  for (int i = 0; i < (dur * sampleRate).round(); i++) {
+    final t = i / sampleRate;
+    final k = t / dur;
+    final first = k < 0.46;
+    final p = first ? k / 0.46 : (k - 0.5) / 0.5;
+    final f = (first ? 250.0 : 190.0) - 30 * smooth(p);
+    final gate = first ? 1.0 : 0.85;
+    final s = 0.5 * sin(2 * pi * f * t) +
+        0.32 * sin(2 * pi * 2 * f * t) +
+        0.18 * sin(2 * pi * 3 * f * t);
+    out.add(s * gate * env(k, attack: 0.07, release: 0.3) * 0.85);
+  }
+  return out;
+}
+
+/// Linear-interpolated resample. [factor] > 1 stretches (lower pitch),
+/// < 1 compresses (higher pitch).
+List<double> resample(List<double> src, double factor) {
+  if (src.isEmpty) return src;
+  final out = <double>[];
+  final n = (src.length * factor).round();
+  for (int i = 0; i < n; i++) {
+    final pos = i / factor;
+    final a = pos.floor();
+    final b = min(a + 1, src.length - 1);
+    final f = pos - a;
+    if (a >= src.length) break;
+    out.add(src[a] * (1 - f) + src[b] * f);
+  }
+  return out;
+}
+
+/// Reads back one of our own 16-bit mono WAVs, so the pitch variants are
+/// generated from exactly the bytes that shipped.
+List<double> readWav(String name) {
+  final bytes = File('assets/sfx/$name').readAsBytesSync();
+  final data = ByteData.sublistView(bytes);
+  // Our own writer always emits a 44-byte canonical header.
+  const headerBytes = 44;
+  final out = <double>[];
+  for (int i = headerBytes; i + 1 < bytes.length; i += 2) {
+    out.add(data.getInt16(i, Endian.little) / 32767.0);
+  }
+  return out;
 }
 
 /// Effortful "nngh" as the firearm kicks: low nasal grind, falling pitch.

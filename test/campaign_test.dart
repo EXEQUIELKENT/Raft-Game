@@ -117,9 +117,19 @@ void main() {
       expect(players.length, fleetSize + 1, reason: '${level.id}: one seat per raft plus the player');
       expect(players.first.isAi, false);
       expect(players.skip(1).every((p) => p.isAi), true);
-      expect(players[1].aiDifficulty, level.aiDifficulty);
+      // Every seat runs the level's difficulty, except a boss's own — a
+      // named opponent is as sharp as its [BossDef] says.
+      final bossSeat = players.indexWhere((p) => p.boss != null);
+      for (int i = 1; i < players.length; i++) {
+        if (i == bossSeat) continue;
+        expect(players[i].aiDifficulty, level.aiDifficulty);
+      }
       expect(settings.map.id, level.worldId);
       expect(settings.enabledWeapons, level.enabledWeapons);
+      expect(settings.isBoss, level.isBoss);
+      // Exactly one boss on a boss level, and none anywhere else.
+      expect(players.where((p) => p.boss != null).length, level.isBoss ? 1 : 0,
+          reason: '${level.id}: wrong number of bosses');
 
       final ctrl = GameController(settings: settings, players: players, mode: GameMode.vsAi, seed: 55);
       expect(ctrl.phase, GamePhase.aiming, reason: '${level.id}: should start in aiming');
@@ -134,8 +144,13 @@ void main() {
         final enemy = ctrl.world.raftOf(i + 1);
         expect(enemy, isNotNull, reason: '${level.id}: enemy raft $i missing');
         expect(enemy!.alive, true);
-        // Enemy HP reflects the archetype plus the level's difficulty bump.
-        expect(enemy.crew.first.maxHp, level.fleet[i].hp + level.enemyHp);
+        // Enemy HP reflects the archetype plus the level's difficulty bump,
+        // and — on the boss's own raft only — the boss's extra HP. The
+        // escort deliberately does not get it: a boss that toughened its
+        // whole fleet would just be a longer fight.
+        final isBossRaft = players[i + 1].boss != null;
+        final bossHp = isBossRaft ? players[i + 1].boss!.bonusHp : 0.0;
+        expect(enemy.crew.first.maxHp, level.fleet[i].hp + level.enemyHp + bossHp);
       }
 
       // Rafts must never share a slot, or they'd draw on top of each other.

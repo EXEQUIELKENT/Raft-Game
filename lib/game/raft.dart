@@ -48,23 +48,23 @@ class RaftHull {
   static const List<RaftHull> all = [
     RaftHull(
       id: 'tube', name: 'Pool Tube', desc: 'Bouncy inflatable ring. Light and cheerful.',
-      thickness: 0.27, rounding: 1.0,
+      thickness: 0.26, rounding: 1.0,
     ),
     RaftHull(
       id: 'log', name: 'Log Raft', desc: 'Lashed timber. The classic castaway special.',
-      tierRequired: 1, thickness: 0.19, rounding: 0.18,
+      tierRequired: 1, thickness: 0.17, rounding: 0.18,
     ),
     RaftHull(
       id: 'barrel', name: 'Barrel Float', desc: 'Planks over sealed barrels. Rides high.',
-      tierRequired: 2, thickness: 0.3, rounding: 0.35,
+      tierRequired: 2, thickness: 0.26, rounding: 0.35,
     ),
     RaftHull(
       id: 'sloop', name: 'Little Sloop', desc: 'A proper hull, and a proper sail.',
-      tierRequired: 3, thickness: 0.36, rounding: 0.3, hasMast: true,
+      tierRequired: 3, thickness: 0.28, rounding: 0.3, hasMast: true,
     ),
     RaftHull(
       id: 'galleon', name: 'Galleon Deck', desc: 'Captain-grade timber. Nothing sinks it easily.',
-      tierRequired: 4, thickness: 0.42, rounding: 0.24, hasMast: true,
+      tierRequired: 4, thickness: 0.30, rounding: 0.24, hasMast: true,
     ),
   ];
 
@@ -140,12 +140,16 @@ class DeckSegment {
   /// front wall; a ramp (rise0 != rise1) renders as a wedge you can walk.
   final bool isBlock;
 
+  /// How the renderer dresses this segment. Physics ignores it entirely.
+  final DeckStyle style;
+
   const DeckSegment({
     required this.x0,
     required this.x1,
     required this.rise0,
     required this.rise1,
     this.isBlock = true,
+    this.style = DeckStyle.planks,
   });
 
   bool get isFlat => rise0 == rise1;
@@ -157,17 +161,85 @@ class DeckSegment {
   }
 
   /// The same segment mirrored across the raft's centreline.
-  DeckSegment mirrored() =>
-      DeckSegment(x0: -x1, x1: -x0, rise0: rise1, rise1: rise0, isBlock: isBlock);
+  DeckSegment mirrored() => DeckSegment(
+        x0: -x1,
+        x1: -x0,
+        rise0: rise1,
+        rise1: rise0,
+        isBlock: isBlock,
+        style: style,
+      );
+}
+
+/// One tier of a hull's deck plan, before it is turned into segments.
+///
+/// A plan is written as fractions of the walkable deck so it scales with hull
+/// size: [span] is this tier's share of the deck width, [rise] its height
+/// above the main deck plane, and [crewWeight] how eagerly crew are posted
+/// here when berths are handed out (0 = scenery only, never stood on).
+class DeckTier {
+  final double span;
+  final double rise;
+  final int crewWeight;
+
+  /// What the renderer builds here — changes the furniture, not the physics.
+  final DeckStyle style;
+
+  const DeckTier({
+    required this.span,
+    required this.rise,
+    this.crewWeight = 1,
+    this.style = DeckStyle.planks,
+  });
+}
+
+/// Visual treatment for a deck tier. The height-field is identical either
+/// way; this only picks what the renderer stacks on top.
+enum DeckStyle {
+  /// Bare planking — the main deck.
+  planks,
+
+  /// Lashed timber with visible rope bindings.
+  lashed,
+
+  /// Planks over sealed barrels, barrel ends showing at the front wall.
+  barrels,
+
+  /// A proper raised castle: solid wall, railing posts along the top.
+  castle,
+
+  /// A cargo stack — crates roped down, no railing.
+  cargo,
+}
+
+/// A crew berth: where one crew member stands, and what they are standing on.
+class DeckStation {
+  /// Hull-local x of the station.
+  final double x;
+
+  /// Rise of the surface underfoot (0 = main deck).
+  final double rise;
+
+  const DeckStation({required this.x, required this.rise});
 }
 
 /// The deck layout for one hull — a series of platforms of varying shape
-/// and height, ordered stern-to-bow, that together tile the whole deck.
+/// and height, ordered stern-to-bow, that together tile the whole deck,
+/// plus the crew berths posted across them.
 class DeckProfile {
   final String hullId;
   final List<DeckSegment> segments;
 
-  const DeckProfile({required this.hullId, required this.segments});
+  /// Where each crew member stands. Built with the segments so a berth is
+  /// always on a *flat* patch of some tier — nobody is ever posted mid-ramp,
+  /// standing on a slope.
+  final List<DeckStation> stations;
+
+  const DeckProfile({
+    required this.hullId,
+    required this.segments,
+    this.stations = const [],
+  });
 
   /// Surface rise at hull-local [x]. Anywhere not covered by a segment is
   /// the flat main deck (rise 0), so the profile is total: every x has a
@@ -195,92 +267,268 @@ class DeckProfile {
     return true;
   }
 
-  /// Builds the deck layout for a hull. [facing] is the raft's shooting
-  /// direction: the raised stern work is always placed *behind* the crew,
-  /// so the canonical negative-x stern flips for rafts firing left.
+  /// Per-hull deck plans, written stern-to-bow as fractions of the walkable
+  /// deck. This is what makes the fleet read as five different boats rather
+  /// than one slab in five colours: the tube is a single flat ring, the log
+  /// raft has a lashed sleeping platform aft, the barrel float steps up
+  /// twice over its floats, the sloop carries a proper stern castle, and the
+  /// galleon stacks a castle, a working waist and a raised forecastle.
   ///
-  /// Platforms are kept clear of the crew stations (plus headroom for a
-  /// tumbling body) and only built when the remaining deck can fit a ramp
-  /// and a usable standing area — otherwise the hull stays a flat slab.
+  /// Spans are normalised on use, so they need only be proportional.
+  static const Map<String, List<DeckTier>> _plans = {
+    // One cheerful flat ring — the starter raft has nothing to climb.
+    'tube': [
+      DeckTier(span: 1, rise: 0, crewWeight: 3),
+    ],
+    // Lashed timber: a low sleeping platform aft, open deck forward.
+    'log': [
+      DeckTier(span: 0.40, rise: 8, crewWeight: 2, style: DeckStyle.lashed),
+      DeckTier(span: 0.60, rise: 0, crewWeight: 2),
+    ],
+    // Planks over sealed barrels: two steps down from stern to bow.
+    'barrel': [
+      DeckTier(span: 0.34, rise: 13, crewWeight: 2, style: DeckStyle.barrels),
+      DeckTier(span: 0.36, rise: 6, crewWeight: 2, style: DeckStyle.barrels),
+      DeckTier(span: 0.30, rise: 0, crewWeight: 1),
+    ],
+    // A proper little ship: raised stern castle, working deck, and cargo at
+    // the bow that is scenery only (crewWeight 0) so nobody stands on it.
+    'sloop': [
+      DeckTier(span: 0.32, rise: 17, crewWeight: 3, style: DeckStyle.castle),
+      DeckTier(span: 0.46, rise: 0, crewWeight: 2),
+      DeckTier(span: 0.22, rise: 7, crewWeight: 0, style: DeckStyle.cargo),
+    ],
+    // Captain's deck: high castle aft, main deck amidships, raised
+    // forecastle at the bow — three separate levels to fight from.
+    'galleon': [
+      DeckTier(span: 0.30, rise: 21, crewWeight: 3, style: DeckStyle.castle),
+      DeckTier(span: 0.42, rise: 0, crewWeight: 2),
+      DeckTier(span: 0.28, rise: 11, crewWeight: 2, style: DeckStyle.castle),
+    ],
+  };
+
+  /// Length of the walkable ramp joining two tiers, per unit of height
+  /// difference. Shallow enough that a tumbling body slides down rather than
+  /// catching on a wall.
+  static const double rampPerRise = 1.5;
+
+  /// Smallest flat top a tier may keep once its ramps are cut out of it. A
+  /// tier squeezed below this gives up ramp length instead of becoming an
+  /// unusable sliver.
+  static const double minTopLen = 16.0;
+
+  /// Shoulder-to-shoulder spacing between two crew on the same tier. A body
+  /// is about 29 units across, so anything tighter draws them overlapping.
+  static const double minBerthGap = 42.0;
+
+  /// How far a berth stays clear of the deck edge.
+  ///
+  /// Tiers run right out to the rails, so without this the outermost crew
+  /// member is posted a few units from open water — and a heavy hit that
+  /// should merely knock them down slides them straight over the side. Being
+  /// swept overboard is meant to be an occasional disaster, not the default
+  /// outcome of standing where the layout put you.
+  static const double railMargin = 26.0;
+
+  /// Half a crew member's width. Berths stay this far inside a flat top so
+  /// nobody stands with a foot on the ramp beside them.
+  static const double bodyHalf = 9.0;
+
+  /// Builds the deck layout and crew berths for a hull. [facing] is the
+  /// raft's shooting direction: the raised stern work always sits *behind*
+  /// the crew, so the canonical negative-x stern flips for rafts firing left.
+  ///
+  /// The profile is continuous by construction — every tier's flat top is
+  /// joined to the next by a ramp meeting both at their exact heights — which
+  /// is the structural-integrity guarantee: a tumbling body can slide from
+  /// the castle down to the main deck without ever finding a crack.
   factory DeckProfile.forLoadout(RaftLoadout loadout, {required int facing}) {
     final half = loadout.deckHalf;
+    final deck = half * 2;
+    final plan = _plans[loadout.hull.id] ?? _plans['tube']!;
 
-    // Crew keep-out: platforms begin beyond the outermost crew station.
-    final outerStation =
-        loadout.crewCount <= 1 ? 0.0 : loadout.crewSpacing * (loadout.crewCount - 1) / 2;
-    final zoneEdge = max(half * 0.5, outerStation + 14);
-    final span = half - zoneEdge;
+    // 1. Lay the tiers out edge to edge across the deck, stern to bow.
+    final spanTotal = plan.fold<double>(0, (s, t) => s + t.span);
+    final edges = <double>[-half];
+    for (final t in plan) {
+      edges.add(edges.last + deck * (t.span / spanTotal));
+    }
+    edges[edges.length - 1] = half; // kill accumulated rounding
 
-    // How high each hull builds, and whether it also raises its bow.
-    final (sternRise, bowRise) = switch (loadout.hull.id) {
-      'log' => (7.0, 0.0),
-      'barrel' => (9.0, 5.0),
-      'sloop' => (13.0, 0.0),
-      'galleon' => (17.0, 12.0),
-      _ => (0.0, 0.0), // the pool tube is one cheerful flat slab
-    };
+    // 2. Cut a ramp out of the *taller* side of every internal boundary, then
+    //    emit the flat top that remains. Hosting the ramp on the raised tier
+    //    reads as a stair cut into the structure rather than a wedge leaning
+    //    against it, and it keeps the lower deck fully walkable.
+    final segments = <DeckSegment>[];
+    final tops = <int, ({double x0, double x1, double rise})>{};
 
-    // A platform needs room for a walkable ramp plus a usable standing area.
-    const rampLen = 16.0;
-    const minTop = 10.0;
+    for (int i = 0; i < plan.length; i++) {
+      var x0 = edges[i];
+      final x1 = edges[i + 1];
+      final rise = plan[i].rise;
 
-    DeckSegment? sternBlock(double rise) {
-      if (rise <= 0 || span < rampLen + minTop) return null;
-      final topLen = min(span - rampLen, 26.0);
-      return DeckSegment(
-        x0: -half,
-        x1: -(half - topLen),
-        rise0: rise,
-        rise1: rise,
-      );
+      double cutFor(int other) {
+        if (other < 0 || other >= plan.length) return 0;
+        final drop = (plan[other].rise - rise).abs();
+        if (drop <= 0.01) return 0;
+        if (plan[other].rise > rise) return 0; // the taller tier hosts it
+        return min(drop * rampPerRise, (x1 - x0) * 0.4);
+      }
+
+      final cutL = cutFor(i - 1);
+      final cutR = cutFor(i + 1);
+      // On a small hull the ramps can eat the whole tier; give up ramp length
+      // rather than the standing area, so the top never vanishes.
+      final shrink = ((x1 - x0) - cutL - cutR) < minTopLen && (cutL + cutR) > 0
+          ? (((x1 - x0) - minTopLen) / (cutL + cutR)).clamp(0.0, 1.0)
+          : 1.0;
+      final rampL = cutL * shrink;
+      final rampR = cutR * shrink;
+
+      if (rampL > 0) {
+        segments.add(DeckSegment(
+          x0: x0,
+          x1: x0 + rampL,
+          rise0: plan[i - 1].rise,
+          rise1: rise,
+          isBlock: false,
+          style: plan[i].style,
+        ));
+        x0 += rampL;
+      }
+      final topX1 = x1 - rampR;
+      if (topX1 > x0) {
+        segments.add(DeckSegment(
+          x0: x0,
+          x1: topX1,
+          rise0: rise,
+          rise1: rise,
+          isBlock: rise > 0,
+          style: plan[i].style,
+        ));
+        tops[i] = (x0: x0, x1: topX1, rise: rise);
+      }
+      if (rampR > 0) {
+        segments.add(DeckSegment(
+          x0: topX1,
+          x1: x1,
+          rise0: rise,
+          rise1: plan[i + 1].rise,
+          isBlock: false,
+          style: plan[i].style,
+        ));
+      }
     }
 
-    DeckSegment? sternRamp(double rise) {
-      if (rise <= 0 || span < rampLen + minTop) return null;
-      final topLen = min(span - rampLen, 26.0);
-      return DeckSegment(
-        x0: -(half - topLen),
-        x1: -zoneEdge,
-        rise0: rise,
-        rise1: 0,
-        isBlock: false,
-      );
-    }
+    // 3. Post the crew across the tiers that want them, so a galleon crew
+    //    genuinely fights from the castle, the waist and the forecastle
+    //    rather than lining up along one plank.
+    final stations = _berths(loadout.crewCount, plan, tops, half);
 
-    DeckSegment? bowBlock(double rise) {
-      if (rise <= 0 || span < rampLen + minTop) return null;
-      final topLen = min(span - rampLen, 22.0);
-      return DeckSegment(
-        x0: half - topLen,
-        x1: half,
-        rise0: rise,
-        rise1: rise,
-      );
-    }
-
-    DeckSegment? bowRamp(double rise) {
-      if (rise <= 0 || span < rampLen + minTop) return null;
-      final topLen = min(span - rampLen, 22.0);
-      return DeckSegment(
-        x0: zoneEdge,
-        x1: half - topLen,
-        rise0: 0,
-        rise1: rise,
-        isBlock: false,
-      );
-    }
-
-    final stern = sternBlock(sternRise);
-    final bow = bowBlock(bowRise);
-    final segments = <DeckSegment>[
-      if (stern != null) stern,
-      if (stern != null) sternRamp(sternRise)!,
-      if (bow != null) bowRamp(bowRise)!,
-      if (bow != null) bow,
-    ];
-
-    final canonical = DeckProfile(hullId: loadout.hull.id, segments: segments);
+    final canonical = DeckProfile(
+      hullId: loadout.hull.id,
+      segments: segments,
+      stations: stations,
+    );
     return facing < 0 ? _mirrored(canonical) : canonical;
+  }
+
+  /// Hands [count] berths out across the tiers that accept crew, then spreads
+  /// each tier's share along its flat top.
+  static List<DeckStation> _berths(
+    int count,
+    List<DeckTier> plan,
+    Map<int, ({double x0, double x1, double rise})> tops,
+    double deckHalf,
+  ) {
+    if (count <= 0) return const [];
+
+    final usable = <int>[
+      for (int i = 0; i < plan.length; i++)
+        if (plan[i].crewWeight > 0 && tops.containsKey(i)) i,
+    ];
+    if (usable.isEmpty) {
+      // Every tier is scenery, or all were squeezed out: fall back to the
+      // middle of the widest surface there is.
+      if (tops.isEmpty) {
+        return [for (int i = 0; i < count; i++) const DeckStation(x: 0, rise: 0)];
+      }
+      final t = tops.values.reduce((a, b) => (a.x1 - a.x0) >= (b.x1 - b.x0) ? a : b);
+      return [
+        for (int i = 0; i < count; i++)
+          DeckStation(x: (t.x0 + t.x1) / 2, rise: t.rise),
+      ];
+    }
+
+    // How many bodies each tier can actually hold shoulder to shoulder. A
+    // narrow stern castle that is handed three crew draws them standing
+    // inside one another, so capacity is a hard limit on the deal below.
+    int capacityOf(int i) {
+      final t = tops[i]!;
+      return max(1, ((t.x1 - t.x0) / minBerthGap).floor());
+    }
+
+    // Deal one berth at a time to whichever tier is most under-served for its
+    // weight, so a 2-crew galleon takes the castle and the waist while a
+    // 4-crew galleon doubles up. Tiers drop out of the running once full.
+    final assigned = <int, int>{for (final i in usable) i: 0};
+    for (int n = 0; n < count; n++) {
+      var best = -1;
+      var bestScore = double.negativeInfinity;
+      for (final i in usable) {
+        if (assigned[i]! >= capacityOf(i)) continue;
+        final score = plan[i].crewWeight - assigned[i]! * 1.0;
+        if (score > bestScore) {
+          bestScore = score;
+          best = i;
+        }
+      }
+      // Every tier full: put the overflow on the roomiest one rather than
+      // dropping a crew member on the floor.
+      if (best < 0) {
+        best = usable.reduce((a, b) =>
+            (tops[a]!.x1 - tops[a]!.x0) >= (tops[b]!.x1 - tops[b]!.x0) ? a : b);
+      }
+      assigned[best] = assigned[best]! + 1;
+    }
+
+    // Spread each tier's berths along its top, keeping a body's width clear
+    // of the tier edges.
+    final out = <DeckStation>[];
+    for (final i in usable) {
+      final n = assigned[i]!;
+      if (n == 0) continue;
+      final t = tops[i]!;
+      // Usable band on this tier: inside its own edges, and clear of the
+      // ship's rails — a tier runs right out to the deck edge, and a crew
+      // member posted there goes over the side on any solid hit.
+      // The inset is a body half-width: a berth any closer to the flat top's
+      // edge would have one boot hanging over the ramp beside it.
+      var x0 = max(t.x0 + bodyHalf, -deckHalf + railMargin);
+      var x1 = min(t.x1 - bodyHalf, deckHalf - railMargin);
+      if (x1 < x0) {
+        // The tier is entirely inside the rail margin (a tiny hull): fall
+        // back to its centre rather than inverting the band.
+        final mid = (t.x0 + t.x1) / 2;
+        x0 = mid;
+        x1 = mid;
+      }
+
+      if (n == 1) {
+        out.add(DeckStation(x: (x0 + x1) / 2, rise: t.rise));
+        continue;
+      }
+      // Space them a full body apart about the band's centre, shrinking the
+      // spread only as far as the band forces — overlapping crew look far
+      // worse than a slightly tighter line.
+      final span = min(minBerthGap * (n - 1), x1 - x0);
+      final lo = (x0 + x1) / 2 - span / 2;
+      for (int k = 0; k < n; k++) {
+        out.add(DeckStation(x: lo + span * k / (n - 1), rise: t.rise));
+      }
+    }
+    out.sort((a, b) => a.x.compareTo(b.x));
+    return out;
   }
 
   /// Flips the whole layout across the centreline so a left-firing raft has
@@ -290,6 +538,9 @@ class DeckProfile {
         hullId: p.hullId,
         segments: [
           for (final s in p.segments.reversed) s.mirrored(),
+        ],
+        stations: [
+          for (final s in p.stations.reversed) DeckStation(x: -s.x, rise: s.rise),
         ],
       );
 }
@@ -377,13 +628,50 @@ class RaftLoadout {
 
   double get width => size.width;
 
-  /// Horizontal gap between crew members standing on the deck. Kept well
-  /// inside the hull so even a full crew leaves usable platform space at
-  /// bow and stern (see [DeckProfile.forLoadout]).
-  double get crewSpacing => crewCount <= 1 ? 0 : (width * 0.5) / (crewCount - 1);
+  /// How tall the hull block sits in the water, in world units.
+  ///
+  /// Deliberately *not* a flat fraction of [width]: [RaftHull.thickness] is a
+  /// proportion, so scaling it straight off the beam made the widest hulls
+  /// enormous — a 260-wide galleon came out over a hundred units tall, a
+  /// slab taller than the crew standing on it, which read as a brick rather
+  /// than a boat. Anchoring on a reference beam and letting size nudge it
+  /// keeps a barge visibly bigger than a skiff without the hull swallowing
+  /// the deck structure that is supposed to be the interesting part.
+  static const double _refWidth = 200.0;
+  double get hullHeight =>
+      hull.thickness * _refWidth * (0.85 + 0.15 * width / _refWidth);
 
-  /// Offset of crew [i] from the raft's centre.
-  double crewOffset(int i) => crewCount <= 1 ? 0 : (i - (crewCount - 1) / 2) * crewSpacing;
+  /// Y of the deck surface relative to the waterline (negative = above it).
+  /// The single definition every drawing and physics path shares.
+  double get deckRise => hullHeight * 0.55;
+
+  /// The canonical (right-facing) deck layout for this loadout, including
+  /// where its crew are posted. In a battle a [Raft] builds its own copy
+  /// oriented to its facing; this one serves callers that have a loadout but
+  /// no raft — the customisation preview, and the offsets below.
+  DeckProfile get profile => DeckProfile.forLoadout(this, facing: 1);
+
+  /// Where crew [i] stands, as an offset from the raft's centre.
+  ///
+  /// Berths come from the hull's deck plan, so they follow the structure:
+  /// a galleon crew is spread over its castle, waist and forecastle rather
+  /// than evenly along a line. Falls back to even spacing only if a plan
+  /// somehow posts nobody.
+  double crewOffset(int i) {
+    final st = profile.stations;
+    if (st.isEmpty) return crewCount <= 1 ? 0 : (i - (crewCount - 1) / 2) * crewSpacing;
+    return st[i.clamp(0, st.length - 1)].x;
+  }
+
+  /// Height of the surface crew [i] stands on, above the main deck plane.
+  double crewRise(int i) {
+    final st = profile.stations;
+    if (st.isEmpty) return 0;
+    return st[i.clamp(0, st.length - 1)].rise;
+  }
+
+  /// Even fallback spacing, used only when a hull plan yields no berths.
+  double get crewSpacing => crewCount <= 1 ? 0 : (width * 0.5) / (crewCount - 1);
 
   /// Half the *walkable* deck: the hull side minus a rail margin. Past this
   /// a crew member is over open water.

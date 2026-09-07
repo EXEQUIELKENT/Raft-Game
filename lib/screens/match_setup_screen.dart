@@ -379,6 +379,7 @@ class _MatchSetupScreenState extends State<MatchSetupScreen> {
         PlayerConfig(
           name: 'YOU',
           loadout: seatLoadout(0),
+          look: Cast.byId(save.character).look,
           powerMultiplier: save.powerMultiplier,
         ),
         PlayerConfig(
@@ -391,8 +392,21 @@ class _MatchSetupScreenState extends State<MatchSetupScreen> {
       ];
     } else {
       players = [
-        PlayerConfig(name: 'PLAYER 1', loadout: seatLoadout(0), powerMultiplier: save.powerMultiplier),
-        PlayerConfig(name: 'PLAYER 2', loadout: seatLoadout(1), powerMultiplier: save.powerMultiplier),
+        // Hot-seat: seat one wears the account's chosen character, seat two
+        // gets a visibly different castaway so two players sharing a device
+        // can tell their own crew apart at a glance.
+        PlayerConfig(
+            name: 'PLAYER 1',
+            loadout: seatLoadout(0),
+            look: Cast.byId(save.character).look,
+            powerMultiplier: save.powerMultiplier),
+        PlayerConfig(
+            name: 'PLAYER 2',
+            loadout: seatLoadout(1),
+            look: Cast.byId(save.character).look == CrewLook.drifter
+                ? CrewLook.swimmer
+                : CrewLook.drifter,
+            powerMultiplier: save.powerMultiplier),
       ];
     }
     Navigator.pushReplacement(

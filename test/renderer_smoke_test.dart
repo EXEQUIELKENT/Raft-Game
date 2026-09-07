@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:raft_rumble/game/battle.dart';
+import 'package:raft_rumble/game/characters.dart';
 import 'package:raft_rumble/game/maps.dart';
 import 'package:raft_rumble/game/models.dart';
 import 'package:raft_rumble/game/raft.dart';
@@ -82,10 +83,174 @@ void main() {
     await tester.pump();
   }
 
+
+  testWidgets('every character in the roster paints on a real deck',
+      (tester) async {
+    // The cast grew from five archetypes to a full roster, each with its own
+    // headgear and face marking. Painting one of them proves nothing about
+    // the other fifteen, and an unpainted hat is a crash in a battle.
+    for (final ch in Cast.all) {
+      final world = BattleWorld(map: GameMaps.all.first, seed: 7);
+      world.addRaft(Raft(
+        playerIndex: 0,
+        x: BattleConst.playerX,
+        loadout: loadout(),
+        look: ch.look,
+        label: ch.name,
+        facing: 1,
+        crew: [Crew(hp: 100, maxHp: 100, voice: ch.voice)],
+      ));
+      world.addRaft(Raft(
+        playerIndex: 1,
+        x: BattleConst.enemySlots.first,
+        loadout: loadout(color: 3),
+        look: ch.look,
+        label: ch.name,
+        // Both facings: brims, visors and knots all point with the body.
+        facing: -1,
+        crew: [Crew(hp: 100, maxHp: 100, voice: ch.voice)],
+      ));
+      await paint(tester, world, currentPlayer: 0, isAiming: true);
+      expect(tester.takeException(), isNull, reason: '${ch.id} failed to paint');
+    }
+  });
+
+  testWidgets('every boss projectile paints in flight', (tester) async {
+    // A boss round's silhouette in the air is the only warning the player
+    // gets, so each one has its own drawing path.
+    for (final w in Weapons.boss) {
+      final world = freshWorld();
+      world.shot = Shot(
+        pos: const Offset(420, 200),
+        vel: const Offset(6, -3),
+        weapon: w,
+        owner: 1,
+        firedAt: 0,
+      );
+      world.shot!.trail.addAll(const [Offset(400, 210), Offset(410, 204)]);
+      await paint(tester, world);
+      expect(tester.takeException(), isNull, reason: '${w.id} failed to paint');
+    }
+  });
+
+  testWidgets('status badges, bubbles and body expressions paint clean',
+      (tester) async {
+    for (final effect in StatusEffect.values) {
+      final world = freshWorld();
+      final crew = world.raftOf(0)!.crew;
+      crew[0].afflict(effect, 1);
+      crew[0].say(effect.bubble);
+      // Fresh-hit flash and the ongoing badge are different draw paths.
+      crew[1].afflict(effect, 1);
+      crew[1].statusFlash = 0;
+      await paint(tester, world, currentPlayer: 0, isAiming: true);
+      expect(tester.takeException(), isNull, reason: '$effect failed to paint');
+    }
+  });
+
+  testWidgets('a crew mid-expression paints in every idle activity',
+      (tester) async {
+    // Expressions now move the whole body — hips, lean, free arm — which is
+    // a lot more geometry than a mouth shape, and the free arm competes with
+    // the weapon grip IK for the same limb.
+    for (final idle in CrewIdle.values) {
+      final world = freshWorld();
+      for (final r in world.rafts) {
+        for (final c in r.crew) {
+          c.idle = idle;
+          c.idleDur = 2;
+          c.idleT = 1;
+        }
+      }
+      // Once idle-only, once with the shooter aiming, because the raised
+      // arm is suppressed mid-aim and that is a separate branch.
+      await paint(tester, world);
+      expect(tester.takeException(), isNull, reason: '$idle failed to paint');
+      await paint(tester, world, currentPlayer: 0, isAiming: true);
+      expect(tester.takeException(), isNull,
+          reason: '$idle failed to paint while aiming');
+    }
+  });
+
+  testWidgets('a gloating and a wincing crew both paint', (tester) async {
+    final world = freshWorld();
+    world.raftOf(0)!.crew[0].gloatT = BattleConst.gloatTime;
+    world.raftOf(0)!.crew[1].hitReactT = BattleConst.hitReactTime;
+    world.raftOf(1)!.crew[0].hp = 8; // the low-health slump
+    await paint(tester, world, currentPlayer: 0, isAiming: false);
+    expect(tester.takeException(), isNull);
+  });
   testWidgets('idle crews, rafts and scenery paint clean', (tester) async {
     final world = freshWorld();
     await paint(tester, world);
     expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('every hull, at every size and facing, paints clean', (tester) async {
+    // Each hull now builds its own multi-level deck with its own furniture
+    // (lashings, barrel ends, castle railings, roped crates) and its own
+    // waterline detail. Painting one hull proves none of that.
+    for (final hull in RaftHull.all) {
+      for (final size in RaftSize.all) {
+        final world = BattleWorld(map: GameMaps.all.first, seed: 5);
+        for (int p = 0; p < 2; p++) {
+          final lo = RaftLoadout.custom(
+              hullId: hull.id, sizeId: size.id, colorIndex: p);
+          world.addRaft(Raft(
+            playerIndex: p,
+            x: p == 0 ? BattleConst.playerX : BattleConst.enemySlots.first,
+            loadout: lo,
+            look: p == 0 ? CrewLook.player : CrewLook.pirate,
+            label: 'R$p',
+            facing: p == 0 ? 1 : -1,
+            crew: [
+              for (int k = 0; k < lo.crewCount; k++)
+                Crew(hp: 100, maxHp: 100, bobPhase: k * 0.7),
+            ],
+          ));
+        }
+        await paint(tester, world, currentPlayer: 0, isAiming: true);
+        expect(tester.takeException(), isNull,
+            reason: '${hull.id}/${size.id} should paint without throwing');
+      }
+    }
+  });
+
+  testWidgets('every firearm model paints clean, in hand and firing', (tester) async {
+    // Each caliber has its own hardware — scope, vented shroud, revolver
+    // cylinder, winch crank, bipod, box magazine — and its own grip. Paint
+    // all of them, idle and mid-recoil.
+    for (final weapon in Weapons.all) {
+      for (final firing in [false, true]) {
+        final world = freshWorld();
+        final shooter = world.raftOf(0)!;
+        for (final c in shooter.crew) {
+          c.equipInstant(weapon.id);
+        }
+        if (firing) {
+          // A live shot from this raft puts the shooter in the recoil window,
+          // which is what animates pumps, crank wheels and muzzle flash.
+          world.fire(
+            from: shooter.muzzle(weapon: weapon),
+            angleDeg: 45,
+            power: 70,
+            facing: shooter.facing,
+            weapon: weapon,
+            owner: 0,
+          );
+        }
+        await tester.pumpWidget(
+          CustomPaint(
+            size: const ui.Size(870, 422),
+            painter: _RendererPainter(_battle(world),
+                currentPlayer: 0, isAiming: true),
+          ),
+        );
+        await tester.pump();
+        expect(tester.takeException(), isNull,
+            reason: '${weapon.id} should paint (firing: $firing)');
+      }
+    }
   });
 
   testWidgets('a live ragdoll, its get-up and the walk home all paint clean', (tester) async {

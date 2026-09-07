@@ -9,6 +9,7 @@ import 'characters_screen.dart';
 import 'maps_screen.dart';
 import 'match_setup_screen.dart';
 import 'hotspot_screen.dart';
+import 'online_screen.dart';
 import 'settings_screen.dart';
 import 'stats_screen.dart';
 
@@ -130,6 +131,8 @@ class _MainMenuScreenState extends State<MainMenuScreen> with TickerProviderStat
                                       () => _tap(() => Navigator.push(context, MaterialPageRoute(builder: (_) => const MatchSetupScreen(mode: 'local'))))),
                                   _secondaryBtn('HOTSPOT', Icons.wifi_tethering,
                                       () => _tap(() => Navigator.push(context, MaterialPageRoute(builder: (_) => const HotspotScreen())))),
+                                  _secondaryBtn('ONLINE', Icons.public,
+                                      () => _tap(() => Navigator.push(context, MaterialPageRoute(builder: (_) => const OnlineScreen())))),
                                 ],
                               ),
                               const SizedBox(height: 18),
