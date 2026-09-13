@@ -75,6 +75,7 @@ class WorldRenderer {
     _drawClouds(canvas, time);
     _drawProps(canvas, time);
     _drawWater(canvas, time);
+    _drawObstacles(canvas, time);
     _drawRafts(
       canvas, time,
       currentPlayer: currentPlayer,
@@ -125,16 +126,47 @@ class WorldRenderer {
   // Sky / water
   // ---------------------------------------------------------------------------
 
+  /// How far past a raft's own hull anything attached to it can reach: a
+  /// sprawled ragdoll, a flag, a speech bubble.
+  static const double _raftCullMargin = 170;
+
+  /// True when something [halfWidth] wide centred on [x] touches the camera
+  /// window at all. The one place visibility is decided, so every culled
+  /// thing uses the same margin logic.
+  bool _visible(double x, double halfWidth) =>
+      x + halfWidth >= world.cam - 8 &&
+      x - halfWidth <= world.cam + world.viewWidth + 8;
+
+  /// The sky and water gradients, built once.
+  ///
+  /// Both were rebuilt from scratch every frame. They are vertical gradients
+  /// over a fixed band of the world — sky from 0 to the waterline, water from
+  /// there to the bottom — so the colour at any pixel depends only on its y.
+  /// Panning the camera cannot change them, which is why the shader can be
+  /// built for a fixed rect and reused however far the view has scrolled.
+  Paint? _skyPaint;
+  Paint? _waterPaint;
+
+  Paint _bandPaint(Paint? cached, double top, double bottom, List<Color> colors,
+      void Function(Paint) store) {
+    if (cached != null) return cached;
+    final rect = Rect.fromLTWH(0, top, 1, bottom - top);
+    final p = Paint()
+      ..shader = LinearGradient(
+        begin: Alignment.topCenter,
+        end: Alignment.bottomCenter,
+        colors: colors,
+      ).createShader(rect);
+    store(p);
+    return p;
+  }
+
   void _drawSky(Canvas canvas, double time) {
     final rect = Rect.fromLTWH(world.cam - 40, 0, world.viewWidth + 80, BattleConst.waterY + 4);
     canvas.drawRect(
       rect,
-      Paint()
-        ..shader = LinearGradient(
-          begin: Alignment.topCenter,
-          end: Alignment.bottomCenter,
-          colors: map.sky,
-        ).createShader(rect),
+      _bandPaint(_skyPaint, 0, BattleConst.waterY + 4, map.sky,
+          (p) => _skyPaint = p),
     );
   }
 
@@ -142,6 +174,7 @@ class WorldRenderer {
     for (final c in _clouds) {
       // Slow horizontal drift, wrapped so clouds never run out.
       final x = (c.x + time * c.speed) % (BattleConst.worldW + 400) - 200;
+      if (!_visible(x + c.w * 0.5, c.w)) continue;
       final paint = Paint()..color = Colors.white.withOpacity(c.opacity);
       final h = c.w * 0.34;
       canvas.drawRRect(
@@ -161,42 +194,366 @@ class WorldRenderer {
     }
   }
 
-  void _drawWater(Canvas canvas, double time) {
-    final top = BattleConst.waterY;
-    final rect = Rect.fromLTWH(world.cam - 40, top, world.viewWidth + 80, BattleConst.worldH - top);
+
+  /// The solid obstacles floating in the channel.
+  ///
+  /// Every kind is drawn to fill its own collision box exactly — the box is
+  /// what the physics uses, and a player judging an arc has to be looking at
+  /// the same shape the shot will hit. Anything that overhangs the box would
+  /// be a lie about where the hazard is.
+  void _drawObstacles(Canvas canvas, double time) {
+    for (final o in world.obstacles) {
+      if (o.broken) continue;
+      if (!_visible(o.pos.dx, o.halfW + 12)) continue;
+      final r = o.rect;
+
+      canvas.save();
+      canvas.translate(o.pos.dx, o.pos.dy);
+      // Floating kinds lean with the swell; anchored ones sit dead still.
+      if (o.kind == ObstacleKind.buoy || o.kind == ObstacleKind.crate) {
+        canvas.rotate(sin(time * 1.3 + o.bobPhase) * 0.05);
+      }
+      // Being hit shakes it. A shot now ricochets off rather than bursting,
+      // so an obstacle can be struck several times in quick succession —
+      // the old response was a bright white overlay on the whole box, which
+      // at that rate reads as flicker rather than as impact. A solid thing
+      // that gets hit should move, not light up.
+      if (o.struckT > 0) {
+        final k = (o.struckT / BattleConst.obstacleStruckTime).clamp(0.0, 1.0);
+        canvas.translate(sin(o.struckT * 90) * 3.2 * k, 0);
+      }
+      canvas.translate(-o.pos.dx, -o.pos.dy);
+
+      switch (o.kind) {
+        case ObstacleKind.rock:
+          _obstacleRock(canvas, r, map.stone, map.stoneShade);
+        case ObstacleKind.iceberg:
+          // Ice is the one material that does not take the scene's stone
+          // colour: an iceberg IS the frozen scene, and tinting it to match
+          // the rock beside it would make the two indistinguishable.
+          _obstacleRock(canvas, r, const Color(0xFFD6EEF6), const Color(0xFF9EC9DA));
+        case ObstacleKind.wreck:
+          _obstacleWreck(canvas, r, map.timber, map.timberShade);
+        case ObstacleKind.buoy:
+          _obstacleBuoy(canvas, r, o);
+        case ObstacleKind.crate:
+          _obstacleCrate(canvas, r, map.timber, map.timberShade);
+        case ObstacleKind.mast:
+          _obstacleMast(canvas, r, time, o, map.timber, map.timberShade);
+      }
+
+      // Damage: a breakable obstacle cracks open as it takes hits, so you
+      // can see how much more it will stand before the line opens up.
+      if (o.destructible && o.wear > 0) {
+        final crack = Paint()
+          ..color = const Color(0xFF2A2520).withOpacity(0.25 + o.wear * 0.5)
+          ..strokeWidth = 1.6 + o.wear * 1.6
+          ..style = PaintingStyle.stroke;
+        final steps = 1 + (o.wear * 3).round();
+        for (int i = 0; i < steps; i++) {
+          final y = r.top + r.height * (i + 1) / (steps + 1);
+          canvas.drawLine(
+            Offset(r.left + 2, y),
+            Offset(r.right - 2, y + (i.isEven ? 3 : -3)),
+            crack,
+          );
+        }
+      }
+
+      canvas.restore();
+    }
+  }
+
+  /// A lumpy solid: three overlapping humps clipped to the box.
+  void _obstacleRock(Canvas canvas, Rect r, Color top, Color shade) {
+    canvas.save();
+    canvas.clipRect(r);
+    final body = Path()
+      ..moveTo(r.left, r.bottom)
+      ..lineTo(r.left + r.width * 0.16, r.top + r.height * 0.34)
+      ..lineTo(r.left + r.width * 0.42, r.top)
+      ..lineTo(r.left + r.width * 0.68, r.top + r.height * 0.26)
+      ..lineTo(r.right, r.top + r.height * 0.5)
+      ..lineTo(r.right, r.bottom)
+      ..close();
+    canvas.drawPath(body, Paint()..color = top);
+    // Shaded right flank, so it reads as solid rather than as a cut-out.
+    final side = Path()
+      ..moveTo(r.left + r.width * 0.68, r.top + r.height * 0.26)
+      ..lineTo(r.right, r.top + r.height * 0.5)
+      ..lineTo(r.right, r.bottom)
+      ..lineTo(r.left + r.width * 0.62, r.bottom)
+      ..close();
+    canvas.drawPath(side, Paint()..color = shade);
+    canvas.restore();
+  }
+
+  /// A half-sunk hull: a low dark slab with a broken rib or two.
+  void _obstacleWreck(Canvas canvas, Rect r, Color wood, Color shade) {
+    canvas.save();
+    canvas.clipRect(r);
+    final hull = Path()
+      ..moveTo(r.left, r.bottom)
+      ..lineTo(r.left + r.width * 0.1, r.top + r.height * 0.35)
+      ..lineTo(r.right - r.width * 0.14, r.top + r.height * 0.2)
+      ..lineTo(r.right, r.bottom)
+      ..close();
+    canvas.drawPath(hull, Paint()..color = wood);
+    final rib = Paint()
+      ..color = shade
+      ..strokeWidth = 3
+      ..strokeCap = StrokeCap.round;
+    for (int i = 1; i <= 3; i++) {
+      final x = r.left + r.width * (i / 4);
+      canvas.drawLine(Offset(x, r.bottom), Offset(x - 3, r.top + r.height * 0.3), rib);
+    }
+    canvas.restore();
+  }
+
+  /// A channel marker: a tall float with a band and a little lamp.
+  void _obstacleBuoy(Canvas canvas, Rect r, Obstacle o) {
+    canvas.save();
+    canvas.clipRect(r);
+    final body = RRect.fromRectAndRadius(
+      Rect.fromLTRB(r.left, r.top + r.height * 0.22, r.right, r.bottom),
+      const Radius.circular(5),
+    );
+    canvas.drawRRect(body, Paint()..color = const Color(0xFFE0522C));
     canvas.drawRect(
-      rect,
-      Paint()
-        ..shader = LinearGradient(
-          begin: Alignment.topCenter,
-          end: Alignment.bottomCenter,
-          colors: [map.water, map.waterDeep],
-        ).createShader(rect),
+      Rect.fromLTRB(r.left, r.top + r.height * 0.55, r.right, r.top + r.height * 0.72),
+      Paint()..color = const Color(0xFFF6E9D8),
+    );
+    // Mast and lamp on top.
+    canvas.drawRect(
+      Rect.fromLTRB(r.center.dx - 1.6, r.top + r.height * 0.08,
+          r.center.dx + 1.6, r.top + r.height * 0.26),
+      Paint()..color = const Color(0xFF43403B),
+    );
+    canvas.drawCircle(Offset(r.center.dx, r.top + r.height * 0.06), 4,
+        Paint()..color = const Color(0xFFFFC94D));
+    canvas.restore();
+  }
+
+  /// A lashed cargo crate: planks, a cross-brace and a rope band.
+  void _obstacleCrate(Canvas canvas, Rect r, Color wood, Color shade) {
+    canvas.save();
+    canvas.clipRect(r);
+    canvas.drawRect(r, Paint()..color = wood);
+    final line = Paint()
+      ..color = shade
+      ..strokeWidth = 2.4;
+    canvas.drawLine(r.topLeft, r.bottomRight, line);
+    canvas.drawLine(r.topRight, r.bottomLeft, line);
+    canvas.drawRect(
+      Rect.fromLTRB(r.left, r.top + 3, r.right, r.top + 9),
+      Paint()..color = shade,
+    );
+    canvas.drawRect(
+      Rect.fromLTRB(r.left, r.bottom - 9, r.right, r.bottom - 3),
+      Paint()..color = shade,
+    );
+    canvas.restore();
+  }
+
+  /// A broken mast standing out of the water, with a tattered pennant.
+  void _obstacleMast(Canvas canvas, Rect r, double time, Obstacle o,
+      Color wood, Color shade) {
+    canvas.save();
+    canvas.clipRect(r);
+    canvas.drawRect(r, Paint()..color = shade);
+    canvas.drawRect(
+      Rect.fromLTRB(r.left, r.top, r.left + r.width * 0.42, r.bottom),
+      Paint()..color = wood,
+    );
+    // Cross-spar, so the silhouette reads as a mast and not a post.
+    final sparY = r.top + r.height * 0.18;
+    canvas.drawRect(
+      Rect.fromLTRB(r.left - 14, sparY, r.right + 14, sparY + 4),
+      Paint()..color = shade,
+    );
+    canvas.restore();
+    // The pennant is allowed outside the box: it is cloth, it is obviously
+    // not solid, and nothing about it invites you to aim at it.
+    final wave = sin(time * 3 + o.bobPhase) * 3;
+    final flag = Path()
+      ..moveTo(r.right, r.top + 4)
+      ..lineTo(r.right + 20, r.top + 8 + wave)
+      ..lineTo(r.right, r.top + 14);
+    canvas.drawPath(flag, Paint()..color = const Color(0xFFD9433C));
+  }
+  /// The sea, following whatever terraces this match was built with.
+  ///
+  /// Sampled along x rather than drawn as one rectangle, because the surface
+  /// is no longer a straight line: a match can put one raft a good drop above
+  /// the other, joined by a falls. Sampling is also what keeps the drawn
+  /// surface and the simulated one honest with each other — both read the
+  /// same [BattleWorld.waterAt], so a shot splashes down exactly where the
+  /// water looks like it is.
+  void _drawWater(Canvas canvas, double time) {
+    final startX = world.cam - 40;
+    final endX = startX + world.viewWidth + 80;
+    // Gradient band measured from the HIGHEST water in the world, so the
+    // same paint covers every terrace and the deep colour still lands at the
+    // bottom of the world.
+    final gradTop = BattleConst.waterY - world.water.maxRise;
+
+    final body = Path()..moveTo(startX, BattleConst.worldH);
+    for (double x = startX; x <= endX; x += 6) {
+      body.lineTo(x, world.waterAt(x));
+    }
+    body
+      ..lineTo(endX, world.waterAt(endX))
+      ..lineTo(endX, BattleConst.worldH)
+      ..close();
+    canvas.drawPath(
+      body,
+      _bandPaint(_waterPaint, gradTop, BattleConst.worldH,
+          [map.water, map.waterDeep], (p) => _waterPaint = p),
     );
 
-    // Two offset wave lines along the surface for a bit of motion.
+    // The falls themselves, before the surface foam so the foam caps them.
+    for (final step in world.water.steps) {
+      if (step.right < startX - 40 || step.left > endX + 40) continue;
+      _falls(canvas, step, time);
+    }
+
+    // Two offset wave lines along the surface for a bit of motion. They
+    // ride the terraces too — a flat highlight across a stepped sea would
+    // read as a seam.
     for (int layer = 0; layer < 2; layer++) {
       final path = Path();
       final amp = (layer == 0 ? 3.4 : 2.2) * map.chop;
-      final yBase = top + (layer == 0 ? 2.0 : 9.0);
+      final drop = layer == 0 ? 2.0 : 9.0;
       final speed = layer == 0 ? 34.0 : -22.0;
-      final startX = world.cam - 40;
-      path.moveTo(startX, yBase);
-      for (double x = startX; x <= startX + world.viewWidth + 80; x += 14) {
-        final y = yBase + sin((x + time * speed) / 46 + layer) * amp;
+      path.moveTo(startX, world.waterAt(startX) + drop);
+      for (double x = startX; x <= endX; x += 14) {
+        final y = world.waterAt(x) +
+            drop +
+            sin((x + time * speed) / 46 + layer) * amp;
         path.lineTo(x, y);
       }
-      path.lineTo(startX + world.viewWidth + 80, top + 26);
-      path.lineTo(startX, top + 26);
+      for (double x = endX; x >= startX; x -= 14) {
+        path.lineTo(x, world.waterAt(x) + 26);
+      }
       path.close();
-      canvas.drawPath(path, Paint()..color = Colors.white.withOpacity(layer == 0 ? 0.22 : 0.12));
+      canvas.drawPath(
+        path,
+        Paint()..color = Colors.white.withOpacity(layer == 0 ? 0.22 : 0.12),
+      );
     }
+  }
+
+  /// A waterfall joining two terraces.
+  ///
+  /// The surface itself is a slope, because that is what the simulation
+  /// uses — everything that touches the water reads the same
+  /// [BattleWorld.waterAt], and a drawn sheer drop over a simulated ramp
+  /// would be a lie about where the water is. So this is drawn as a chute:
+  /// aerated water in the channel, a band of white water hugging the slope,
+  /// streaks running down it, and churn where it lands.
+  ///
+  /// Which way the streaks run is the useful part. It tells you at a glance
+  /// which side is the high one, and that is the single most important thing
+  /// about the map — every shot in the match has to account for it.
+  void _falls(Canvas canvas, WaterStep step, double time) {
+    final leftY = world.waterAt(step.left - 1);
+    final rightY = world.waterAt(step.right + 1);
+    // Smaller y is higher water.
+    if ((leftY - rightY).abs() < 1) return;
+    final downhillRight = leftY < rightY;
+    final botY = max(leftY, rightY);
+
+    /// The surface across the falls, as a path.
+    Path slopePath() {
+      final p = Path()..moveTo(step.left, world.waterAt(step.left));
+      for (double x = step.left; x <= step.right; x += 3) {
+        p.lineTo(x, world.waterAt(x));
+      }
+      return p;
+    }
+
+    // The chute is NOT filled with a pale wash. That was the obvious thing
+    // to try and it looked wrong: a flat translucent white over the whole
+    // drop is a large uniform area with hard vertical edges where it meets
+    // the ordinary water, so it read as a pane of glass laid over the sea
+    // rather than as moving water. The band, the streaks and the churn below
+    // carry it on their own, and the water beneath them is just water.
+
+    // 2. The white water itself: a soft band riding the slope. Two passes,
+    //    a wide faint one under a narrow bright one, so it has an edge
+    //    without a hard outline.
+    for (final (width, alpha) in [(9.0, 0.30), (4.5, 0.72)]) {
+      canvas.drawPath(
+        slopePath(),
+        Paint()
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = width
+          ..strokeJoin = StrokeJoin.round
+          ..strokeCap = StrokeCap.round
+          ..color = Colors.white.withOpacity(alpha),
+      );
+    }
+
+    // 3. Streaks running DOWNHILL, scrolling, fading out as they go. Short
+    //    tangent segments rather than vertical ticks: vertical ones read as
+    //    a fence across the water.
+    const n = 9;
+    for (int i = 0; i < n; i++) {
+      final u = ((i / n) + time * 0.45) % 1.0;
+      final along = downhillRight ? u : 1 - u;
+      final x = step.left + step.width * along;
+      final y = world.waterAt(x);
+      // Tangent to the surface here, pointing downhill.
+      final ahead = downhillRight ? 7.0 : -7.0;
+      final y2 = world.waterAt(x + ahead);
+      final fade = sin(pi * u);
+      canvas.drawLine(
+        Offset(x, y + 1.5),
+        Offset(x + ahead * 1.6, y2 + 5.5),
+        Paint()
+          ..color = Colors.white.withOpacity(0.55 * fade)
+          ..strokeWidth = 1.8 + (i % 3) * 0.7
+          ..strokeCap = StrokeCap.round,
+      );
+    }
+
+    // 4. Churn at the foot: soft blobs on the lower terrace, drifting away
+    //    from the base of the chute and fading.
+    final footX = downhillRight ? step.right : step.left;
+    final drift = downhillRight ? 1.0 : -1.0;
+    for (int i = 0; i < 7; i++) {
+      final u = ((time * 0.5) + i / 7) % 1.0;
+      final fade = (1 - u) * (1 - u);
+      canvas.drawCircle(
+        Offset(
+          footX + drift * u * 52,
+          botY + 2.5 + sin(time * 3.4 + i * 1.7) * 1.8,
+        ),
+        (2.0 + (i % 3) * 1.4) * (0.4 + fade),
+        Paint()..color = Colors.white.withOpacity(0.5 * fade + 0.08),
+      );
+    }
+
+    // 5. The lip: a bright line right at the top of the drop, which is what
+    //    makes the edge read as an edge rather than as a gradient.
+    final lipX = downhillRight ? step.left : step.right;
+    canvas.drawLine(
+      Offset(lipX - 10, world.waterAt(lipX) + 1),
+      Offset(lipX + 10, world.waterAt(lipX) + 1),
+      Paint()
+        ..color = Colors.white.withOpacity(0.8)
+        ..strokeWidth = 2.6
+        ..strokeCap = StrokeCap.round,
+    );
   }
 
   void _drawProps(Canvas canvas, double time) {
     for (final p in _props) {
+      // Scenery is scattered across the whole 3210-wide world; only a
+      // fraction of it is ever in shot.
+      if (!_visible(p.x, 120 * p.scale)) continue;
       canvas.save();
-      canvas.translate(p.x, BattleConst.waterY);
+      canvas.translate(p.x, world.waterAt(p.x));
       canvas.scale(p.scale);
       switch (p.kind) {
         case SceneProp.palm:
@@ -359,7 +716,25 @@ class WorldRenderer {
     required double aimAngleDeg,
     required WeaponDef? weapon,
   }) {
+    raftsDrawn = 0;
     for (final raft in world.rafts) {
+      // Cull rafts outside the visible window.
+      //
+      // The rafts sit at x = 210 and 1500..2700 across a 3210-wide world,
+      // while the camera window is only about 870 across — so for most of a
+      // match three of the four rafts are entirely off screen. Every one of
+      // them was still being drawn in full: hull, deck platforms, rigging,
+      // and every crew member aboard with their articulated limbs, face,
+      // health bar and speech bubble. That was the single largest waste in
+      // the frame, and it was being paid every frame of every match.
+      //
+      // The margin is deliberately generous — a knocked body sprawls well
+      // past its raft, and bubbles and status badges sit above it — so
+      // nothing pops in at the edge of the view.
+      if (!_visible(raft.x, raft.loadout.width * 0.5 + _raftCullMargin)) {
+        continue;
+      }
+      raftsDrawn++;
       final bob = world.bobOf(raft);
       canvas.save();
       canvas.translate(raft.x, bob);
@@ -402,13 +777,25 @@ class WorldRenderer {
         // body is actually in the water (see BattleWorld's body stepper).
         // The fade layer covers the whole body in whatever pose it died.
         Rect bodyBounds = const Rect.fromLTWH(-130, -150, 260, 230);
+        // A layer is only needed while the body is actually translucent, or
+        // while the killing-blow flash is compositing over it — both of which
+        // are short. It used to be taken for every dead crew member on every
+        // frame for as long as the body existed, and saveLayer allocates an
+        // offscreen render target the size of the whole body: with a couple
+        // of bodies down that is several full-size buffers per frame, which
+        // is a large part of why the frame rate fell over the moment shots
+        // started landing.
+        final fading = _sinkOpacity(c.sinkT) < 0.995 || c.deathFlash > 0;
         if (!c.alive) {
           if (pose != null) bodyBounds = pose.drawBounds;
           canvas.translate(0, _sinkDrop(c));
-          canvas.saveLayer(
-            bodyBounds.inflate(30),
-            Paint()..color = Colors.white.withOpacity(_sinkOpacity(c.sinkT)),
-          );
+          if (fading) {
+            bodyLayers++;
+            canvas.saveLayer(
+              bodyBounds.inflate(30),
+              Paint()..color = Colors.white.withOpacity(_sinkOpacity(c.sinkT)),
+            );
+          }
         }
         _crewMember(
           canvas, raft, c, i, time,
@@ -419,8 +806,9 @@ class WorldRenderer {
         );
         if (!c.alive) {
           // Killing-blow flash: a beat of pure white over the whole body,
-          // blended onto what was just drawn.
-          if (c.deathFlash > 0) {
+          // blended onto what was just drawn. srcATop needs the layer to
+          // clip it to the body, so it only draws when one was taken.
+          if (c.deathFlash > 0 && fading) {
             final f = (c.deathFlash / BattleConst.deathFlashTime).clamp(0.0, 1.0);
             canvas.drawRect(
               bodyBounds.inflate(30),
@@ -430,7 +818,7 @@ class WorldRenderer {
             );
           }
           _deathFx(canvas, c, time);
-          canvas.restore();
+          if (fading) canvas.restore();
         } else if (c.hpBarT > 0) {
           // Dynamic health bar: hidden by default, summoned by damage, and
           // gone again once its animation finishes.
@@ -510,6 +898,47 @@ class WorldRenderer {
   /// quick fade-in, a red ghost bar drains from the HP the character *had*
   /// down to the live value, and the whole thing fades out once the drain
   /// completes.
+  /// Laid-out text, reused across frames.
+  ///
+  /// Every entry costs one text shaping pass; without this the crew's speech
+  /// bubbles and the raft name plates re-shaped their strings on every single
+  /// frame. Opacity is quantised to sixteenths so a fading bubble reuses one
+  /// of a handful of painters rather than forcing a fresh layout per frame.
+  final Map<String, TextPainter> _textCache = {};
+
+  TextPainter _text(
+    String text, {
+    required double size,
+    required Color color,
+    double alpha = 1,
+    FontWeight weight = FontWeight.w800,
+    double letterSpacing = 0,
+    double maxWidth = double.infinity,
+  }) {
+    final bucket = (alpha.clamp(0.0, 1.0) * 16).round();
+    final key = '$text|$size|${color.value}|$bucket|${weight.index}|$letterSpacing';
+    final hit = _textCache[key];
+    if (hit != null) return hit;
+    // A battle only ever has a handful of distinct lines on screen, but the
+    // cache is bounded anyway so a long match can never grow it without end.
+    if (_textCache.length > 64) _textCache.clear();
+    textLayouts++;
+    final tp = TextPainter(
+      text: TextSpan(
+        text: text,
+        style: RT.body(
+          size: size,
+          color: color.withOpacity(bucket / 16),
+          weight: weight,
+          letterSpacing: letterSpacing,
+        ),
+      ),
+      textDirection: TextDirection.ltr,
+    )..layout(maxWidth: maxWidth);
+    _textCache[key] = tp;
+    return tp;
+  }
+
   /// A crew member's speech bubble.
   ///
   /// Deliberately small and quiet. Four rafts of two or three crew each can
@@ -535,18 +964,21 @@ class WorldRenderer {
     // Above the status badge when both are showing, so they never overlap.
     final y = headTop - (c.afflicted ? 44 : 28);
 
-    final tp = TextPainter(
-      text: TextSpan(
-        text: text,
-        style: RT.body(
-          size: 9,
-          color: RT.ink.withOpacity(alpha),
-          weight: FontWeight.w800,
-          letterSpacing: 0.2,
-        ),
-      ),
-      textDirection: TextDirection.ltr,
-    )..layout(maxWidth: 96);
+    // Laying text out means shaping it, which is expensive — and a bubble
+    // fires on every hit, for every crew member hit plus the shooter
+    // gloating, then redraws for a second and a half. Building a fresh
+    // TextPainter every frame for each of those was a measurable share of
+    // the stutter when shots landed. The cache quantises the fade so a line
+    // is shaped a handful of times instead of ninety.
+    final tp = _text(
+      text,
+      size: 9,
+      color: RT.ink,
+      alpha: alpha,
+      weight: FontWeight.w800,
+      letterSpacing: 0.2,
+      maxWidth: 96,
+    );
 
     final w = tp.width + 12;
     final h = tp.height + 7;
@@ -707,7 +1139,7 @@ class WorldRenderer {
     final t = (time * 0.55 + raft.x * 0.01) % 1.0;
     canvas.drawOval(
       Rect.fromCenter(
-        center: Offset(0, BattleConst.waterY + 4),
+        center: Offset(0, raft.waterLine + 4),
         width: w * (0.75 + t * 0.5),
         height: 13 * (0.75 + t * 0.5),
       ),
@@ -715,19 +1147,123 @@ class WorldRenderer {
     );
   }
 
+  /// The hull's outline, as an actual path.
+  ///
+  /// Every hull used to be one rounded rectangle with different trim painted
+  /// over it, so the fleet read as a single shape in five colours no matter
+  /// how much detail went on top. At raft scale the silhouette is what you
+  /// recognise a boat by, so this is where the hulls are actually made
+  /// different: a ring, a bundle of logs, a plank deck on floats, a boat with
+  /// a raked stem and a transom, and a tall ship with a high stern quarter.
+  ///
+  /// [bow] is +1 when the raft faces right, so stems and transoms end up on
+  /// the correct ends.
+  Path _hullPath(RaftLoadout lo, double w, double h, double top, double bow) {
+    final half = w / 2;
+    final bot = top + h;
+    final p = Path();
+
+    switch (lo.hull.shape) {
+      case HullShape.ring:
+        // A fat inflatable: fully rounded ends, belly sagging into the water.
+        p.addRRect(RRect.fromRectAndRadius(
+          Rect.fromLTWH(-half, top, w, h),
+          Radius.circular(h * 0.5),
+        ));
+        break;
+
+      case HullShape.logs:
+        // Round logs side by side: flat on top, scalloped underneath, and
+        // the outer logs poking past the deck at both ends.
+        final logs = max(4, (w / 26).round());
+        final r = w / logs / 2;
+        p.moveTo(-half - r * 0.5, top);
+        p.lineTo(half + r * 0.5, top);
+        p.lineTo(half + r * 0.5, top + h * 0.35);
+        for (int i = logs - 1; i >= 0; i--) {
+          final cx = -half + r + i * r * 2;
+          p.arcToPoint(
+            Offset(cx - r, top + h * 0.35),
+            radius: Radius.circular(r),
+            clockwise: true,
+          );
+        }
+        p.lineTo(-half - r * 0.5, top + h * 0.35);
+        p.close();
+        break;
+
+      case HullShape.pontoon:
+        // A flat plank deck riding clear of the water on two round floats.
+        final deckH = h * 0.42;
+        p.addRRect(RRect.fromRectAndRadius(
+          Rect.fromLTWH(-half, top, w, deckH),
+          const Radius.circular(3),
+        ));
+        final floatR = (h - deckH) * 0.5;
+        for (final s in [-1.0, 1.0]) {
+          p.addRRect(RRect.fromRectAndRadius(
+            Rect.fromLTWH(s * (half - w * 0.34) - w * 0.16, top + deckH,
+                w * 0.32, floatR * 2),
+            Radius.circular(floatR),
+          ));
+        }
+        break;
+
+      case HullShape.boat:
+        // A proper little boat: raked stem forward, square transom aft, and
+        // a sheer line that rises toward the bow.
+        final stem = bow * half;
+        final stern = -bow * half;
+        p.moveTo(stern, top + h * 0.12);
+        // Sheer along the deck, lifting toward the bow.
+        p.quadraticBezierTo(0, top - h * 0.06, stem, top - h * 0.1);
+        // Raked stem down to the forefoot.
+        p.quadraticBezierTo(
+            stem + bow * h * 0.16, top + h * 0.42, stem - bow * h * 0.1, bot);
+        // Flat-ish keel.
+        p.lineTo(stern + bow * h * 0.22, bot);
+        // Transom.
+        p.lineTo(stern, top + h * 0.12);
+        p.close();
+        break;
+
+      case HullShape.carrack:
+        // A tall ship: high stern castle quarter, tumblehome amidships, a
+        // rounded forefoot and a sternpost standing proud of the deck.
+        final stem = bow * half;
+        final stern = -bow * half;
+        p.moveTo(stern - bow * h * 0.06, top - h * 0.26);
+        // Stern quarter drops to the deck line.
+        p.lineTo(stern + bow * h * 0.10, top - h * 0.02);
+        p.quadraticBezierTo(0, top - h * 0.10, stem, top - h * 0.02);
+        // Bow: rounded forefoot rather than a knife stem.
+        p.quadraticBezierTo(
+            stem + bow * h * 0.2, top + h * 0.5, stem - bow * h * 0.14, bot);
+        p.lineTo(stern + bow * h * 0.26, bot);
+        // Sternpost back up, kicked out past the deck.
+        p.quadraticBezierTo(stern - bow * h * 0.14, top + h * 0.55,
+            stern - bow * h * 0.06, top - h * 0.26);
+        p.close();
+        break;
+    }
+    return p;
+  }
   void _hull(Canvas canvas, Raft raft) {
     final lo = raft.loadout;
     final w = lo.width;
     final h = lo.hullHeight;
-    final top = BattleConst.waterY - h * 0.55;
-    final rect = Rect.fromLTWH(-w / 2, top, w, h);
+    final top = raft.waterLine - h * 0.55;
     final radius = Radius.circular(h * lo.hull.rounding.clamp(0.0, 1.0) * 0.5 + 3);
 
-    canvas.drawRRect(
-      RRect.fromRectAndRadius(rect, radius),
-      Paint()..color = lo.color,
-    );
-    // Inner shade along the bottom, matching the mockup's inset shadow.
+    // The hull's own outline — see [_hullPath]. Every hull used to be this
+    // same rounded rectangle, which is why the fleet read as one shape in
+    // five colours however much trim was painted on afterwards.
+    final body = _hullPath(lo, w, h, top, raft.facing.toDouble());
+    canvas.drawPath(body, Paint()..color = lo.color);
+    // Inner shade along the bottom, clipped to the hull so the shading
+    // follows whatever silhouette this hull actually has.
+    canvas.save();
+    canvas.clipPath(body);
     canvas.drawRRect(
       RRect.fromRectAndRadius(
         Rect.fromLTWH(-w / 2, top + h * 0.58, w, h * 0.42),
@@ -735,6 +1271,7 @@ class WorldRenderer {
       ),
       Paint()..color = Colors.black.withOpacity(0.14),
     );
+    canvas.restore();
     // Plank seam on timber-style hulls.
     if (lo.hull.rounding < 0.5) {
       canvas.drawRect(
@@ -863,7 +1400,7 @@ class WorldRenderer {
   void _rigging(Canvas canvas, Raft raft, double time) {
     final lo = raft.loadout;
     final w = lo.width;
-    final deckTop = BattleConst.waterY - lo.deckRise;
+    final deckTop = raft.waterLine - lo.deckRise;
     final hullTop = deckTop;
     final hullH = lo.hullHeight;
     final dir = raft.facing.toDouble();
@@ -1092,7 +1629,7 @@ class WorldRenderer {
           ..strokeWidth = 1.4;
         for (final s in [-1.0, 1.0]) {
           canvas.drawLine(
-            Offset(mastX, BattleConst.waterY - lo.hullHeight * 0.5 - 96),
+            Offset(mastX, raft.waterLine - lo.hullHeight * 0.5 - 96),
             Offset(mastX + s * (w * 0.26), deckTop - 1),
             shroud,
           );
@@ -1112,7 +1649,7 @@ class WorldRenderer {
         for (int i = -2; i <= 2; i++) {
           if (i == 0) continue;
           canvas.drawLine(
-            Offset(mastX, BattleConst.waterY - lo.hullHeight * 0.5 - 100),
+            Offset(mastX, raft.waterLine - lo.hullHeight * 0.5 - 100),
             Offset(mastX + i * (w * 0.13), deckTop - 1),
             shroud,
           );
@@ -1163,7 +1700,7 @@ class WorldRenderer {
   /// rises measured up from the main deck plane (y-down, so negative).
   void _platforms(Canvas canvas, Raft raft) {
     final lo = raft.loadout;
-    final deckTop = BattleConst.waterY - lo.deckRise;
+    final deckTop = raft.waterLine - lo.deckRise;
     final w = lo.width;
 
     for (final s in raft.profile.segments) {
@@ -1218,9 +1755,39 @@ class WorldRenderer {
           Rect.fromLTWH(left, deckTop - 3, span, 5),
           Paint()..color = Colors.black.withOpacity(0.16),
         );
+      } else if ((topL - topR).abs() >= 6) {
+        // A real climb gets a real staircase: solid treads and risers cut
+        // into the slope. The physics surface underneath is the same ramp it
+        // always was — a tumbling body still slides down it — but a level
+        // change now reads as stairs rather than a bare wedge, which is what
+        // makes an upper deck look reachable.
+        final up = topR < topL; // climbing toward the right
+        final span = right - left;
+        final steps = (span / 11).floor().clamp(2, 6);
+        for (int k = 0; k < steps; k++) {
+          final x0 = left + span * k / steps;
+          final x1 = left + span * (k + 1) / steps;
+          // Each tread sits at the height of the slope's far edge, so the
+          // staircase always meets both tiers cleanly.
+          final f = (up ? k + 1 : k) / steps;
+          final y = topL + (topR - topL) * f;
+          canvas.drawRect(
+            Rect.fromLTRB(x0, y, x1, deckTop + 2),
+            Paint()..color = k.isEven
+                ? lo.color
+                : Color.lerp(lo.color, Colors.white, 0.1)!,
+          );
+          canvas.drawRect(
+            Rect.fromLTRB(x0, y, x1, y + 2),
+            Paint()..color = Colors.white.withOpacity(0.3),
+          );
+          canvas.drawRect(
+            Rect.fromLTRB(x0, y + 2, x0 + 1.4, deckTop),
+            Paint()..color = Colors.black.withOpacity(0.14),
+          );
+        }
       } else {
-        // Ramp treads, so a slope reads as something you can walk up rather
-        // than a plain wedge.
+        // A gentle slope keeps the old light tread hints.
         final tread = Paint()
           ..color = Colors.black.withOpacity(0.13)
           ..strokeWidth = 1.4;
@@ -1235,7 +1802,12 @@ class WorldRenderer {
 
       // Per-tier furniture: what actually tells the five hulls apart at a
       // glance, on top of the shared plank language above.
-      if (!isRamp && s.rise0 > 0.5) {
+      //
+      // Rise-0 tiers get it too now. The guard used to require a raised tier,
+      // which silently threw away everything that sits ON a surface rather
+      // than being built into a wall — the galley table, the lashed barrel
+      // stacks — because those live on the main deck by definition.
+      if (!isRamp) {
         _deckFurniture(canvas, s, lo, deckTop, topL);
       }
       // Keep the planks' horizontal seam language but bound it to the hull.
@@ -1370,13 +1942,197 @@ class WorldRenderer {
         }
         break;
 
+
+      case DeckStyle.cabin:
+        // A deck house. Its roof IS the tier above — crew posted up there are
+        // standing on this, which is what makes a raft feel like two floors
+        // rather than one deck with a box on it.
+        canvas.drawRect(
+          Rect.fromLTRB(left, topY, right, deckTop),
+          Paint()..color = Color.lerp(lo.color, Colors.white, 0.1)!,
+        );
+        // Corner posts.
+        for (final x in [left + 2.0, right - 2.0]) {
+          canvas.drawRect(
+            Rect.fromLTWH(x - 1.6, topY, 3.2, wallH),
+            Paint()..color = timber,
+          );
+        }
+        // A shuttered window, and a doorway into the dark.
+        final midY = topY + wallH * 0.42;
+        if (span > 34) {
+          final wx = left + span * 0.3;
+          canvas.drawRRect(
+            RRect.fromRectAndRadius(
+              Rect.fromCenter(
+                  center: Offset(wx, midY), width: 13, height: min(wallH * 0.5, 11)),
+              const Radius.circular(2),
+            ),
+            Paint()..color = const Color(0xFF7FC7D9),
+          );
+          canvas.drawLine(Offset(wx, midY - 6), Offset(wx, midY + 6),
+              Paint()..color = timber..strokeWidth = 1.6);
+          canvas.drawRRect(
+            RRect.fromRectAndRadius(
+              Rect.fromCenter(
+                  center: Offset(wx, midY), width: 13, height: min(wallH * 0.5, 11)),
+              const Radius.circular(2),
+            ),
+            Paint()
+              ..color = timber
+              ..style = PaintingStyle.stroke
+              ..strokeWidth = 1.8,
+          );
+        }
+        final dx = left + span * 0.72;
+        final doorH = min(wallH * 0.78, 20.0);
+        canvas.drawRRect(
+          RRect.fromRectAndCorners(
+            Rect.fromLTWH(dx - 6, deckTop - doorH, 12, doorH),
+            topLeft: const Radius.circular(5),
+            topRight: const Radius.circular(5),
+          ),
+          Paint()..color = const Color(0xFF2E2118),
+        );
+        canvas.drawCircle(
+            Offset(dx + 3.4, deckTop - doorH * 0.45), 1.4, Paint()..color = rope);
+        break;
+
+      case DeckStyle.roof:
+        // The upper floor of the deckhouse — crew stand ON this, so it is
+        // drawn as a storey you can walk on rather than a peaked roof over
+        // your head: sided wall, an overhanging eave board along the top, and
+        // rafter ends poking out under it.
+        canvas.drawRect(
+          Rect.fromLTRB(left, topY, right, deckTop),
+          Paint()..color = Color.lerp(lo.color, Colors.white, 0.16)!,
+        );
+        // Horizontal siding.
+        final boards = (wallH / 6).floor().clamp(1, 5);
+        for (int k = 1; k <= boards; k++) {
+          final y = topY + wallH * k / (boards + 1);
+          canvas.drawLine(
+            Offset(left + 1, y),
+            Offset(right - 1, y),
+            Paint()
+              ..color = Colors.black.withOpacity(0.08)
+              ..strokeWidth = 1.2,
+          );
+        }
+        // Rafter ends, then the eave board over them.
+        final rafters = (span / 15).floor().clamp(2, 6);
+        for (int k = 0; k <= rafters; k++) {
+          final x = left + span * k / rafters;
+          canvas.drawRect(
+            Rect.fromLTWH(x - 1.4, topY + 2, 2.8, 3.4),
+            Paint()..color = timber,
+          );
+        }
+        canvas.drawRRect(
+          RRect.fromRectAndRadius(
+            Rect.fromLTWH(left - 5, topY - 1.5, span + 10, 4),
+            const Radius.circular(2),
+          ),
+          Paint()..color = timber,
+        );
+        break;
+
+      case DeckStyle.galley:
+        // Somewhere the crew actually live: a table with a stool either side,
+        // a tankard and a lamp.
+        final tY = topY - 9;
+        final tx0 = left + span * 0.22;
+        final tx1 = left + span * 0.78;
+        canvas.drawRRect(
+          RRect.fromRectAndRadius(
+            Rect.fromLTRB(tx0, tY, tx1, tY + 3.4),
+            const Radius.circular(1.7),
+          ),
+          Paint()..color = timber,
+        );
+        for (final x in [tx0 + 3.0, tx1 - 3.0]) {
+          canvas.drawRect(
+              Rect.fromLTWH(x - 1.2, tY + 3, 2.4, topY - tY - 3),
+              Paint()..color = timber);
+        }
+        // Stools.
+        for (final x in [tx0 - 6.0, tx1 + 6.0]) {
+          if (x < left || x > right) continue;
+          canvas.drawRRect(
+            RRect.fromRectAndRadius(
+              Rect.fromCenter(center: Offset(x, topY - 4), width: 8, height: 2.6),
+              const Radius.circular(1.3),
+            ),
+            Paint()..color = timber,
+          );
+          canvas.drawRect(Rect.fromLTWH(x - 0.9, topY - 4, 1.8, 4),
+              Paint()..color = timber);
+        }
+        // A tankard, and a lamp with a warm pool of light.
+        canvas.drawRect(Rect.fromLTWH(tx0 + 7, tY - 5, 4, 5),
+            Paint()..color = const Color(0xFFD9D2C0));
+        final lampAt = Offset(tx1 - 8, tY - 5);
+        canvas.drawCircle(
+            lampAt, 7, Paint()..color = const Color(0xFFFFD98A).withOpacity(0.3));
+        canvas.drawRRect(
+          RRect.fromRectAndRadius(
+            Rect.fromCenter(center: lampAt, width: 5, height: 7),
+            const Radius.circular(2),
+          ),
+          Paint()..color = const Color(0xFFFFD98A),
+        );
+        break;
+
+      case DeckStyle.barrelStack:
+        // Barrels standing on their ends, lashed in a row, with a second
+        // course stacked where there is room.
+        final br = min(span / 5, 8.0);
+        final n = (span / (br * 2.3)).floor().clamp(1, 5);
+        for (int k = 0; k < n; k++) {
+          final cx = left + span * (k + 0.5) / n;
+          final by = topY - br * 1.5;
+          canvas.drawRRect(
+            RRect.fromRectAndRadius(
+              Rect.fromCenter(
+                  center: Offset(cx, by + br * 0.75),
+                  width: br * 1.8,
+                  height: br * 2.4),
+              Radius.circular(br * 0.5),
+            ),
+            Paint()..color = timber,
+          );
+          for (final hy in [by + br * 0.2, by + br * 1.3]) {
+            canvas.drawLine(
+              Offset(cx - br * 0.9, hy),
+              Offset(cx + br * 0.9, hy),
+              Paint()
+                ..color = Colors.black.withOpacity(0.22)
+                ..strokeWidth = 1.4,
+            );
+          }
+          canvas.drawOval(
+            Rect.fromCenter(
+                center: Offset(cx, by - br * 0.4), width: br * 1.6, height: br * 0.7),
+            Paint()..color = Color.lerp(timber, Colors.white, 0.18)!,
+          );
+        }
+        // One lashing rope across the whole row.
+        canvas.drawLine(
+          Offset(left + 2, topY - br * 1.1),
+          Offset(right - 2, topY - br * 1.1),
+          Paint()
+            ..color = rope
+            ..strokeWidth = 1.8,
+        );
+        break;
+
       case DeckStyle.planks:
         break;
     }
   }
 
   void _mast(Canvas canvas, Raft raft) {    final lo = raft.loadout;
-    final baseY = BattleConst.waterY - lo.hullHeight * 0.5;
+    final baseY = raft.waterLine - lo.hullHeight * 0.5;
     final dir = raft.facing.toDouble();
     canvas.drawRRect(
       RRect.fromRectAndRadius(
@@ -1407,7 +2163,7 @@ class WorldRenderer {
   }) {
     final lo = raft.loadout;
     final dir = raft.facing.toDouble();
-    final deck = BattleConst.waterY - lo.deckRise;
+    final deck = raft.waterLine - lo.deckRise;
 
     if (crew.pose != null) {
       _ragdollBody(canvas, raft, crew, dir, weapon, time);
@@ -1459,7 +2215,7 @@ class WorldRenderer {
     // -------------------------------------------------------------------
     // Layout: a small head over a chunkier, human-proportioned torso, on
     // two planted legs. Everything is built from thick rounded-cap "bone"
-    // strokes (see [_limb]) rather than baked shapes, so the gun arm is
+    // strokes (see [_taperedLimb]) rather than baked shapes, so the gun arm is
     // free to swing to any angle at runtime instead of needing a sprite
     // for every pose.
     // -------------------------------------------------------------------
@@ -1664,7 +2420,14 @@ class WorldRenderer {
       // overhead reach for a stretch, a hand to the temple for a scratch.
       // Only while NOT aiming — a raised arm mid-shot would fight the grip
       // IK for the same limb and read as a broken pose.
-      final up = Offset(-gunSide * 10.0, shoulderY - 28.0 * bx.armRaise);
+      //
+      // Height AND reach, because height alone put every one of them in the
+      // same place: with two dozen activities in the pool, a wave, a salute
+      // and somebody pointing across the water were one drawing.
+      final up = Offset(
+        -gunSide * 10.0 + gunSide * bx.armReach.clamp(-1.0, 1.0) * 24.0,
+        shoulderY - 28.0 * bx.armRaise,
+      );
       suppHand = Offset.lerp(suppHand, up, bx.armRaise.clamp(0.0, 1.0))!;
     }
 
@@ -2349,6 +3112,28 @@ class WorldRenderer {
   /// Draws a crew member straight from their live ragdoll pose: limbs are
   /// stroked between the verlet points, so whatever tangle the physics
   /// produced is exactly what you see. The gun stays in the nearest hand.
+  /// The dimensions a tumbling body is actually drawn at.
+  ///
+  /// Pulled out as a pure function of the pose because the bug it fixes is
+  /// precisely a disagreement between the skeleton and the artwork: the
+  /// solver curls the body up, and the renderer used to keep drawing a
+  /// full-size torso, head and boots inside it — the torso overshooting the
+  /// neck and burying the head, which is what "the whole body disappears and
+  /// they turn into a ball" actually was. Exposing the maths is what lets a
+  /// test pin it rather than merely pin the model it is supposed to follow.
+  
+  static ({double curl, double torsoLen, double torsoW, double headR})
+      ragdollMetrics(RagdollPose pose) {
+    final curl = pose.drawScale;
+    return (
+      curl: curl,
+      // Measured, not assumed: the slab always ends exactly at the neck.
+      torsoLen: max(9.0, (pose.neck.pos - pose.hip.pos).distance),
+      torsoW: 29.0 * curl,
+      headR: 14.0 * curl,
+    );
+  }
+
   void _ragdollBody(
     Canvas canvas,
     Raft raft,
@@ -2363,25 +3148,125 @@ class WorldRenderer {
     const boot = Color(0xFF23262B);
     const metal = Color(0xFF3B3F45);
 
-    void limbTo(RagdollPoint a, RagdollPoint b, double w, Color color) =>
-        _limb(canvas, a.pos, b.pos, w, color);
+    // How far the physics body is curled, as a scale factor on every drawn
+    // part. This is the fix for the ragdoll turning into an unreadable blob:
+    // a tuck shrinks every CONSTRAINT (that is what buys the rotation for a
+    // somersault), but the drawn torso, head and boots used to keep their
+    // full standing size. At a deep tuck the neck sat about nine units from
+    // the hip while the torso slab was still drawn twenty-seven long, so the
+    // torso overshot the neck and swallowed the head, and a fourteen-radius
+    // head sat centred inside it. That is what "the body disappears and they
+    // turn into a ball" actually was — not missing geometry, but every part
+    // drawn at full size inside a third of the space.
+    //
+    // Scaling the art by the same factor the solver scales the skeleton
+    // keeps a curled body reading as a curled *person*.
+    final m = ragdollMetrics(pose);
+    final curl = m.curl;
 
-    // Legs first (behind the torso). Each boot is oriented along its own
-    // shin instead of sitting as a bare circle, so a sprawled leg still
-    // reads as a booted foot, not a ball-joint.
-    for (final foot in [pose.footL, pose.footR]) {
-      limbTo(pose.hip, foot, 10, boot);
-      final shin = foot.pos - pose.hip.pos;
+    // The body's own frame: along the spine, and across it. Every limb root
+    // is placed in this frame rather than at a bare physics point, which is
+    // what stops a tumbling character reading as a stick figure — the
+    // ragdoll used to hang both arms off the single neck point and both legs
+    // off the single hip point, so a knocked-down crew member turned into a
+    // cruder character than the one standing a frame earlier.
+    final spineVec = pose.neck.pos - pose.hip.pos;
+    final spineLen = spineVec.distance;
+    final su = spineLen > 1e-3
+        ? spineVec / spineLen
+        : const Offset(0, -1); // hip -> neck
+    final sp = Offset(-su.dy, su.dx); // across the shoulders
+
+    // Two-bone IK in the body's own scale. Solving in world units would put
+    // the elbow outside a curled body, because the IK's bone lengths are
+    // fixed while the skeleton shrinks with the tuck; dividing into unscaled
+    // space, solving, and scaling back shortens the bones by exactly the
+    // same factor everything else uses.
+    (Offset, Offset) armIK(Offset shoulder, Offset target, double bend) {
+      final safe = curl < 0.05 ? 0.05 : curl;
+      final (e, h) = ArmIK.solve(
+        shoulder,
+        shoulder + (target - shoulder) / safe,
+        bend: bend,
+      );
+      return (
+        shoulder + (e - shoulder) * safe,
+        shoulder + (h - shoulder) * safe,
+      );
+    }
+
+    final farSuit = Color.lerp(suit, Colors.black, 0.22)!;
+    final farSkin = Color.lerp(skin, Colors.black, 0.18)!;
+
+    // Shoulders sit either side of the spine just below the neck, exactly as
+    // they do on the standing rig (torso half-width less the sleeve inset).
+    final shoulderNear = pose.neck.pos - su * (5 * curl) + sp * (9.5 * curl);
+    final shoulderFar = pose.neck.pos - su * (5 * curl) - sp * (9.5 * curl);
+
+    void elbowJoint(Offset e, Color sleeve) {
+      canvas.drawCircle(e, 5.2 * curl, Paint()..color = sleeve);
+      canvas.drawCircle(
+        e,
+        5.4 * curl,
+        Paint()
+          ..color = Colors.black.withOpacity(0.14)
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = 1.6 * curl,
+      );
+    }
+
+    /// One articulated arm: sleeve to the elbow, skin to the fist.
+    void drawArm(Offset shoulder, Offset elbow, Offset wrist, Color sleeve,
+        Color hide) {
+      _taperedLimb(canvas, shoulder, elbow, 13 * curl, 10.5 * curl, sleeve);
+      canvas.drawCircle(shoulder, 6.5 * curl, Paint()..color = sleeve);
+      elbowJoint(elbow, sleeve);
+      _taperedLimb(canvas, elbow, wrist, 9.5 * curl, 6.8 * curl, hide);
+      canvas.drawCircle(wrist, 5.0 * curl, Paint()..color = hide);
+    }
+
+    Offset arm(Offset shoulder, Offset hand, double bend, Color sleeve, Color hide) {
+      final (elbow, wrist) = armIK(shoulder, hand, bend);
+      drawArm(shoulder, elbow, wrist, sleeve, hide);
+      return wrist;
+    }
+
+    // The gun hand is solved up front, because the weapon has to be drawn
+    // BEHIND the torso and the arm in front of it. A tumbling body's arm
+    // folds right up against the chest — the hand ends up a few units from
+    // the neck rather than out at arm's length — so a weapon drawn on top,
+    // as the standing pose draws it, lies straight across the character and
+    // hides the person the player is trying to read.
+    final (gunElbow, gunWrist) = armIK(shoulderNear, pose.handR.pos, 1);
+
+    // Legs first (behind the torso), rooted at a pelvis rather than a point:
+    // each thigh starts offset across the spine toward its own foot, so the
+    // legs splay from hips the way the standing pose's do instead of both
+    // sprouting from one spot.
+    // The far leg is shaded down like the far arm. Both legs are the same
+    // near-black, and on a body lying with its feet together they merged into
+    // one shapeless mass; a little depth separation is what makes them read
+    // as two legs again.
+    final farBoot = Color.lerp(boot, Colors.black, 0.35)!;
+    for (final entry in [(pose.footL, farBoot), (pose.footR, boot)]) {
+      final foot = entry.$1;
+      final shade = entry.$2;
+      final toFoot = foot.pos - pose.hip.pos;
+      final across = sp.dx * toFoot.dx + sp.dy * toFoot.dy;
+      final anchor = pose.hip.pos + sp * (across * 0.35);
+      _taperedLimb(canvas, anchor, foot.pos, 12 * curl, 9 * curl, shade);
+      final shin = foot.pos - anchor;
       final shinAng = shin.distance > 1 ? atan2(shin.dy, shin.dx) : pi / 2;
       canvas.save();
       canvas.translate(foot.pos.dx, foot.pos.dy);
       canvas.rotate(shinAng + pi / 2);
       canvas.drawRRect(
         RRect.fromRectAndRadius(
-          Rect.fromCenter(center: Offset.zero, width: 15, height: 9),
-          const Radius.circular(4.5),
+          Rect.fromCenter(
+              center: Offset.zero, width: 15 * curl, height: 9 * curl),
+          Radius.circular(4.5 * curl),
         ),
-        Paint()..color = boot,
+        Paint()..color = shade,
       );
       canvas.restore();
     }
@@ -2389,54 +3274,27 @@ class WorldRenderer {
     // Support arm behind the torso — unless a torso hit left them clutching
     // the wound, in which case the hand grabs the spot instead of flailing.
     if (crew.grabT > 0) {
-      final grab = (pose.neck.pos + pose.hip.pos) / 2 +
-          Offset(dir >= 0 ? 4 : -4, 2);
-      _limb(canvas, pose.neck.pos, grab, 8.5, suit);
-      canvas.drawCircle(grab, 5.2, Paint()..color = skin);
+      final grab = (pose.neck.pos + pose.hip.pos) / 2 + sp * (4 * curl * dir) +
+          su * (-2 * curl);
+      final press = arm(shoulderFar, grab, -1, farSuit, farSkin);
       canvas.drawLine(
-        grab + const Offset(-2.4, 0), grab + const Offset(2.4, 0),
+        press + sp * (-2.4 * curl), press + sp * (2.4 * curl),
         Paint()
           ..color = Colors.black.withOpacity(0.2)
-          ..strokeWidth = 1.4
+          ..strokeWidth = 1.4 * curl
           ..strokeCap = StrokeCap.round,
       );
     } else {
-      _limb(canvas, pose.neck.pos, pose.handL.pos, 8.5, suit);
-      canvas.drawCircle(pose.handL.pos, 5.0, Paint()..color = skin);
+      arm(shoulderFar, pose.handL.pos, -1, farSuit, farSkin);
     }
 
-    // Torso: a rounded slab spanning neck→hip, oriented along the spine —
-    // same shape and shading band as the standing body.
-    final spine = pose.neck.pos - pose.hip.pos;
-    final spineAng = atan2(spine.dy, spine.dx);
-    const torsoW = 29.0, torsoH = 27.0;
-    canvas.save();
-    canvas.translate(pose.hip.pos.dx, pose.hip.pos.dy);
-    canvas.rotate(spineAng + pi / 2);
-    canvas.drawRRect(
-      RRect.fromRectAndCorners(
-        Rect.fromLTWH(-torsoW / 2, -torsoH, torsoW, torsoH),
-        topLeft: const Radius.circular(11),
-        topRight: const Radius.circular(11),
-        bottomLeft: const Radius.circular(6),
-        bottomRight: const Radius.circular(6),
-      ),
-      Paint()..color = suit,
-    );
-    canvas.drawRRect(
-      RRect.fromRectAndRadius(
-        Rect.fromLTWH(-torsoW / 2, -torsoH * 0.4, torsoW, torsoH * 0.4),
-        const Radius.circular(6),
-      ),
-      Paint()..color = Colors.black.withOpacity(0.1),
-    );
-    canvas.restore();
-
-    // Gun arm in front, still holding the equipped firearm — the same view
-    // the standing body draws, aimed across the body along the line between
-    // the two hands, so a limp wrist reads as a limp gun rather than
-    // dropping it.
-    limbTo(pose.neck, pose.handR, 8.5, suit);
+    // The equipped firearm, drawn BEHIND the torso.
+    //
+    // The standing pose draws it in front, where the arm holds it out clear
+    // of the body. A tumbling arm folds up against the chest instead, so in
+    // front meant a large weapon lying straight across the character and
+    // hiding them. Behind, it reads as still gripped — poking out either
+    // side of the body — without covering the person.
     if (weapon != null || crew.equipped != null) {
       final equippedId = crew.equipped ?? weapon!.id;
       final wv = WeaponView.forCrew(equippedId, weapon,
@@ -2444,7 +3302,10 @@ class WorldRenderer {
       final aim = pose.handR.pos - pose.handL.pos;
       final u = aim.distance > 1 ? aim / aim.distance : Offset(dir, 0);
       canvas.save();
-      canvas.translate(pose.handR.pos.dx, pose.handR.pos.dy);
+      // Anchored on the SOLVED wrist, not the raw physics hand: those two
+      // part company whenever the tumble throws a hand past arm's reach, and
+      // the gun would then hang in space beside the fist gripping it.
+      canvas.translate(gunWrist.dx, gunWrist.dy);
       canvas.rotate(atan2(u.dy, u.dx));
       canvas.scale(1, dir >= 0 ? 1 : -1);
       canvas.translate(-wv.gripX, -wv.gripY);
@@ -2463,6 +3324,63 @@ class WorldRenderer {
       canvas.restore();
     }
 
+
+    // Torso: a rounded slab spanning neck→hip, oriented along the spine —
+    // same shape, shading band, sash and belt as the standing body.
+    //
+    // Its LENGTH is the live spine distance rather than a constant. Drawing
+    // a fixed twenty-seven from the hip is what let a curled torso overshoot
+    // the neck and bury the head; measuring it means the slab always ends
+    // exactly where the neck is, curled or sprawled.
+    final spineAng = atan2(spineVec.dy, spineVec.dx);
+    final torsoH = m.torsoLen;
+    final torsoW = m.torsoW;
+    canvas.save();
+    canvas.translate(pose.hip.pos.dx, pose.hip.pos.dy);
+    canvas.rotate(spineAng + pi / 2);
+    canvas.drawRRect(
+      RRect.fromRectAndCorners(
+        Rect.fromLTWH(-torsoW / 2, -torsoH, torsoW, torsoH),
+        topLeft: Radius.circular(11 * curl),
+        topRight: Radius.circular(11 * curl),
+        bottomLeft: Radius.circular(6 * curl),
+        bottomRight: Radius.circular(6 * curl),
+      ),
+      Paint()..color = suit,
+    );
+    canvas.drawRRect(
+      RRect.fromRectAndRadius(
+        Rect.fromLTWH(-torsoW / 2, -torsoH * 0.4, torsoW, torsoH * 0.4),
+        Radius.circular(6 * curl),
+      ),
+      Paint()..color = Colors.black.withOpacity(0.1),
+    );
+    // The sash and belt the standing body wears. Without them a knocked-down
+    // character loses the trim that says whose crew they are, at exactly the
+    // moment the player is looking at them.
+    canvas.drawPath(
+      Path()
+        ..moveTo(-torsoW / 2, -torsoH * 0.88)
+        ..lineTo(torsoW / 2, -torsoH * 0.48)
+        ..lineTo(torsoW / 2, -torsoH * 0.28)
+        ..lineTo(-torsoW / 2, -torsoH * 0.68)
+        ..close(),
+      Paint()..color = _accentFor(raft).withOpacity(0.9),
+    );
+    canvas.drawRRect(
+      RRect.fromRectAndRadius(
+        Rect.fromLTWH(-torsoW / 2, -torsoH * 0.22, torsoW, 4 * curl),
+        Radius.circular(2 * curl),
+      ),
+      Paint()..color = raft.loadout.color,
+    );
+    canvas.restore();
+
+    // Gun arm, over the torso: the fist lands on the grip of the weapon
+    // passing behind the body, so it still reads as held rather than
+    // dropped.
+    drawArm(shoulderNear, gunElbow, gunWrist, suit, skin);
+
     // Bruises and cuts show off how much punishment they've taken.
     _drawInjuries(
       canvas,
@@ -2478,17 +3396,25 @@ class WorldRenderer {
     // face and headgear, same as standing, so the ragdoll is unmistakably
     // the same character mid-tumble rather than a simplified stand-in.
     final hAxis = pose.head.pos - pose.neck.pos;
-    var hAng = atan2(hAxis.dy, hAxis.dx) + pi / 2; // 0 = upright, π = inverted
-    // Never draw the face upside down: wrap the tilt to the *closest*
-    // upright orientation, so a body mid-backflip shows a face that reads
-    // as a wobble rather than an inverted skull. Fully upside-down bodies
-    // snap the head back near upright, exactly like a cartoony knockdown.
-    while (hAng > pi / 2) hAng -= pi;
-    while (hAng < -pi / 2) hAng += pi;
+    // The head follows the neck, continuously.
+    //
+    // This used to be wrapped into the nearest upright orientation to avoid
+    // ever drawing an inverted face — but wrapping by π is a DISCONTINUITY:
+    // as a somersaulting body turned smoothly past ninety degrees the drawn
+    // head snapped through half a turn, twice per revolution. That visible
+    // jerk, on top of the head visibly refusing to travel with the body it
+    // is attached to, is most of what made a tumble look wrong.
+    //
+    // Rotating by the raw angle is safe precisely because it only ever wraps
+    // by a full 2π, which is visually identical — the same reason the torso
+    // has always been able to use its spine angle directly.
+    final hAng = atan2(hAxis.dy, hAxis.dx) + pi / 2;
     canvas.save();
     canvas.translate(pose.head.pos.dx, pose.head.pos.dy);
-    canvas.rotate(hAng * 0.6);
-    const headR = 14.0;
+    canvas.rotate(hAng);
+    // Scaled with the curl like everything else — a full-size head on a
+    // curled body is most of what read as "a ball".
+    final headR = m.headR;
     canvas.drawCircle(Offset.zero, headR, Paint()..color = skin);
     canvas.drawArc(
       Rect.fromCircle(center: Offset.zero, radius: headR),
@@ -2541,11 +3467,18 @@ class WorldRenderer {
     final gloat = dead || pain > 0 ? 0.0 : (crew.gloatT / BattleConst.gloatTime).clamp(0.0, 1.0);
     final lowHp = !dead && pain <= 0 && gloat <= 0 && crew.hpFrac < BattleConst.lowHpFace;
     // Idle fidgets only surface when nothing more urgent is on the face —
-    // and the active shooter keeps a straight face while aiming (the world
-    // also stops picking new activities for them).
-    final idleAct = (!dead && pain <= 0 && gloat <= 0 && !aiming && !firing)
-        ? crew.idle
-        : CrewIdle.none;
+    // and the active shooter keeps a straight face while AIMING (the world
+    // also stops picking new activities for them then).
+    //
+    // A firing flourish is the exception: it exists precisely for the beat
+    // after the trigger, when the shot is away and the shooter is free to
+    // gloat about it, so it has to survive the `firing` gate that suppresses
+    // everything else.
+    final flourishing = Crew.fireFlourishes.contains(crew.idle);
+    final idleAct =
+        (!dead && pain <= 0 && gloat <= 0 && !aiming && (!firing || flourishing))
+            ? crew.idle
+            : CrewIdle.none;
     // 0..1 progress through the current activity, so expressions can ease
     // in and out over its lifetime.
     final idleK = idleAct == CrewIdle.none
@@ -2778,44 +3711,80 @@ class WorldRenderer {
   }) {
     final level = crew.injuryLevel;
     if (level <= 0) return;
-    final rng = Random((crew.bobPhase * 1000).round() ^ 0xC0FFEE);
-    double rx(double spread) => rng.nextDouble() * spread - spread / 2;
 
-    final bruise = Paint()..color = const Color(0xFF6D3B8E).withOpacity(0.5);
-    final dark = Paint()..color = const Color(0xFF4A2470).withOpacity(0.45);
-    final cut = Paint()
-      ..color = const Color(0xFFC0392B).withOpacity(0.8)
-      ..strokeWidth = 1.5
-      ..strokeCap = StrokeCap.round;
+    // The scatter is a pure function of the crew member's phase and how hurt
+    // they are, so it is computed once and kept. It used to allocate a
+    // seeded Random, run nine draws off it and build a fresh record list on
+    // every frame for every injured body — work that produced byte-identical
+    // numbers each time. That cost appeared the moment somebody took a hit
+    // and never went away, which is exactly the shape of the complaint.
+    final layout = _injuryCache.putIfAbsent(
+      (crew.bobPhase * 1000).round() * 4 + level,
+      () {
+        injuryLayouts++;
+        return _InjuryLayout.build(crew.bobPhase, level);
+      },
+    );
+
+    void spot(Offset base, Offset jitter, double r) {
+      final at = base + jitter;
+      canvas.drawCircle(at, r, _bruisePaint);
+      canvas.drawCircle(at + const Offset(0.5, 0.4), r * 0.55, _bruiseDarkPaint);
+    }
 
     // Bruise spots: one on the torso when scuffed, an arm/leg when worse,
     // and a shiner on the cheek when properly battered.
-    final spots = <(Offset, double)>[
-      (torC + Offset(rx(8), rx(6)), rng.nextDouble() * 2.2 + 2.0),
-      if (level >= 2)
-        (legC + Offset(rx(6), rx(3)), rng.nextDouble() * 2.2 + 1.8),
-      if (level >= 2)
-        (armC + Offset(rx(5), rx(4)), rng.nextDouble() * 2.0 + 1.6),
-      if (level >= 3)
-        (headC + Offset(dir * 3.2 + rx(2), rx(3) + 1), rng.nextDouble() * 1.8 + 1.4),
-      if (level >= 3)
-        (torC + Offset(rx(10), rx(6)), rng.nextDouble() * 2.0 + 1.8),
-    ];
-    for (final (at, r) in spots) {
-      canvas.drawCircle(at, r, bruise);
-      canvas.drawCircle(at + Offset(0.5, 0.4), r * 0.55, dark);
+    spot(torC, layout.torso, layout.torsoR);
+    if (level >= 2) {
+      spot(legC, layout.leg, layout.legR);
+      spot(armC, layout.arm, layout.armR);
+    }
+    if (level >= 3) {
+      spot(headC, layout.head + Offset(dir * 3.2, 0), layout.headR);
+      spot(torC, layout.torso2, layout.torso2R);
     }
 
     // Cuts appear once they're properly hurt, another when battered.
     if (level >= 2) {
-      final c = torC + Offset(rx(6), rx(4));
-      canvas.drawLine(c + const Offset(-2.4, -1), c + const Offset(2.4, 1), cut);
+      final c = torC + layout.cutTorso;
+      canvas.drawLine(
+          c + const Offset(-2.4, -1), c + const Offset(2.4, 1), _cutPaint);
     }
     if (level >= 3) {
-      final c = legC + Offset(rx(5), 1.2);
-      canvas.drawLine(c + const Offset(-2.2, -0.8), c + const Offset(2.2, 0.9), cut);
+      final c = legC + layout.cutLeg;
+      canvas.drawLine(
+          c + const Offset(-2.2, -0.8), c + const Offset(2.2, 0.9), _cutPaint);
     }
   }
+
+  /// Injury scatter per (crew phase, injury level). Bounded because both
+  /// inputs are: a battle has a handful of crew and four injury levels.
+  final Map<int, _InjuryLayout> _injuryCache = {};
+
+  /// Work done that a cache is supposed to make rare, counted so the tests
+  /// can pin it without measuring wall-clock time. Each of these used to
+  /// happen on every frame for as long as a body was hurt, talking or down,
+  /// which is what made the frame rate fall the moment shots started landing.
+  
+  int textLayouts = 0;
+  
+  int injuryLayouts = 0;
+  
+  int bodyLayers = 0;
+
+  /// Rafts actually drawn last frame, after culling. Counted so a test can
+  /// pin the cull directly rather than inferring it from something else.
+  
+  int raftsDrawn = 0;
+
+  static final Paint _bruisePaint = Paint()
+    ..color = const Color(0xFF6D3B8E).withOpacity(0.5);
+  static final Paint _bruiseDarkPaint = Paint()
+    ..color = const Color(0xFF4A2470).withOpacity(0.45);
+  static final Paint _cutPaint = Paint()
+    ..color = const Color(0xFFC0392B).withOpacity(0.8)
+    ..strokeWidth = 1.5
+    ..strokeCap = StrokeCap.round;
 
   /// Two little music notes drifting up from a whistling mouth — drawn in
   /// the face's head-local space, fading as they rise.
@@ -2839,22 +3808,12 @@ class WorldRenderer {
     }
   }
 
-  /// A single thick, rounded-cap "bone" — the building block for every arm
-  /// and leg. Always convex and reads as a limb at any rotation, which is
-  /// what makes the gun arm safe to swing to an arbitrary angle at runtime
-  /// instead of needing a pre-drawn pose per angle.
-  void _limb(Canvas canvas, Offset a, Offset b, double width, Color color) {
-    canvas.drawLine(
-      a, b,
-      Paint()
-        ..color = color
-        ..strokeWidth = width
-        ..strokeCap = StrokeCap.round,
-    );
-  }
-
-  /// A tapered, capped "bone" — like [_limb], but narrows from [widthA] at
-  /// [a] to [widthB] at [b] instead of holding one uniform stroke width.
+  /// A tapered, capped "bone" — the building block for every arm and leg.
+  /// Narrows from [widthA] at [a] to [widthB] at [b] rather than holding one
+  /// uniform stroke width. Always convex, so it reads as a limb at any
+  /// rotation — which is what makes the gun arm safe to swing to an
+  /// arbitrary angle at runtime instead of needing a pre-drawn pose per
+  /// angle.
   ///
   /// Two segments sharing a joint — an upper arm ending at some width, a
   /// forearm starting at a smaller one — leave a visible rim of the wider
@@ -2865,6 +3824,20 @@ class WorldRenderer {
   /// reads as one smooth capsule rather than a cut-off wedge, and a soft
   /// shading line runs down one long edge for a hint of roundness without
   /// a gradient.
+  /// Scratch drawing objects, reused instead of reallocated.
+  ///
+  /// The limb painters ran `Paint()` and `Path()` on every call, and a limb
+  /// is drawn about ten times per body per frame — so a deck of crew churned
+  /// thousands of short-lived objects a second. That never showed up in an
+  /// average frame time (0.7ms) but it landed as GC pauses on individual
+  /// frames: measured worst-case frames of 27–55ms against that 0.7ms
+  /// typical. A stutter is a tail-latency problem, and this was the tail.
+  ///
+  /// Safe to reuse because the canvas snapshots a paint's state at the draw
+  /// call and reads a path immediately — neither is retained afterwards.
+  final Paint _limbPaint = Paint();
+  final Path _limbPath = Path();
+
   void _taperedLimb(
     Canvas canvas,
     Offset a,
@@ -2876,7 +3849,11 @@ class WorldRenderer {
     final rA = widthA / 2, rB = widthB / 2;
     final delta = b - a;
     final len = delta.distance;
-    final paint = Paint()..color = color;
+    final paint = _limbPaint
+      ..color = color
+      ..style = PaintingStyle.fill
+      ..shader = null
+      ..strokeWidth = 0;
     if (len < 1e-3) {
       canvas.drawCircle(a, max(rA, rB), paint);
       return;
@@ -2888,7 +3865,8 @@ class WorldRenderer {
     final p3 = b - perp * rB;
     final p4 = a - perp * rA;
     canvas.drawPath(
-      Path()
+      _limbPath
+        ..reset()
         ..moveTo(p1.dx, p1.dy)
         ..lineTo(p2.dx, p2.dy)
         ..lineTo(p3.dx, p3.dy)
@@ -2899,13 +3877,18 @@ class WorldRenderer {
     canvas.drawCircle(a, rA, paint);
     canvas.drawCircle(b, rB, paint);
     canvas.drawLine(
-      p4, p3,
-      Paint()
-        ..color = Colors.black.withOpacity(0.13)
-        ..strokeWidth = min(rA, rB) * 0.7
-        ..strokeCap = StrokeCap.round,
+      p4,
+      p3,
+      _creasePaint..strokeWidth = min(rA, rB) * 0.7,
     );
   }
+
+  /// The shading crease down a limb. Constant but for its width, so it is
+  /// built once instead of on every limb of every body of every frame.
+  static final Paint _creasePaint = Paint()
+    ..color = Colors.black.withOpacity(0.13)
+    ..strokeCap = StrokeCap.round;
+
   Color _skinFor(CrewLook look) => Cast.of(look).skin;
 
   /// The character's own outfit colour, with the raft's colour kept as trim.
@@ -2923,12 +3906,12 @@ class WorldRenderer {
 
   void _enemyLabel(Canvas canvas, Raft raft, double bob) {
     final lo = raft.loadout;
-    final top = BattleConst.waterY - lo.deckRise - 104 + bob;
+    final top = raft.waterLine - lo.deckRise - 104 + bob;
 
-    final tp = TextPainter(
-      text: TextSpan(text: raft.label, style: RT.body(size: 10, color: RT.ink, weight: FontWeight.w800, letterSpacing: 1.2)),
-      textDirection: TextDirection.ltr,
-    )..layout();
+    // Cached: a raft's name never changes mid-match, so re-shaping it every
+    // frame for every raft was pure waste.
+    final tp = _text(raft.label,
+        size: 10, color: RT.ink, weight: FontWeight.w800, letterSpacing: 1.2);
     tp.paint(canvas, Offset(raft.x - tp.width / 2, top - 14));
     // HP is no longer shown here: every crew member carries a dynamic health
     // bar that only appears when they actually take damage (see
@@ -3067,6 +4050,10 @@ class WorldRenderer {
 
   void _drawEffects(Canvas canvas) {
     for (final fx in world.effects) {
+      // An impact away from the camera still spawns its full set of effects.
+      // Drawing them costs the most of anything on screen, and they are the
+      // one thing that only appears when something is hit.
+      if (!_visible(fx.pos.dx, fx.size * 2)) continue;
       final p = fx.progress;
       switch (fx.kind) {
         case 'boom':
@@ -3181,4 +4168,53 @@ class _Cloud {
     required this.opacity,
     required this.speed,
   });
+}
+
+/// Where one crew member's bruises and cuts sit on their body.
+///
+/// Deterministic from their bob phase, so a given character always carries
+/// the same marks in the same places — and computed once rather than
+/// re-rolled from a fresh seeded [Random] on every frame.
+class _InjuryLayout {
+  final Offset torso, leg, arm, head, torso2, cutTorso, cutLeg;
+  final double torsoR, legR, armR, headR, torso2R;
+
+  const _InjuryLayout({
+    required this.torso,
+    required this.leg,
+    required this.arm,
+    required this.head,
+    required this.torso2,
+    required this.cutTorso,
+    required this.cutLeg,
+    required this.torsoR,
+    required this.legR,
+    required this.armR,
+    required this.headR,
+    required this.torso2R,
+  });
+
+  factory _InjuryLayout.build(double bobPhase, int level) {
+    final rng = Random((bobPhase * 1000).round() ^ 0xC0FFEE);
+    double rx(double spread) => rng.nextDouble() * spread - spread / 2;
+    // Drawn in the same order the old inline code drew them, so a character's
+    // marks land exactly where they always did.
+    final torso = Offset(rx(8), rx(6));
+    final torsoR = rng.nextDouble() * 2.2 + 2.0;
+    final leg = level >= 2 ? Offset(rx(6), rx(3)) : Offset.zero;
+    final legR = level >= 2 ? rng.nextDouble() * 2.2 + 1.8 : 0.0;
+    final arm = level >= 2 ? Offset(rx(5), rx(4)) : Offset.zero;
+    final armR = level >= 2 ? rng.nextDouble() * 2.0 + 1.6 : 0.0;
+    final head = level >= 3 ? Offset(rx(2), rx(3) + 1) : Offset.zero;
+    final headR = level >= 3 ? rng.nextDouble() * 1.8 + 1.4 : 0.0;
+    final torso2 = level >= 3 ? Offset(rx(10), rx(6)) : Offset.zero;
+    final torso2R = level >= 3 ? rng.nextDouble() * 2.0 + 1.8 : 0.0;
+    final cutTorso = level >= 2 ? Offset(rx(6), rx(4)) : Offset.zero;
+    final cutLeg = level >= 3 ? Offset(rx(5), 1.2) : Offset.zero;
+    return _InjuryLayout(
+      torso: torso, leg: leg, arm: arm, head: head, torso2: torso2,
+      cutTorso: cutTorso, cutLeg: cutLeg,
+      torsoR: torsoR, legR: legR, armR: armR, headR: headR, torso2R: torso2R,
+    );
+  }
 }

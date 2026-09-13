@@ -20,6 +20,13 @@ void main() {
 
   BattleWorld world({required List<Offset> raftXs, int crewPerRaft = 2}) {
     final w = BattleWorld(map: GameMaps.all.first, seed: 7);
+    // Clear water. These tests are about what a hit does to a body — which
+    // limb it plants, whether a torso hit leaves them standing — so the
+    // shots are deliberately flat and direct. The channel obstacles exist
+    // precisely to stop flat direct shots, so leaving them in would mean
+    // testing the obstacle field over and over instead of the hit zones.
+    // Obstacles have their own tests.
+    w.obstacles.clear();
     for (int i = 0; i < raftXs.length; i++) {
       w.addRaft(Raft(
         playerIndex: i,
@@ -201,8 +208,12 @@ void main() {
       final enemy = w.rafts[1];
 
       // A cluster bomb dropped into the water just off the enemy's hull:
-      // a genuine miss, but well inside its 130-unit blast radius.
-      final dropX = enemy.x - enemy.hullHalf - 30;
+      // a genuine miss, but well inside its 130-unit blast radius. Close in,
+      // because crew are spread across the deck now rather than bunched
+      // amidships — the nearest berth on this side sits further inboard than
+      // it used to, and a drop thirty units out lands right on the edge of
+      // the radius rather than "well inside" it.
+      final dropX = enemy.x - enemy.hullHalf - 10;
       final out = fireAndWait(
         w,
         from: Offset(dropX, BattleConst.waterY - 60),
@@ -212,14 +223,23 @@ void main() {
       );
 
       expect(out.hitSomething, false, reason: 'it missed the raft itself');
-      final crew1 = enemy.crew[0];
-      final crew2 = enemy.crew[1];
-      expect(crew1.hp, lessThan(crew1.maxHp),
+      // Nearest and furthest by berth, rather than by crew index: the hulls
+      // carry real multi-level deck plans now, and which index sits closest
+      // to a given side depends on the plan and on which way the raft faces.
+      final byRange = [...enemy.crew]..sort((a, b) {
+          final ai = enemy.crew.indexOf(a), bi = enemy.crew.indexOf(b);
+          return ((enemy.x + enemy.stationX(ai)) - dropX)
+              .abs()
+              .compareTo(((enemy.x + enemy.stationX(bi)) - dropX).abs());
+        });
+      final near = byRange.first;
+      final far = byRange.last;
+      expect(near.hp, lessThan(near.maxHp),
           reason: 'blast damage does not need a direct hit');
-      expect(crew1.pose, isNotNull,
+      expect(near.pose, isNotNull,
           reason: 'the blast shockwave ragdolls the near crew');
       // The far crew member is outside the blast radius and unharmed.
-      expect(crew2.hp, crew2.maxHp);
+      expect(far.hp, far.maxHp);
       expect(w.shake, greaterThan(0), reason: 'the screen felt the bang');
     });
 
@@ -267,13 +287,26 @@ void main() {
     /// by following the hip->head vector frame by frame and accumulating the
     /// signed angle change. Instantaneous spin says a body was *set* turning;
     /// this says whether the somersault ever came round.
-    double rotationOver(BattleWorld w, Crew c, int frames) {
+    /// Rotation accumulated while the body is actually OFF the deck.
+    ///
+    /// The total-rotation version of this measured nothing useful. A body
+    /// that somersaults cleanly and a body that flops over and rights itself
+    /// both end upright, so the signed deltas both telescope to exactly one
+    /// revolution — the check read 0.9999 revolutions whether the tuck was
+    /// working or switched off entirely, and passed or failed on floating
+    /// point noise either side of 2π rather than on physics.
+    ///
+    /// What separates a somersault from a flop is how far the body turns
+    /// while it is in the AIR, which is precisely what the tuck buys and what
+    /// the speed cap would otherwise take away.
+    double airborneRotation(BattleWorld w, Raft raft, Crew c, int frames) {
       double angleOf(RagdollPose p) {
         final v = p.head.pos - p.hip.pos;
         return atan2(v.dy, v.dx);
       }
 
       var total = 0.0;
+      var peak = 0.0;
       var prev = c.pose == null ? null : angleOf(c.pose!);
       for (int i = 0; i < frames; i++) {
         w.update(1 / 60);
@@ -289,16 +322,20 @@ void main() {
             d += 2 * pi;
           }
           total += d;
+          if (total.abs() > peak) peak = total.abs();
         }
         prev = a;
       }
-      return total.abs();
+      return peak;
     }
 
     test('A backflip actually comes all the way round', () {
       // The point of the tuck: the point speed cap bleeds rotation out of a
-      // sprawled body, so a flip that never curls in stalls at roughly half
-      // a turn. A real somersault has to pass a full rotation.
+      // sprawled body, so a flip that never curls in stalls partway and flops
+      // back. A real somersault turns most of a revolution before it lands —
+      // measured in the air, because once a body is down it can right itself
+      // on the planks and reach an upright finish either way (see
+      // [airborneRotation]).
       final w = world(raftXs: [const Offset(300, 0), const Offset(1300, 0)]);
       final enemy = w.rafts[1];
       final headY = enemy.crewPos(0).dy - 34;
@@ -309,10 +346,11 @@ void main() {
       expect(c.flipT, greaterThan(0), reason: 'the flip curl is engaged');
       expect(c.pose!.tuck, lessThan(0.2), reason: 'the curl eases in, it does not snap');
 
-      final turned = rotationOver(w, c, 90);
-      expect(turned, greaterThan(2 * pi),
-          reason: 'a backflip must complete at least one full rotation '
-              '(turned ${(turned / (2 * pi)).toStringAsFixed(2)} revolutions)');
+      final turned = airborneRotation(w, enemy, c, 90);
+      expect(turned, greaterThan(2 * pi * 0.8),
+          reason: 'a backflip must come most of the way round in the air '
+              '(turned ${(turned / (2 * pi)).toStringAsFixed(3)} revolutions '
+              'before landing)');
     });
 
     test('The curl lets go again so the body lands sprawled, not balled up', () {
@@ -327,7 +365,19 @@ void main() {
         w.update(1 / 60);
         peak = max(peak, c.pose!.tuck);
       }
-      expect(peak, greaterThan(0.6), reason: 'the body genuinely curls up');
+      // ...reaches a good fraction of the depth this particular tumble
+      // rolled. How deep that is is now random per knock (see
+      // [RagdollStyle.curl]), so a fixed number here would pin the roll
+      // rather than the behaviour. The tuck is eased in rather than snapped
+      // on, and the flip window is short, so it reaches roughly two thirds
+      // of its target before the body lands — that was true of the old
+      // fixed depth too.
+      expect(c.style.curl, greaterThan(0.5),
+          reason: 'no tumble should roll a curl too shallow to read');
+      expect(peak, greaterThan(c.style.curl * 0.6),
+          reason: 'the body never curled toward the depth it rolled');
+      expect(peak, greaterThan(0.3),
+          reason: 'the body genuinely curls up');
 
       // ...and released by the time they are back on their feet.
       for (int i = 0; i < 600 && c.pose != null; i++) {

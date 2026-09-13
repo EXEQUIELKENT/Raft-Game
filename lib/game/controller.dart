@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:ui' show Offset;
 
 import 'package:flutter/foundation.dart';
 
@@ -120,12 +121,68 @@ class GameController extends ChangeNotifier {
   double aimAngle = 45;
   double aimPower = 70;
   bool aimFine = false;
-  String selectedWeaponId = 'tennis';
   bool isCharging = false;
 
-  /// Remaining rounds by weapon id for the human side. Infinite weapons are
-  /// absent from this map entirely.
-  final Map<String, int> ammo = {};
+  /// Each seat's own weapon rack: what they have selected, and what they
+  /// have left.
+  ///
+  /// These used to be a single `selectedWeaponId` and a single `ammo` map for
+  /// the whole match, which meant every seat shared one rack. Three separate
+  /// things went wrong with that:
+  ///
+  ///  * In a two-player match — hot-seat or over a hotspot link — one player
+  ///    spending a bomb took it out of the other player's pouch too, and
+  ///    picking a weapon changed what their opponent was holding.
+  ///  * The AI writes its choice into the same field at fire time, so an
+  ///    enemy turn silently swapped the player's selected weapon out from
+  ///    under them; they came back to their turn holding something else.
+  ///  * A networked shot is applied locally with `currentPlayer` set to the
+  ///    remote seat, so the remote player's shot was spending *this* device's
+  ///    ammunition.
+  ///
+  /// Indexed by seat. Read through [ammoOf] and [weaponOf] rather than
+  /// directly, so a seat index that is somehow out of range cannot crash a
+  /// live match.
+  final List<Map<String, int>> _racks = [];
+  final List<String> _selected = [];
+
+  int _seat(int player) =>
+      _racks.isEmpty ? 0 : player.clamp(0, _racks.length - 1);
+
+  /// [player]'s remaining rounds by weapon id. Infinite weapons are absent
+  /// from the map entirely.
+  Map<String, int> ammoOf(int player) =>
+      _racks.isEmpty ? const {} : _racks[_seat(player)];
+
+  /// The weapon [player] currently has in hand.
+  String weaponOf(int player) =>
+      _selected.isEmpty ? Weapons.starter.id : _selected[_seat(player)];
+
+  void setWeaponOf(int player, String weaponId) {
+    if (_selected.isEmpty) return;
+    _selected[_seat(player)] = weaponId;
+  }
+
+  /// True if [player] has anything left to fire of [weaponId].
+  bool hasAmmoFor(int player, String weaponId) {
+    final w = Weapons.byId(weaponId);
+    return w.infinite || (ammoOf(player)[weaponId] ?? 0) > 0;
+  }
+
+  /// The seat the HUD belongs to, and whose rack the player's taps act on.
+  ///
+  /// [myPlayerIndex] already answers exactly this question in every mode:
+  /// the local seat over a link, and whoever's turn it is otherwise — which
+  /// is what hot-seat play needs, since the two players take it in turns to
+  /// own the same screen.
+  int get _hudSeat => myPlayerIndex;
+
+  /// The local player's remaining rounds. Kept as `ammo` because that is
+  /// what the HUD reads; it is now this seat's rack rather than the match's.
+  Map<String, int> get ammo => ammoOf(_hudSeat);
+
+  String get selectedWeaponId => weaponOf(_hudSeat);
+  set selectedWeaponId(String id) => setWeaponOf(_hudSeat, id);
 
   int? winner;
   int damageDealtByHuman = 0;
@@ -201,7 +258,8 @@ class GameController extends ChangeNotifier {
     world = BattleWorld(map: settings.map, seed: seed);
     // Crew voices — grunts, yelps, gloats and idle blips — route through
     // the shared audio service at a slightly softer level than SFX.
-    world.onVoice = (sound) => AudioService.instance.sfx(sound, volume: 0.85);
+    world.onVoice =
+        (sound) => AudioService.instance.sfx(sound, volume: 0.85, voice: true);
     // World SFX — ricochets, weapon swaps — at full punch.
     world.onSfx = (sound) => AudioService.instance.sfx(sound);
 
@@ -226,18 +284,28 @@ class GameController extends ChangeNotifier {
             maxHp: hp,
             bobPhase: c * 0.7,
             voice: Cast.of(p.look).voice,
+            traits: Cast.of(p.look).ragdoll,
           ),
         ),
       ));
     }
 
-    ammo.clear();
-    for (final w in Weapons.all) {
-      if (w.infinite) continue;
-      if (!settings.enabledWeapons.contains(w.id)) continue;
-      ammo[w.id] = settings.ammo?[w.id] ?? w.startAmmo;
+    // One rack per seat, each stocked identically from the match settings.
+    // Every seat gets its own even though the AI never spends anything: the
+    // alternative is a special case that has to stay in step with which
+    // seats happen to be human, and a rack nobody draws from costs nothing.
+    _racks.clear();
+    _selected.clear();
+    for (var seat = 0; seat < players.length; seat++) {
+      final rack = <String, int>{};
+      for (final w in Weapons.all) {
+        if (w.infinite) continue;
+        if (!settings.enabledWeapons.contains(w.id)) continue;
+        rack[w.id] = settings.ammo?[w.id] ?? w.startAmmo;
+      }
+      _racks.add(rack);
+      _selected.add(Weapons.starter.id);
     }
-    selectedWeaponId = Weapons.starter.id;
 
     world.lockCam(0);
     _beginTurn(0, initial: true);
@@ -364,11 +432,23 @@ class GameController extends ChangeNotifier {
     _ticker = Timer.periodic(const Duration(milliseconds: 16), (_) => _tick());
   }
 
+  /// Runs one frame of exactly [dt].
+  ///
+  /// The live game is driven by a wall-clock timer, so a test cannot step it
+  /// deterministically — and walking is a per-frame integration, which is
+  /// precisely the kind of thing that needs stepping a known amount.
+  @visibleForTesting
+  void stepForTest(double dt) => _frame(dt);
+
   void _tick() {
     if (_disposed) return;
     final now = DateTime.now();
     final dt = (now.difference(_lastTick).inMilliseconds / 1000.0).clamp(0.0, 0.05);
     _lastTick = now;
+    _frame(dt);
+  }
+
+  void _frame(double dt) {
     time += dt;
 
     world.update(dt);
@@ -407,6 +487,13 @@ class GameController extends ChangeNotifier {
     _impactHold = 0;
     _crewWait = 0;
     _turnSeq++;
+    // A new turn always starts with the helm released.
+    _walkDir = 0;
+    for (final r in world.rafts) {
+      for (final c in r.crew) {
+        c.steering = false;
+      }
+    }
 
     final raft = world.raftOf(player);
     raft?.ensureActiveReady();
@@ -433,7 +520,7 @@ class GameController extends ChangeNotifier {
     final localSeat = !players[player].isAi &&
         (!isNetworked || player == myPlayerIndex);
     if (localSeat) {
-      world.raftOf(player)?.activeCrew?.equipInstant(selectedWeaponId);
+      world.raftOf(player)?.activeCrew?.equipInstant(weaponOf(player));
     }
     // The view belongs to whoever is firing — except over a hotspot link,
     // where each device shows only its own deck, so you watch incoming fire
@@ -442,9 +529,13 @@ class GameController extends ChangeNotifier {
     // easing across would just be a long sideways pan past the enemy.
     world.lockCam(isNetworked ? localPlayerIndex : player);
 
-    // A weapon the player has run out of must not stay selected into the next
-    // turn, or the fire button would silently do nothing.
-    if (!_hasAmmoFor(selectedWeaponId)) selectedWeaponId = Weapons.starter.id;
+    // A weapon THIS SEAT has run out of must not stay selected into their
+    // next turn, or the fire button would silently do nothing. Scoped to the
+    // seat whose turn is starting: checking the HUD seat's rack here would
+    // reset the local player's choice at the start of an enemy turn.
+    if (!hasAmmoFor(player, weaponOf(player))) {
+      setWeaponOf(player, Weapons.starter.id);
+    }
 
     statusMessage = players[player].isAi
         ? '${players[player].name} is aiming…'
@@ -457,7 +548,120 @@ class GameController extends ChangeNotifier {
     }
   }
 
+  // ---------------------------------------------------------------------------
+  // Taking the helm: picking a crew member and walking them
+  // ---------------------------------------------------------------------------
+
+  /// How fast a steered crew member walks, in world units per second. Slow
+  /// enough that repositioning is a decision rather than a dodge.
+  static const double walkSpeed = 52.0;
+
+  /// Which way the player is currently walking their crew member: -1, 0, +1.
+  int _walkDir = 0;
+  int get walkDir => _walkDir;
+
+  /// True when the player may take the helm at all: their own turn, their own
+  /// aiming phase, and a crew member on their feet to move.
+  bool get canSteer =>
+      phase == GamePhase.aiming &&
+      !_shotCommitted &&
+      currentPlayer >= 0 &&
+      currentPlayer < players.length &&
+      !players[currentPlayer].isAi &&
+      (!isNetworked || currentPlayer == myPlayerIndex) &&
+      (world.raftOf(currentPlayer)?.activeCrew?.ready ?? false);
+
+  /// Starts or stops walking. Held by the on-screen controls.
+  void setWalk(int dir) {
+    if (!canSteer) dir = 0;
+    if (_walkDir == dir) return;
+    _walkDir = dir;
+    final c = world.raftOf(currentPlayer)?.activeCrew;
+    if (c == null) return;
+    c.steering = dir != 0;
+    if (dir == 0) {
+      // Handing the body back to the stepper: it will walk them home from
+      // wherever they stopped, which is the same shuffle it already does
+      // after a knockdown.
+      c.walkAmp = 0;
+    }
+    notifyListeners();
+  }
+
+  /// Advances a walk by one frame. Called from the aiming update.
+  void _stepWalk(double dt) {
+    if (_walkDir == 0) return;
+    if (!canSteer) {
+      setWalk(0);
+      return;
+    }
+    final raft = world.raftOf(currentPlayer);
+    final crew = raft?.activeCrew;
+    if (raft == null || crew == null) {
+      setWalk(0);
+      return;
+    }
+    final i = raft.activeIndex;
+    final station = raft.stationX(i);
+    // Walk in the crew member's own frame, then clamp so they can never step
+    // off their own deck: the rails are a wall to somebody walking, even
+    // though a hard enough hit can still throw them over one.
+    //
+    // The limit is the planks themselves, less a half-body so no boot hangs
+    // over — NOT the berth inset. Berths are placed further out than that
+    // inset allows, so clamping to it would leave a crew member unable to
+    // walk back to their own station.
+    final limit = raft.deckHalf - DeckProfile.bodyHalf;
+    final fromX = station + crew.offset.dx;
+    final wantX = (fromX + _walkDir * walkSpeed * dt).clamp(-limit, limit);
+    final surface = raft.surfaceY(wantX) ?? crew.offset.dy;
+    crew.offset = Offset(wantX - station, surface);
+    crew.steering = true;
+    // Where the player puts them is where they stay. Without this the
+    // simulation's "walk back to your berth" stepper took over the instant
+    // the controls were released and marched them back to the spot they
+    // started from, so a walk could never actually change anything.
+    crew.parked = true;
+    // Legs cycle with the ground covered, not with the clock — walking into
+    // the rail clamp above stops the stride as well as the body, instead of
+    // leaving them sprinting on the spot against the railing.
+    crew.advanceWalk(wantX - fromX);
+    notifyListeners();
+  }
+
+  /// Hands control to whichever of this raft's crew is nearest [worldPos].
+  ///
+  /// Returns true if somebody was picked up. Only ever selects a crew member
+  /// on the player's OWN raft who is on their feet — tapping an enemy, or a
+  /// body still tumbling, does nothing.
+  bool selectCrewAt(Offset worldPos) {
+    if (!canSteer) return false;
+    final raft = world.raftOf(currentPlayer);
+    if (raft == null) return false;
+    var best = -1;
+    var bestD = double.infinity;
+    for (int i = 0; i < raft.crew.length; i++) {
+      final c = raft.crew[i];
+      if (!c.alive || !c.ready) continue;
+      final d = (raft.crewPos(i) - worldPos).distance;
+      if (d < bestD) {
+        bestD = d;
+        best = i;
+      }
+    }
+    // A body is about 29 across and 58 tall; this is a comfortable tap target
+    // around that without letting a tap on open deck grab somebody.
+    if (best < 0 || bestD > 46) return false;
+    if (best == raft.activeIndex) return true;
+    raft.activeIndex = best;
+    raft.crew[best].equipInstant(weaponOf(currentPlayer));
+    AudioService.instance.sfx('click');
+    notifyListeners();
+    return true;
+  }
+
   void _updateAiming(double dt) {
+    _stepWalk(dt);
     // The camera stays on the shooter's own raft for the whole aiming phase.
     // It used to ease toward the shot's predicted landing point, which meant
     // a long drag panned the view all the way across to the enemy deck and
@@ -590,7 +794,11 @@ class GameController extends ChangeNotifier {
     _aiShotQueued = true;
     aimAngle = shot.angle;
     aimPower = shot.power;
-    selectedWeaponId = shot.weapon.id;
+    // The AI's own rack, not the match's. Writing this into a shared field
+    // is what let an enemy turn swap the player's selected weapon out from
+    // under them — they came back to their turn holding whatever the AI had
+    // just thrown.
+    setWeaponOf(currentPlayer, shot.weapon.id);
     // The AI equips instantly: its weapon choice is made at fire time, and
     // a raise animation would fight the recoil window that follows.
     me.activeCrew?.equipInstant(shot.weapon.id);
@@ -821,10 +1029,11 @@ class GameController extends ChangeNotifier {
 
   Raft? get currentRaft => world.raftOf(currentPlayer);
 
+  /// The weapon the HUD seat has in hand.
   WeaponDef get selectedWeapon => Weapons.byId(selectedWeaponId);
 
   /// Weapons offered on the HUD: enabled for this match and either infinite
-  /// or actually stocked.
+  /// or actually stocked in THIS seat's rack.
   List<WeaponDef> get availableWeapons => Weapons.all
       .where((w) => settings.enabledWeapons.contains(w.id))
       .where((w) => w.infinite || (ammo[w.id] ?? 0) > 0 || w.id == selectedWeaponId)
@@ -836,13 +1045,16 @@ class GameController extends ChangeNotifier {
     return ammo[weaponId] ?? 0;
   }
 
-  bool _hasAmmoFor(String weaponId) {
-    final w = Weapons.byId(weaponId);
-    return w.infinite || (ammo[weaponId] ?? 0) > 0;
-  }
+  /// True when pressing FIRE would actually loose a shot.
+  ///
+  /// Exactly the condition [humanFire] checks, exposed so the button and the
+  /// action can never disagree — a button that looks live but does nothing
+  /// is worse than no button.
+  bool get canFire =>
+      canHumanAct && hasAmmoFor(_hudSeat, weaponOf(_hudSeat));
 
   bool selectWeapon(String weaponId) {
-    if (!_hasAmmoFor(weaponId)) return false;
+    if (!hasAmmoFor(_hudSeat, weaponId)) return false;
     final changed = selectedWeaponId != weaponId;
     selectedWeaponId = weaponId;
     // Only the local human seat animates a swap: their active crew lowers
@@ -886,7 +1098,7 @@ class GameController extends ChangeNotifier {
 
   void humanFire() {
     if (!canHumanAct) return;
-    if (!_hasAmmoFor(selectedWeaponId)) return;
+    if (!hasAmmoFor(_hudSeat, weaponOf(_hudSeat))) return;
     final w = selectedWeapon;
     if (isNetworked) {
       if (currentPlayer != myPlayerIndex) return;
@@ -931,14 +1143,23 @@ class GameController extends ChangeNotifier {
     final safePower = power.clamp(BattleConst.powerMin, BattleConst.powerMax);
 
     // Only the human side spends ammo; enemy loadouts are scripted per level.
+    //
+    // Spent from the FIRING seat's rack, not the HUD's. Over a hotspot link
+    // the opponent's shot arrives here with [currentPlayer] set to their
+    // seat while this device's HUD still belongs to the local player — so
+    // reading the HUD's rack meant a remote player's shot came out of the
+    // local player's pouch.
     if (!players[currentPlayer].isAi && !safeWeapon.infinite) {
-      final left = ammo[safeWeapon.id] ?? 0;
+      final rack = ammoOf(currentPlayer);
+      final left = rack[safeWeapon.id] ?? 0;
       if (left <= 0) {
         if (kDebugMode) debugPrint('[fire] rejected: out of ${safeWeapon.id}');
         return;
       }
-      ammo[safeWeapon.id] = left - 1;
-      if (ammo[safeWeapon.id] == 0) selectedWeaponId = Weapons.starter.id;
+      rack[safeWeapon.id] = left - 1;
+      if (rack[safeWeapon.id] == 0) {
+        setWeaponOf(currentPlayer, Weapons.starter.id);
+      }
     }
 
     _shotCommitted = true;
@@ -1058,8 +1279,18 @@ class GameController extends ChangeNotifier {
         'shotsFired': shotsFired,
         'shotsHit': shotsHit,
         'damage': damageDealtByHuman,
-        'ammo': Map<String, int>.from(ammo),
-        'weapon': selectedWeaponId,
+        // Every seat's rack, not just this device's. A resumed hotspot match
+        // still applies the opponent's shots locally, and that spends their
+        // rack on this device — so if their rack came back empty after a
+        // reconnect, their perfectly legal shots would be dropped here and
+        // the two devices would quietly stop agreeing about the match.
+        //
+        // 'ammo'/'weapon' are still written for snapshots read by an older
+        // build, and still read below.
+        'ammo': Map<String, int>.from(ammoOf(_hudSeat)),
+        'weapon': weaponOf(_hudSeat),
+        'racks': [for (final r in _racks) Map<String, int>.from(r)],
+        'weapons': List<String>.from(_selected),
         'rafts': [
           for (final r in world.rafts)
             {
@@ -1099,12 +1330,41 @@ class GameController extends ChangeNotifier {
       }
     }
 
-    final savedAmmo = snap['ammo'];
-    if (savedAmmo is Map) {
-      for (final e in savedAmmo.entries) {
-        final v = e.value;
-        if (v is num && ammo.containsKey(e.key)) {
-          ammo[e.key as String] = v.toInt();
+    // Per-seat racks, with a fallback to the single-rack format an older
+    // build wrote — which is applied to every seat, because that is exactly
+    // what it meant when there was only one.
+    final savedRacks = snap['racks'];
+    if (savedRacks is List) {
+      for (var seat = 0; seat < savedRacks.length && seat < _racks.length; seat++) {
+        final entry = savedRacks[seat];
+        if (entry is! Map) continue;
+        for (final e in entry.entries) {
+          final v = e.value;
+          if (v is num && _racks[seat].containsKey(e.key)) {
+            _racks[seat][e.key as String] = v.toInt();
+          }
+        }
+      }
+    } else {
+      final savedAmmo = snap['ammo'];
+      if (savedAmmo is Map) {
+        for (final rack in _racks) {
+          for (final e in savedAmmo.entries) {
+            final v = e.value;
+            if (v is num && rack.containsKey(e.key)) {
+              rack[e.key as String] = v.toInt();
+            }
+          }
+        }
+      }
+    }
+
+    final savedWeapons = snap['weapons'];
+    if (savedWeapons is List) {
+      for (var seat = 0; seat < savedWeapons.length && seat < _selected.length; seat++) {
+        final id = savedWeapons[seat];
+        if (id is String && Weapons.all.any((w) => w.id == id)) {
+          _selected[seat] = id;
         }
       }
     }
@@ -1113,9 +1373,14 @@ class GameController extends ChangeNotifier {
     shotsFired = (snap['shotsFired'] as num?)?.toInt() ?? shotsFired;
     shotsHit = (snap['shotsHit'] as num?)?.toInt() ?? shotsHit;
     damageDealtByHuman = (snap['damage'] as num?)?.toInt() ?? damageDealtByHuman;
-    final weapon = snap['weapon'];
-    if (weapon is String && Weapons.all.any((w) => w.id == weapon)) {
-      selectedWeaponId = weapon;
+    // Legacy single-weapon field: only consulted when the snapshot had no
+    // per-seat list, so an older save still puts the local player back where
+    // they left off.
+    if (savedWeapons is! List) {
+      final weapon = snap['weapon'];
+      if (weapon is String && Weapons.all.any((w) => w.id == weapon)) {
+        setWeaponOf(_hudSeat, weapon);
+      }
     }
     // The turn counter has to come back too: it is what dedupes `endTurn`
     // messages, and restarting it at zero would let a turn already played

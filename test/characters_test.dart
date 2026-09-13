@@ -275,27 +275,175 @@ void main() {
       expect(dead.bodyExpression(1).isNeutral, true);
     });
 
+    /// True if [act] actually moves the body rather than only the face.
+    ///
+    /// Asked of [Crew.bodyExpression] rather than checked against a list of
+    /// activity names. The list version went stale the moment the pool grew
+    /// — it kept passing while naming five of twenty-three activities — and
+    /// a list of names was never the property anyway. What matters is that
+    /// the activity moves something.
+    bool movesTheBody(CrewIdle act) {
+      final c = crew();
+      c.idle = act;
+      c.idleDur = 2;
+      // Sampled across the activity, because several of them pass through
+      // zero at the middle of their own cycle.
+      for (int step = 1; step < 10; step++) {
+        c.idleT = 2 * step / 10;
+        final bx = c.bodyExpression(step * 0.17);
+        final size = bx.crouch.abs() +
+            bx.lean.abs() * 3 +
+            bx.armRaise.abs() +
+            bx.bounce.abs() * 0.3 +
+            bx.tremble.abs() * 0.3 +
+            bx.slump.abs() +
+            bx.headTilt.abs() * 0.4;
+        if (size > 0.25) return true;
+      }
+      return false;
+    }
+
     test('the idle pool is mostly whole-body, not mostly faces', () {
       // The point of the rework: a deck of people making faces reads as a row
       // of statues from across the screen.
-      const bodyLed = {
-        CrewIdle.stretch,
-        CrewIdle.hop,
-        CrewIdle.shrug,
-        CrewIdle.scratchHead,
-        CrewIdle.jig,
-      };
       final c = crew();
       final picked = <CrewIdle>[];
-      for (int i = 0; i < 200; i++) {
+      for (int i = 0; i < 400; i++) {
         c.idle = CrewIdle.none;
         c.idleNextIn = 0;
         c.updateIdle(0.016, allowNew: true);
         picked.add(c.idle);
       }
-      final bodyCount = picked.where(bodyLed.contains).length;
-      expect(bodyCount / picked.length, greaterThan(0.4),
+      final bodyCount = picked.where(movesTheBody).length;
+      expect(bodyCount / picked.length, greaterThan(0.75),
           reason: 'idle time is still mostly face-only');
+    });
+
+
+    test('activities that raise an arm put the hand in different places', () {
+      // [armRaise] is only a height. With height alone every activity that
+      // lifted the free arm — a wave, a salute, a point across the water,
+      // somebody inspecting their nails — sent the hand to the identical
+      // spot, so a dozen new activities were one drawing with a dozen names.
+      // [armReach] is the other axis, and this is what says the pool uses it.
+      final spots = <String, Offset>{};
+      for (final act in CrewIdle.values) {
+        if (act == CrewIdle.none) continue;
+        final c = crew();
+        c.idle = act;
+        c.idleDur = 2;
+        c.idleT = 1.0; // the peak of the ease
+        final bx = c.bodyExpression(0.4);
+        if (bx.armRaise < 0.3) continue; // not an arm-led activity
+        spots[act.name] = Offset(bx.armReach, bx.armRaise);
+      }
+      expect(spots.length, greaterThan(8),
+          reason: 'this test needs a decent number of arm-led activities');
+
+      // No two of them may land on the same point.
+      final names = spots.keys.toList();
+      for (int i = 0; i < names.length; i++) {
+        for (int j = i + 1; j < names.length; j++) {
+          final d = (spots[names[i]]! - spots[names[j]]!).distance;
+          expect(d, greaterThan(0.08),
+              reason: '${names[i]} and ${names[j]} put the hand in the same '
+                  'place, so they read as the same activity');
+        }
+      }
+    });
+    test('every activity moves the body somehow', () {
+      // Including the firing flourishes. An activity with no body animation
+      // is invisible at raft scale, so adding one is the same as adding
+      // nothing — and that is exactly the sort of gap that accumulates
+      // quietly as the pool grows.
+      for (final act in CrewIdle.values) {
+        if (act == CrewIdle.none) continue;
+        // lookAround and browWaggle are deliberately face-led; everything
+        // else has to carry through the body.
+        if (act == CrewIdle.lookAround || act == CrewIdle.browWaggle) continue;
+        expect(movesTheBody(act), true,
+            reason: '${act.name} does nothing to the body');
+      }
+    });
+
+    test('every activity has a duration and a voice', () {
+      // Three tables have to agree — duration, bubble, voice — and they are
+      // all keyed by the same enum. A new activity missing from one of them
+      // plays wrong rather than not at all, which is harder to notice.
+      for (final act in CrewIdle.values) {
+        if (act == CrewIdle.none) continue;
+        final c = crew();
+        c.idle = CrewIdle.none;
+        c.idleNextIn = 0;
+        // Force this exact activity through the same path the pool uses.
+        String? voice;
+        for (int tries = 0; tries < 4000 && c.idle != act; tries++) {
+          c.idle = CrewIdle.none;
+          c.idleNextIn = 0;
+          voice = c.updateIdle(0.016, allowNew: true);
+        }
+        if (c.idle != act) continue; // a flourish, tested below
+        expect(c.idleDur, greaterThan(0.5),
+            reason: '${act.name} has no sensible duration');
+        expect(voice, isNotNull, reason: '${act.name} plays silently');
+      }
+    });
+
+    test('a firing flourish only ever plays after a shot', () {
+      // They read as a reaction to having fired — blowing the barrel, a
+      // fist-pump — and would be nonsense on somebody standing about.
+      final c = crew();
+      final standing = <CrewIdle>{};
+      for (int i = 0; i < 600; i++) {
+        c.idle = CrewIdle.none;
+        c.idleNextIn = 0;
+        c.updateIdle(0.016, allowNew: true);
+        standing.add(c.idle);
+      }
+      for (final f in Crew.fireFlourishes) {
+        expect(standing.contains(f), false,
+            reason: '${f.name} turned up in the standing-about pool');
+      }
+    });
+
+    test('firing sometimes throws a flourish, and sometimes does not', () {
+      // Every shot would stop it being a flourish; no shot would mean the
+      // shooter is still the one crew member who never does anything.
+      final c = crew();
+      var thrown = 0;
+      for (int i = 0; i < 400; i++) {
+        c.idle = CrewIdle.none;
+        c.idleT = 0;
+        final voice = c.startFireFlourish();
+        if (c.idle != CrewIdle.none) {
+          thrown++;
+          expect(Crew.fireFlourishes.contains(c.idle), true,
+              reason: 'firing picked ${c.idle.name}, which is not a flourish');
+          expect(voice, isNotNull, reason: '${c.idle.name} plays silently');
+        }
+      }
+      expect(thrown, greaterThan(40), reason: 'flourishes never happen');
+      expect(thrown, lessThan(360), reason: 'every single shot throws one');
+    });
+
+    test('a flourish never interrupts something already running', () {
+      final c = crew();
+      c.idle = CrewIdle.yawn;
+      c.idleT = 1;
+      for (int i = 0; i < 50; i++) {
+        expect(c.startFireFlourish(), isNull);
+        expect(c.idle, CrewIdle.yawn);
+      }
+    });
+
+    test('a body being thrown about does not fidget', () {
+      final c = crew();
+      c.knock(const Offset(1, -0.4), 3, hitLocal: const Offset(0, -30));
+      expect(c.startFireFlourish(), isNull,
+          reason: 'a crew member mid-tumble started a flourish');
+      c.idle = CrewIdle.jig;
+      c.updateIdle(0.016, allowNew: true);
+      expect(c.idle, CrewIdle.none);
     });
   });
 

@@ -27,22 +27,24 @@ class AudioService {
   bool _ready = false;
   bool _available = true;
 
-  /// The voice lines that exist at three pitches (see
-  /// `tool/gen_voice_sfx.dart`): the bare name is the mid register, `_low`
-  /// and `_high` are the resampled variants a character's [VoiceType]
-  /// selects. All three are preloaded, because one deck can easily be
-  /// carrying all three registers at once.
+  /// Clips that exist in all three pitch registers, so [voiced] can select
+  /// one. Any voice line NOT listed here falls back to the mid clip for
+  /// every character — fine for the handful that are effectively noises
+  /// (a whistle has no register), wrong for anything a person says.
   static const List<String> voiceBases = [
     'voice_grunt', 'voice_ouch1', 'voice_ouch2', 'voice_ouch3', 'voice_ouch4',
     'voice_laugh', 'voice_yawn', 'voice_chatter', 'voice_hmm', 'voice_look',
     'voice_cheer', 'voice_gasp', 'voice_hup',
+    // The wider activity set.
+    'voice_tsk', 'voice_hum', 'voice_sneeze', 'voice_count', 'voice_blow',
+    'voice_taunt', 'voice_brr', 'voice_whistle',
   ];
 
   /// Every clip the game plays, so [init] can preload them all.
   static final List<String> _knownSounds = [
     'click', 'bounce', 'hit', 'explosion', 'shockwave', 'splash',
     'eliminate', 'whoosh', 'swap', 'turn', 'place', 'fire',
-    'voice_whistle', 'voice_swap', 'voice_brr', 'voice_taunt',
+    'voice_swap',
     for (final v in voiceBases) ...[v, '${v}_low', '${v}_high'],
   ];
 
@@ -112,16 +114,70 @@ class AudioService {
     } catch (_) {}
   }
 
-  void sfx(String name, {double volume = 1.0}) {
+  /// When each clip was last started, and at what volume.
+  ///
+  /// A single explosive kill asks for six to ten sounds inside one frame —
+  /// the blast, the shockwave, a yelp and a thud per crew member caught, an
+  /// elimination sting, the shooter's laugh. Each of those was three platform
+  /// channel round-trips (stop, setVolume, resume), so one impact could fire
+  /// two dozen messages across the channel in a single frame. That is a
+  /// well-known way to drop frames on a real device, and it happens at
+  /// exactly the moment the player is watching a body fly.
+  final Map<String, DateTime> _lastAt = {};
+  final Map<String, double> _lastVol = {};
+
+  /// Two requests for the SAME clip closer together than this are one sound.
+  /// Restarting a clip a few milliseconds in is inaudible anyway — the ear
+  /// hears one hit either way — so the second request buys nothing but
+  /// channel traffic.
+  static const Duration _retrigger = Duration(milliseconds: 55);
+
+  /// How many *different* voice clips may start in one burst. Three crew
+  /// caught by one blast used to yelp over each other into mush; capping it
+  /// keeps the reaction legible and cuts the burst down.
+  static const int _voiceBurstCap = 2;
+  static const Duration _voiceBurstWindow = Duration(milliseconds: 110);
+  DateTime _voiceBurstStart = DateTime.fromMillisecondsSinceEpoch(0);
+  int _voiceBurstCount = 0;
+
+  /// True if [name] should be skipped this instant.
+  ///
+  /// Exposed for tests: without a platform implementation the audio stack is
+  /// a no-op, so the throttle is the only part of this that can be checked at
+  /// all — and it is the part that changes what the player hears.
+  @visibleForTesting
+  bool throttled(String name, {bool voice = false}) {
+    final now = DateTime.now();
+    final last = _lastAt[name];
+    if (last != null && now.difference(last) < _retrigger) return true;
+    if (voice) {
+      if (now.difference(_voiceBurstStart) > _voiceBurstWindow) {
+        _voiceBurstStart = now;
+        _voiceBurstCount = 0;
+      }
+      if (_voiceBurstCount >= _voiceBurstCap) return true;
+      _voiceBurstCount++;
+    }
+    _lastAt[name] = now;
+    return false;
+  }
+
+  void sfx(String name, {double volume = 1.0, bool voice = false}) {
     if (!_ready || !_available || _sfxVol <= 0.01) return;
+    if (throttled(name, voice: voice)) return;
     final vol = (volume * _sfxVol).clamp(0.0, 1.0);
     final locked = _locked[name];
     if (locked != null) {
       // Preloaded: a stop + resume restarts the clip with no re-decode.
+      // setVolume is skipped when it has not changed, which removes a third
+      // of the channel traffic — the volume only ever moves when the player
+      // changes it in settings.
+      final needVol = (_lastVol[name] ?? -1) != vol;
+      if (needVol) _lastVol[name] = vol;
       () async {
         try {
           await locked.stop();
-          await locked.setVolume(vol);
+          if (needVol) await locked.setVolume(vol);
           await locked.resume();
         } catch (_) {}
       }();
@@ -139,6 +195,16 @@ class AudioService {
         await p.play(AssetSource('sfx/$name.wav'));
       } catch (_) {}
     }();
+  }
+
+  /// Clears the throttle bookkeeping, so one test's burst cannot leak into
+  /// the next through the singleton.
+  @visibleForTesting
+  void resetThrottle() {
+    _lastAt.clear();
+    _lastVol.clear();
+    _voiceBurstCount = 0;
+    _voiceBurstStart = DateTime.fromMillisecondsSinceEpoch(0);
   }
 
   void dispose() {

@@ -119,6 +119,21 @@ extension VoiceTypeInfo on VoiceType {
       };
 }
 
+/// The physical half of a character: what they do when they are knocked off
+/// their feet. Kept separate from the cosmetic definition so the battle can
+/// take it without dragging colours and hats along.
+class RagdollTraits {
+  final double mass;
+  final double flail;
+  final double flipBias;
+  final double getUpSpeed;
+
+  const RagdollTraits(
+      {this.mass = 1, this.flail = 0.5, this.flipBias = 1, this.getUpSpeed = 1});
+
+  static const standard = RagdollTraits();
+}
+
 class CharacterDef {
   final CrewLook look;
   final String name;
@@ -149,7 +164,25 @@ class CharacterDef {
   /// Build multiplier applied to the drawn body. A dockhand is broad, a
   /// dune runner is wiry. Small numbers on purpose — the silhouettes still
   /// have to read at raft scale.
+  ///
+  /// It also sets how heavy the character is when they are knocked down —
+  /// see [RagdollTraits].
   final double build;
+
+  /// How much this character throws their limbs about when knocked down,
+  /// 0 (goes limp) to 1 (windmills). Every body used to tumble in exactly
+  /// the same way, which is most of why a deck of different-looking crew
+  /// still read as one puppet the moment anything hit them.
+  final double flail;
+
+  /// How readily a blow tips this character into a somersault, as a
+  /// multiplier on the base chance. A wiry runner cartwheels; a dockhand
+  /// mostly just goes over.
+  final double flipBias;
+
+  /// How quickly they get back on their feet, as a multiplier on the
+  /// stand-up time. Under 1 is springy, over 1 is a struggle.
+  final double getUpSpeed;
 
   const CharacterDef({
     required this.look,
@@ -165,7 +198,20 @@ class CharacterDef {
     this.unlockLevel = 0,
     this.playable = false,
     this.build = 1.0,
+    this.flail = 0.5,
+    this.flipBias = 1.0,
+    this.getUpSpeed = 1.0,
   });
+
+  /// How this character behaves as a ragdoll.
+  RagdollTraits get ragdoll => RagdollTraits(
+        // Broad characters are heavier: they are shoved less far by the same
+        // blow, spin slower, and land harder.
+        mass: build * build,
+        flail: flail,
+        flipBias: flipBias,
+        getUpSpeed: getUpSpeed,
+      );
 
   String get id => look.name;
 }
@@ -194,6 +240,7 @@ class Cast {
       mark: FaceMark.none,
       voice: VoiceType.mid,
       playable: true,
+      flail: 0.5, flipBias: 1.0, getUpSpeed: 1.0,
     ),
     CharacterDef(
       look: CrewLook.drifter,
@@ -209,6 +256,7 @@ class Cast {
       unlockLevel: 3,
       playable: true,
       build: 1.02,
+      flail: 0.25, flipBias: 0.8, getUpSpeed: 1.25,
     ),
     CharacterDef(
       look: CrewLook.swimmer,
@@ -224,6 +272,7 @@ class Cast {
       unlockLevel: 6,
       playable: true,
       build: 0.94,
+      flail: 0.9, flipBias: 1.35, getUpSpeed: 0.75,
     ),
 
     // ---- Scavengers: the first seas --------------------------------------
@@ -238,6 +287,7 @@ class Cast {
       gear: HeadGear.bandana,
       mark: FaceMark.stubble,
       voice: VoiceType.mid,
+      flail: 0.75, flipBias: 1.15, getUpSpeed: 0.9,
     ),
     CharacterDef(
       look: CrewLook.ducker,
@@ -251,6 +301,7 @@ class Cast {
       mark: FaceMark.goggles,
       voice: VoiceType.high,
       build: 0.95,
+      flail: 1.0, flipBias: 1.45, getUpSpeed: 0.7,
     ),
 
     // ---- Buccaneers ------------------------------------------------------
@@ -268,6 +319,7 @@ class Cast {
       unlockLevel: 9,
       playable: true,
       build: 1.05,
+      flail: 0.35, flipBias: 0.85, getUpSpeed: 1.1,
     ),
     CharacterDef(
       look: CrewLook.captain,
@@ -281,6 +333,7 @@ class Cast {
       mark: FaceMark.eyePatch,
       voice: VoiceType.low,
       build: 1.08,
+      flail: 0.2, flipBias: 0.7, getUpSpeed: 1.2,
     ),
     CharacterDef(
       look: CrewLook.gunner,
@@ -294,6 +347,7 @@ class Cast {
       mark: FaceMark.scar,
       voice: VoiceType.mid,
       build: 1.04,
+      flail: 0.6, flipBias: 1.0, getUpSpeed: 0.95,
     ),
 
     // ---- Frostbound: the mountain sea ------------------------------------
@@ -311,6 +365,7 @@ class Cast {
       unlockLevel: 12,
       playable: true,
       build: 1.1,
+      flail: 0.3, flipBias: 0.75, getUpSpeed: 1.3,
     ),
     CharacterDef(
       look: CrewLook.icebreaker,
@@ -324,6 +379,7 @@ class Cast {
       mark: FaceMark.goggles,
       voice: VoiceType.mid,
       build: 1.06,
+      flail: 0.45, flipBias: 0.9, getUpSpeed: 1.05,
     ),
 
     // ---- Sunbaked: the desert sea ----------------------------------------
@@ -340,6 +396,7 @@ class Cast {
       voice: VoiceType.mid,
       unlockLevel: 15,
       playable: true,
+      flail: 0.55, flipBias: 1.05, getUpSpeed: 0.95,
     ),
     CharacterDef(
       look: CrewLook.duneRunner,
@@ -353,6 +410,7 @@ class Cast {
       mark: FaceMark.warPaint,
       voice: VoiceType.high,
       build: 0.92,
+      flail: 1.0, flipBias: 1.5, getUpSpeed: 0.65,
     ),
 
     // ---- Emberkin: the volcano sea ---------------------------------------
@@ -370,6 +428,7 @@ class Cast {
       unlockLevel: 18,
       playable: true,
       build: 1.08,
+      flail: 0.15, flipBias: 0.7, getUpSpeed: 1.35,
     ),
     CharacterDef(
       look: CrewLook.ashwalker,
@@ -382,6 +441,7 @@ class Cast {
       gear: HeadGear.hood,
       mark: FaceMark.scar,
       voice: VoiceType.mid,
+      flail: 0.7, flipBias: 1.1, getUpSpeed: 0.9,
     ),
 
     // ---- Harbour: the city sea -------------------------------------------
@@ -399,6 +459,7 @@ class Cast {
       unlockLevel: 21,
       playable: true,
       build: 1.12,
+      flail: 0.2, flipBias: 0.6, getUpSpeed: 1.4,
     ),
     CharacterDef(
       look: CrewLook.neonRunner,
@@ -414,6 +475,7 @@ class Cast {
       unlockLevel: 25,
       playable: true,
       build: 0.96,
+      flail: 0.95, flipBias: 1.4, getUpSpeed: 0.7,
     ),
   ];
 

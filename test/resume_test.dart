@@ -53,8 +53,13 @@ void main() {
       before.world.raftOf(0)!.crew[0].hp = 41;
       before.world.raftOf(1)!.crew[0].hp = 12;
       before.world.raftOf(1)!.activeIndex = 1;
-      before.ammo['grenade'] = 1;
-      before.selectWeapon('grenade');
+      // Each seat has its own rack, so both are set and both are checked —
+      // a snapshot that only carried one of them would leave a resumed
+      // opponent unable to fire what they still had.
+      before.ammoOf(0)['grenade'] = 1;
+      before.setWeaponOf(0, 'grenade');
+      before.ammoOf(1)['grenade'] = 3;
+      before.setWeaponOf(1, 'bomb');
       before.round = 4;
       before.shotsFired = 9;
       before.shotsHit = 5;
@@ -71,8 +76,11 @@ void main() {
       expect(after.world.raftOf(0)!.crew[0].hp, 41);
       expect(after.world.raftOf(1)!.crew[0].hp, 12);
       expect(after.world.raftOf(1)!.activeIndex, 1);
-      expect(after.ammo['grenade'], 1);
-      expect(after.selectedWeaponId, 'grenade');
+      expect(after.ammoOf(0)['grenade'], 1);
+      expect(after.weaponOf(0), 'grenade');
+      expect(after.ammoOf(1)['grenade'], 3,
+          reason: "the other seat's rack came back wrong");
+      expect(after.weaponOf(1), 'bomb');
       expect(after.round, 4);
       expect(after.shotsFired, 9);
       expect(after.shotsHit, 5);

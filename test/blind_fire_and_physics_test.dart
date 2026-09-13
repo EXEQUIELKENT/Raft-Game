@@ -485,7 +485,10 @@ void main() {
       var sawSplash = false;
       for (int i = 0; i < 900 && !(c.drowned && c.sinkT >= 1); i++) {
         world.update(1 / 60);
-        if ((foe.loadout.crewOffset(0) + c.offset.dx).abs() >= foe.deckHalf) {
+        // stationX, not loadout.crewOffset: the foe fires left, so its deck
+        // plan is mirrored, and the unmirrored offset is on the wrong side of
+        // the boat. The two only agreed while the plans were symmetric.
+        if ((foe.stationX(0) + c.offset.dx).abs() >= foe.deckHalf) {
           leftDeck = true;
         }
         if (world.effects.any((f) => f.kind == 'splash')) sawSplash = true;

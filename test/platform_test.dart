@@ -233,7 +233,12 @@ void main() {
             reason: 'even the anchor cannot sweep a body off a 260-wide deck');
         final hipX = raft.stationX(raft.crew.indexOf(c)) +
             (c.pose?.hip.pos.dx ?? c.offset.dx);
-        expect(hipX.abs(), lessThan(raft.deckHalf),
+        // The rail's own lip is part of the raft: a body it has just caught
+        // is draped across the edge for a moment before it settles and walks
+        // back. Escaping means reaching open water, not overhanging by an
+        // inch — and the berths sit much closer to the rails now that crew
+        // are spread across the deck instead of bunched amidships.
+        expect(hipX.abs(), lessThan(raft.deckHalf + BattleConst.railWall),
             reason: 'the body is still over the planks');
       }
 
@@ -352,6 +357,9 @@ void main() {
       final ctrl = newMatch(hull: 'galleon', size: 'large');
       final raft = ctrl.world.raftOf(0)!;
       final c = raft.crew.first;
+      // The surface this crew member starts on — their berth may be on a
+      // raised tier, and the hop is bounded relative to that.
+      final startY = raft.surfaceY(raft.stationX(0)) ?? 0.0;
 
       // Worst case: the heaviest shell, dead-centre head shot, then a
       // stacked second hit mid-flight.
@@ -365,11 +373,16 @@ void main() {
         }
         final p = c.pose;
         if (p == null) break;
+        // Measured from the surface this crew member was standing ON, not
+        // from the main deck plane. The hulls carry real upper levels now —
+        // a roofed quarterdeck stands its crew a couple of body heights above
+        // the waist — and an absolute ceiling would call a perfectly ordinary
+        // hop from up there a launch.
         for (final point in p.points) {
-          expect(point.pos.dy, greaterThan(-100),
+          expect(point.pos.dy, greaterThan(startY - 100),
               reason: 'no point may fly more than ~30 units above the deck');
         }
-        expect(p.hip.pos.dy, greaterThan(-50),
+        expect(p.hip.pos.dy, greaterThan(startY - 50),
             reason: 'the body hops, it does not launch');
       }
       ctrl.dispose();

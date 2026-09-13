@@ -16,6 +16,29 @@ import 'package:flutter/material.dart';
 /// their rafts apart at a glance.
 /// ---------------------------------------------------------------------------
 
+/// The hull's actual OUTLINE, not its decoration.
+///
+/// Every hull used to be the same rounded rectangle with different trim
+/// painted on it — so the fleet read as one shape in five colours however
+/// much detail was added on top. The silhouette is the thing you recognise a
+/// boat by at raft scale, so it is the thing that has to differ.
+enum HullShape {
+  /// An inflatable ring: fat capsule with the tube's inner hole showing.
+  ring,
+
+  /// Round logs lashed side by side, flat on top and scalloped underneath.
+  logs,
+
+  /// A plank deck riding on separate cylindrical floats.
+  pontoon,
+
+  /// A real boat: raked stem at the bow, transom aft, curved sheer.
+  boat,
+
+  /// A tall ship's hull: high stern quarter, tumblehome sides, sternpost.
+  carrack,
+}
+
 class RaftHull {
   final String id;
   final String name;
@@ -35,6 +58,9 @@ class RaftHull {
   /// Draws a mast + sail behind the crew.
   final bool hasMast;
 
+  /// The outline this hull is cut to.
+  final HullShape shape;
+
   const RaftHull({
     required this.id,
     required this.name,
@@ -43,28 +69,31 @@ class RaftHull {
     this.thickness = 0.26,
     this.rounding = 1.0,
     this.hasMast = false,
+    this.shape = HullShape.ring,
   });
 
   static const List<RaftHull> all = [
     RaftHull(
       id: 'tube', name: 'Pool Tube', desc: 'Bouncy inflatable ring. Light and cheerful.',
-      thickness: 0.26, rounding: 1.0,
+      thickness: 0.26, rounding: 1.0, shape: HullShape.ring,
     ),
     RaftHull(
       id: 'log', name: 'Log Raft', desc: 'Lashed timber. The classic castaway special.',
-      tierRequired: 1, thickness: 0.17, rounding: 0.18,
+      tierRequired: 1, thickness: 0.19, rounding: 0.18, shape: HullShape.logs,
     ),
     RaftHull(
       id: 'barrel', name: 'Barrel Float', desc: 'Planks over sealed barrels. Rides high.',
-      tierRequired: 2, thickness: 0.26, rounding: 0.35,
+      tierRequired: 2, thickness: 0.26, rounding: 0.35, shape: HullShape.pontoon,
     ),
     RaftHull(
       id: 'sloop', name: 'Little Sloop', desc: 'A proper hull, and a proper sail.',
       tierRequired: 3, thickness: 0.28, rounding: 0.3, hasMast: true,
+      shape: HullShape.boat,
     ),
     RaftHull(
       id: 'galleon', name: 'Galleon Deck', desc: 'Captain-grade timber. Nothing sinks it easily.',
-      tierRequired: 4, thickness: 0.30, rounding: 0.24, hasMast: true,
+      tierRequired: 4, thickness: 0.32, rounding: 0.24, hasMast: true,
+      shape: HullShape.carrack,
     ),
   ];
 
@@ -210,6 +239,21 @@ enum DeckStyle {
 
   /// A cargo stack — crates roped down, no railing.
   cargo,
+
+
+  /// A deck house: walls, a shuttered window and a doorway, with a walkable
+  /// roof on top. This is the "second floor" — crew posted to the tier above
+  /// are standing on this cabin's roof.
+  cabin,
+
+  /// A planked roof over the tier below, with a ridge and a lantern hook.
+  roof,
+
+  /// A working deck: a table with stools, tankards and a lamp.
+  galley,
+
+  /// Stacked barrels, lashed down and standing on their ends.
+  barrelStack,
 }
 
 /// A crew berth: where one crew member stands, and what they are standing on.
@@ -276,34 +320,46 @@ class DeckProfile {
   ///
   /// Spans are normalised on use, so they need only be proportional.
   static const Map<String, List<DeckTier>> _plans = {
-    // One cheerful flat ring — the starter raft has nothing to climb.
+    // One cheerful flat ring — the starter raft has nothing to climb, and
+    // nothing on it to shift its crew off centre. Its silhouette is what
+    // makes it different now (see [HullShape.ring]), not its deck plan.
     'tube': [
       DeckTier(span: 1, rise: 0, crewWeight: 3),
     ],
-    // Lashed timber: a low sleeping platform aft, open deck forward.
+    // Lashed timber: a sleeping platform aft, the crew's table on the open
+    // deck forward. The stairs between levels are drawn on the connecting
+    // ramp the profile builder inserts, not as a tier of their own.
     'log': [
-      DeckTier(span: 0.40, rise: 8, crewWeight: 2, style: DeckStyle.lashed),
-      DeckTier(span: 0.60, rise: 0, crewWeight: 2),
+      DeckTier(span: 0.36, rise: 10, crewWeight: 2, style: DeckStyle.lashed),
+      DeckTier(span: 0.42, rise: 0, crewWeight: 2, style: DeckStyle.galley),
+      DeckTier(span: 0.22, rise: 0, crewWeight: 1),
     ],
-    // Planks over sealed barrels: two steps down from stern to bow.
+    // Planks over sealed barrels, stepping down stern to bow, with the spare
+    // barrels stacked and lashed amidships.
     'barrel': [
-      DeckTier(span: 0.34, rise: 13, crewWeight: 2, style: DeckStyle.barrels),
-      DeckTier(span: 0.36, rise: 6, crewWeight: 2, style: DeckStyle.barrels),
-      DeckTier(span: 0.30, rise: 0, crewWeight: 1),
+      DeckTier(span: 0.30, rise: 15, crewWeight: 2, style: DeckStyle.barrels),
+      DeckTier(span: 0.26, rise: 7, crewWeight: 2, style: DeckStyle.barrels),
+      DeckTier(span: 0.22, rise: 0, crewWeight: 0, style: DeckStyle.barrelStack),
+      DeckTier(span: 0.22, rise: 0, crewWeight: 1),
     ],
-    // A proper little ship: raised stern castle, working deck, and cargo at
-    // the bow that is scenery only (crewWeight 0) so nobody stands on it.
+    // A proper little ship, and the first with a SECOND FLOOR: the stern
+    // cabin is a room with a window and a door, and the tier above it is its
+    // roof — crew posted there are standing on top of the cabin.
     'sloop': [
-      DeckTier(span: 0.32, rise: 17, crewWeight: 3, style: DeckStyle.castle),
-      DeckTier(span: 0.46, rise: 0, crewWeight: 2),
-      DeckTier(span: 0.22, rise: 7, crewWeight: 0, style: DeckStyle.cargo),
+      DeckTier(span: 0.26, rise: 21, crewWeight: 2, style: DeckStyle.roof),
+      DeckTier(span: 0.22, rise: 10, crewWeight: 1, style: DeckStyle.cabin),
+      DeckTier(span: 0.34, rise: 0, crewWeight: 2, style: DeckStyle.galley),
+      DeckTier(span: 0.18, rise: 7, crewWeight: 0, style: DeckStyle.cargo),
     ],
-    // Captain's deck: high castle aft, main deck amidships, raised
-    // forecastle at the bow — three separate levels to fight from.
+    // The captain's ship: a roofed quarterdeck over a cabin, a working waist
+    // with the galley table, stairs up to a raised forecastle, and stores
+    // lashed at the bow. Four levels to fight from.
     'galleon': [
-      DeckTier(span: 0.30, rise: 21, crewWeight: 3, style: DeckStyle.castle),
-      DeckTier(span: 0.42, rise: 0, crewWeight: 2),
-      DeckTier(span: 0.28, rise: 11, crewWeight: 2, style: DeckStyle.castle),
+      DeckTier(span: 0.22, rise: 24, crewWeight: 2, style: DeckStyle.roof),
+      DeckTier(span: 0.18, rise: 12, crewWeight: 1, style: DeckStyle.cabin),
+      DeckTier(span: 0.26, rise: 0, crewWeight: 2, style: DeckStyle.galley),
+      DeckTier(span: 0.20, rise: 13, crewWeight: 2, style: DeckStyle.castle),
+      DeckTier(span: 0.14, rise: 0, crewWeight: 0, style: DeckStyle.barrelStack),
     ],
   };
 
@@ -320,6 +376,11 @@ class DeckProfile {
   /// Shoulder-to-shoulder spacing between two crew on the same tier. A body
   /// is about 29 units across, so anything tighter draws them overlapping.
   static const double minBerthGap = 42.0;
+
+  /// The gap crew are given when the tier has room for it. The minimum above
+  /// is the point at which bodies start to overlap; this is what a deck with
+  /// space to spare should actually look like.
+  static const double roomyBerthGap = 82.0;
 
   /// How far a berth stays clear of the deck edge.
   ///
@@ -518,10 +579,16 @@ class DeckProfile {
         out.add(DeckStation(x: (x0 + x1) / 2, rise: t.rise));
         continue;
       }
-      // Space them a full body apart about the band's centre, shrinking the
-      // spread only as far as the band forces — overlapping crew look far
-      // worse than a slightly tighter line.
-      final span = min(minBerthGap * (n - 1), x1 - x0);
+      // Spread them across the band about its centre.
+      //
+      // [minBerthGap] used to cap this, not floor it: crew were pinned at the
+      // MINIMUM 42 units apart however much deck they had, so a wide raft
+      // stood its people shoulder to shoulder in the middle with empty planks
+      // either side. It reads as cramped, and it bunches the whole crew
+      // inside one blast radius. The gap they actually get now opens out to
+      // [roomyBerthGap] when the tier can afford it, and only closes back
+      // toward the minimum when the band genuinely is narrow.
+      final span = min(roomyBerthGap * (n - 1), x1 - x0);
       final lo = (x0 + x1) / 2 - span / 2;
       for (int k = 0; k < n; k++) {
         out.add(DeckStation(x: lo + span * k / (n - 1), rise: t.rise));

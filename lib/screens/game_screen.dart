@@ -57,6 +57,11 @@ class _GameScreenState extends State<GameScreen> {
   /// Widgets that own their own taps and must not also drive aiming.
   final GlobalKey _weaponBarKey = GlobalKey();
   final GlobalKey _nudgeBarKey = GlobalKey();
+
+  /// The walk pads' own key, so a finger on them never also starts an aim
+  /// drag — same exclusion the weapon bar and nudge bar already use.
+  final GlobalKey _walkBarKey = GlobalKey();
+  final GlobalKey _fireBtnKey = GlobalKey();
   final GlobalKey _topBarKey = GlobalKey();
 
   /// Desktop only: the battle is driven by a pull-back drag, which a mouse
@@ -236,7 +241,13 @@ class _GameScreenState extends State<GameScreen> {
 
   List<Rect> _excludedRects() {
     final rects = <Rect>[];
-    for (final key in [_weaponBarKey, _nudgeBarKey, _topBarKey]) {
+    for (final key in [
+      _weaponBarKey,
+      _nudgeBarKey,
+      _topBarKey,
+      _walkBarKey,
+      _fireBtnKey,
+    ]) {
       final box = key.currentContext?.findRenderObject() as RenderBox?;
       if (box == null || !box.attached) continue;
       rects.add(box.localToGlobal(Offset.zero) & box.size);
@@ -292,9 +303,24 @@ class _GameScreenState extends State<GameScreen> {
     });
     if (!wasCharging || origin == null || current == null) return;
     // Only a deliberate pull past the dead zone fires — a stray tap never does.
-    if ((current - origin).distance < BattleConst.deadzone) return;
+    if ((current - origin).distance < BattleConst.deadzone) {
+      // …but a tap is now how you take the helm: tapping one of your own crew
+      // hands them the turn, and the walk controls below move them about the
+      // deck. Anything else (open water, an enemy, a body still tumbling)
+      // falls through and does nothing, exactly as it did before.
+      ctrl.selectCrewAt(_worldFromLocal(current));
+      return;
+    }
     if (SaveService.instance.data.vibration) HapticFeedback.heavyImpact();
     ctrl.humanFire();
+  }
+
+  /// Screen point -> world point, the inverse of what the renderer does when
+  /// it scales the world to the viewport and slides it by the camera.
+  Offset _worldFromLocal(Offset local) {
+    final screen = MediaQuery.sizeOf(context);
+    final scale = screen.height / BattleConst.worldH;
+    return Offset(local.dx / scale + ctrl.world.cam, local.dy / scale);
   }
 
   /// A gesture the OS interrupts mid-drag must not fire — reset cleanly.
@@ -558,9 +584,29 @@ class _GameScreenState extends State<GameScreen> {
       child: Row(
         crossAxisAlignment: CrossAxisAlignment.end,
         children: [
-          _weaponBar(),
+          Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              // Only on your own turn, and only while there is somebody on
+              // their feet to walk — the pads would be a lie otherwise.
+              if (ctrl.canSteer) ...[
+                _walkBar(),
+                const SizedBox(height: 8),
+              ],
+              _weaponBar(),
+            ],
+          ),
           const Spacer(),
-          _nudgeBar(),
+          Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.end,
+            children: [
+              _nudgeBar(),
+              const SizedBox(height: 10),
+              _fireButton(),
+            ],
+          ),
         ],
       ),
     );
@@ -655,6 +701,107 @@ class _GameScreenState extends State<GameScreen> {
     );
   }
 
+  /// Walk controls for the crew member the player has the helm of.
+  ///
+  /// Held, not tapped: the crew member walks for exactly as long as a finger
+  /// is down, which is what makes repositioning feel like steering rather
+  /// than nudging. Releasing hands the body back to the simulation, which
+  /// walks them home the same way it does after a knockdown.
+  Widget _walkBar() {
+    Widget pad(String glyph, int dir) => Listener(
+          onPointerDown: (_) {
+            AudioService.instance.sfx('click');
+            ctrl.setWalk(dir);
+            setState(() {});
+          },
+          onPointerUp: (_) {
+            ctrl.setWalk(0);
+            setState(() {});
+          },
+          onPointerCancel: (_) {
+            ctrl.setWalk(0);
+            setState(() {});
+          },
+          child: Container(
+            key: dir < 0 ? _walkBarKey : null,
+            width: 52,
+            height: 46,
+            alignment: Alignment.center,
+            decoration: RT.pill(
+              color: ctrl.walkDir == dir ? RT.orange : RT.ink,
+              opacity: ctrl.walkDir == dir ? 0.95 : 0.58,
+              radius: 14,
+            ),
+            child: Text(glyph,
+                style: RT.chunky(size: 22, color: Colors.white)),
+          ),
+        );
+
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        pad('◀', -1),
+        const SizedBox(width: 8),
+        pad('▶', 1),
+        const SizedBox(width: 10),
+        Container(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+          decoration: RT.pill(color: RT.ink, opacity: 0.5, radius: 14),
+          child: Text('TAP A CREW MEMBER TO SWITCH',
+              style: RT.body(
+                  size: 9,
+                  color: Colors.white.withOpacity(0.85),
+                  weight: FontWeight.w800,
+                  letterSpacing: 0.8)),
+        ),
+      ],
+    );
+  }
+
+
+  /// The FIRE button.
+  ///
+  /// Pull-and-release on the world is still the main way to shoot, and it is
+  /// the expressive one — it sets angle and power together. This is the
+  /// other half: line the shot up with the angle and power nudges, then
+  /// press a button you can actually see. It fires the shot exactly as
+  /// currently aimed, which is what the readout above has been showing all
+  /// along.
+  ///
+  /// Greyed rather than hidden when it cannot fire, so its place on screen
+  /// never moves and a thumb resting there is never surprised.
+  Widget _fireButton() {
+    final live = ctrl.canFire;
+    return Listener(
+      onPointerDown: (_) {
+        if (!live) {
+          AudioService.instance.sfx('click');
+          return;
+        }
+        if (SaveService.instance.data.vibration) HapticFeedback.heavyImpact();
+        ctrl.humanFire();
+        setState(() {});
+      },
+      child: Container(
+        key: _fireBtnKey,
+        width: 96,
+        height: 64,
+        alignment: Alignment.center,
+        decoration: RT.pill(
+          color: live ? RT.orange : RT.ink,
+          opacity: live ? 0.96 : 0.45,
+          radius: 20,
+        ),
+        child: Text(
+          'FIRE',
+          style: RT.chunky(
+            size: 21,
+            color: live ? Colors.white : Colors.white.withOpacity(0.5),
+          ),
+        ),
+      ),
+    );
+  }
   Widget _roundBtn(String glyph, VoidCallback onTap, {double size = 36}) {
     return GestureDetector(
       onTap: () {
