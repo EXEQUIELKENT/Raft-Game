@@ -1,0 +1,327 @@
+name: Release Please
+
+# Runs on every push to main. Most pushes just update (or open) a standing
+# "chore: release X.Y.Z" PR with the version bump and changelog computed from
+# Conventional Commits since the last release — nothing is built or published
+# at that point.
+#
+# Merging that PR is what actually cuts a release: release-please tags the
+# merge commit, writes the GitHub Release with the changelog as its notes, and
+# THIS SAME WORKFLOW RUN then builds the APK/AAB and attaches them to it,
+# because `release_created` comes back true only on that run. That attachment
+# is the game download players get from the Releases page.
+on:
+  push:
+    branches: [ main ]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+    steps:
+      # release-please decides whether to release (and whether it is a
+      # patch/minor/major) purely by parsing commit messages for Conventional
+      # Commits prefixes ("fix: ...", "feat: ...", etc.) — that parsing IS the
+      # mechanism, there is no config flag to loosen it.
+      #
+      # Commits written without a prefix — which is most of them when messages
+      # come out of an editor's suggestion box — are plain prose that the
+      # parser cannot classify, so it silently ignores them: no version bump,
+      # no changelog line, and if EVERY commit since the last release looks
+      # like that, no release PR gets created or updated at all.
+      #
+      # The step below is a safety net, not a replacement for typing a prefix
+      # when you want one. For every commit since the last release that is not
+      # already a Conventional Commit it adds one small empty commit reusing
+      # THAT commit's own message with a "fix: " prefix — so the changelog
+      # still reads like something a person wrote, and every push keeps
+      # producing a normal patch release.
+      #
+      # It loops over every commit in the range individually, oldest first,
+      # rather than checking whether *any* Conventional Commit exists and
+      # looking at `git log -1`. Doing it the short way means only one
+      # commit's description ever becomes a Conventional Commit, and since
+      # release-please reads nothing else, every other plain commit is
+      # invisible to it — the release PR then lists a single line no matter
+      # how much landed.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Ensure every commit since the last release is a Conventional Commit
+        run: |
+          set -euo pipefail
+          latest_tag="$(git describe --tags --abbrev=0 2>/dev/null || true)"
+          range="HEAD"
+          if [ -n "$latest_tag" ]; then
+            range="${latest_tag}..HEAD"
+          fi
+
+          if [ -z "$(git rev-list "$range")" ]; then
+            echo "No new commits since ${latest_tag:-the start of history} — nothing to do."
+            exit 0
+          fi
+
+          conventional='^(feat|fix|perf|revert|refactor|docs|chore|test|build|ci)(\([^)]*\))?!?:'
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Oldest first, so the synthetic commits — and the changelog
+          # release-please writes from them — land in the order the real
+          # commits happened rather than newest-first. `--no-merges` skips
+          # GitHub's own "Merge pull request #N from ..." commits: those are
+          # not something a person wrote describing a change, so turning one
+          # into "fix: Merge pull request #N" would add noise, not a missing
+          # description.
+          added=0
+          while IFS= read -r sha; do
+            subject="$(git log -1 --pretty=%s "$sha")"
+            if echo "$subject" | grep -Eiq "$conventional"; then
+              continue
+            fi
+            clean="$(echo "$subject" | sed -E 's/ *\(#[0-9]+\)$//')"
+            echo "No Conventional Commit prefix on ${sha:0:7} — adding: fix: ${clean}"
+            # Carry the original commit's DESCRIPTION across too, not just its
+            # subject line: a subject-only stand-in drops the body on the
+            # floor and nothing downstream can show it again. It also means
+            # the body's own footers (a `BREAKING CHANGE:` line, say) reach
+            # release-please's parser, which reads them off the body.
+            body="$(git log -1 --pretty=%b "$sha")"
+            if [ -n "$(printf '%s' "$body" | tr -d '[:space:]')" ]; then
+              git commit --allow-empty -m "fix: ${clean}" -m "$body"
+            else
+              git commit --allow-empty -m "fix: ${clean}"
+            fi
+            added=$((added + 1))
+          done < <(git rev-list --reverse --no-merges "$range")
+
+          if [ "$added" -eq 0 ]; then
+            echo "Every commit since ${latest_tag:-the start of history} is already a Conventional Commit — nothing to do."
+            exit 0
+          fi
+
+          echo "Added ${added} 'fix:' commit(s) so the changelog picks up every plain commit individually."
+          git push origin HEAD:${{ github.ref_name }}
+
+      - uses: googleapis/release-please-action@v4
+        id: release
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+      # release-please writes its PR body straight from Conventional Commit
+      # SUBJECT lines — that is what its changelog is, one bullet per subject —
+      # and there is no setting that folds a commit's body into those bullets.
+      # So the descriptions are added alongside it, as a comment on the PR.
+      #
+      # It has to happen here rather than in pr-update.yml: that workflow
+      # listens for `pull_request`, and GitHub will not raise those events for
+      # a PR opened by the built-in GITHUB_TOKEN, so it can never see a release
+      # PR. This step runs in the very push-to-main run that creates or updates
+      # the PR, so it needs no event of its own.
+      #
+      # The range is "since the last release tag", NOT the PR's own diff: the
+      # release PR only ever contains the version bump and the changelog, while
+      # the commits the release is MADE of are everything landed on main since
+      # the previous tag.
+      - name: Collect the descriptions of every commit in this release
+        id: notes
+        if: ${{ steps.release.outputs.pr }}
+        run: |
+          set -euo pipefail
+
+          # The new tag does not exist until the release PR is merged, so the
+          # newest tag right now is still the PREVIOUS release — which is
+          # exactly the start of the range being released.
+          latest_tag="$(git describe --tags --abbrev=0 2>/dev/null || true)"
+          if [ -n "$latest_tag" ]; then
+            mapfile -t shas < <(git rev-list --reverse --no-merges "${latest_tag}..HEAD")
+          else
+            # First release: the range is the whole history, so cap it — a
+            # GitHub comment is limited to 65536 characters.
+            mapfile -t shas < <(git rev-list --no-merges -n 50 HEAD | tac)
+          fi
+
+          # A description is arbitrary text from a person and can contain a
+          # line reading exactly "EOF", which would close the heredoc early —
+          # hence a per-run random delimiter.
+          delim="RELNOTES_${RANDOM}${RANDOM}"
+
+          {
+            echo "body<<${delim}"
+            echo "### 📝 What's in this release"
+            echo ""
+            echo "Full commit descriptions, since the changelog above lists"
+            echo "only the subject lines."
+            echo ""
+
+            for sha in ${shas[@]+"${shas[@]}"}; do
+              # Skip the empty Conventional-Commit stand-ins added by the step
+              # above: each duplicates a real commit's message, so listing them
+              # too would print every description twice. They are the only
+              # commits here that change no files.
+              if [ -z "$(git diff-tree --no-commit-id --name-only -r "$sha")" ]; then
+                continue
+              fi
+              subject="$(git log -1 --pretty=%s "$sha" | sed -E 's/ *\(#[0-9]+\)$//')"
+              # Release-please's own version-bump commits describe the release
+              # machinery, not the work in it.
+              if echo "$subject" | grep -Eq '^chore(\([^)]*\))?: release '; then
+                continue
+              fi
+              body="$(git log -1 --pretty=%b "$sha")"
+
+              echo "- **${subject}** (\`${sha:0:7}\`)"
+              # Only when there is a real description — a body of nothing but
+              # whitespace counts as none.
+              if [ -n "$(printf '%s' "$body" | tr -d '[:space:]')" ]; then
+                echo ""
+                # Indented so it nests under its bullet in Markdown.
+                printf '%s\n' "$body" | sed 's/^/  /'
+              fi
+              echo ""
+            done
+
+            echo "${delim}"
+          } >> "$GITHUB_OUTPUT"
+
+      # Kept as a comment rather than appended to the PR body: release-please
+      # rewrites that body from scratch on every push to main, and parses it
+      # back to work out what it has already proposed. A separate comment,
+      # updated in place by its marker, cannot interfere with either.
+      - name: Post the descriptions on the release PR
+        if: ${{ steps.release.outputs.pr }}
+        uses: actions/github-script@v7
+        env:
+          NOTES_BODY: ${{ steps.notes.outputs.body }}
+          PR_JSON: ${{ steps.release.outputs.pr }}
+        with:
+          script: |
+            const marker = '<!-- RELEASE_COMMIT_DESCRIPTIONS -->';
+            const body = marker + '\n' + process.env.NOTES_BODY;
+            const number = JSON.parse(process.env.PR_JSON).number;
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: number,
+            });
+
+            const ours = comments.find((c) => c.body && c.body.includes(marker));
+            if (ours) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: ours.id,
+                body,
+              });
+              console.log(`Updated descriptions comment #${ours.id} on PR #${number}`);
+            } else {
+              const { data: created } = await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: number,
+                body,
+              });
+              console.log(`Created descriptions comment #${created.id} on PR #${number}`);
+            }
+
+  build:
+    needs: release-please
+    if: needs.release-please.outputs.release_created == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      # Check out the tag release-please just created, not whatever HEAD of
+      # main happens to be — they are usually the same commit, but the tag is
+      # the source of truth for what is being shipped.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.release-please.outputs.tag_name }}
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: 'stable'
+          cache: true
+
+      - name: Install dependencies
+        run: flutter pub get
+
+      # Decode the real signing key from GitHub Secrets.
+      #
+      # No `if:` on this step, deliberately. A step's `if:` cannot read an
+      # `env:` block declared on that SAME step — GitHub only exposes
+      # step-level env once the step is already running, not while its own
+      # `if:` is evaluated — so gating this on a secret-derived env var makes
+      # it silently never run even with the secrets set correctly. This is the
+      # workflow that fires automatically and produces the release players
+      # download, so getting that wrong means every release is signed with a
+      # fresh throwaway debug key and conflicts with the one before it.
+      - name: Set up Android signing
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_STORE_PASSWORD: ${{ secrets.ANDROID_STORE_PASSWORD }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+        run: |
+          if [ -z "$ANDROID_KEYSTORE_BASE64" ]; then
+            echo "::warning::ANDROID_KEYSTORE_BASE64 is not set — this build"
+            echo "::warning::will be signed with a throwaway debug key and"
+            echo "::warning::will NOT install over any previous release."
+            exit 0
+          fi
+          echo "$ANDROID_KEYSTORE_BASE64" | base64 -d > android/app/release-key.jks
+          {
+            echo "storePassword=$ANDROID_STORE_PASSWORD"
+            echo "keyPassword=$ANDROID_KEY_PASSWORD"
+            echo "keyAlias=${ANDROID_KEY_ALIAS:-raftrumble}"
+          } > android/app/key.properties
+
+      - name: Build release APK
+        env:
+          RAFT_SERVER: ${{ vars.RAFT_SERVER }}
+        run: |
+          flutter build apk --release \
+            --dart-define=RAFT_SERVER="${RAFT_SERVER:-https://envious-dropbox-taste.ngrok-free.dev/Battle-Ship-Blitz-Mobile-Game/server}"
+
+      - name: Build release App Bundle
+        env:
+          RAFT_SERVER: ${{ vars.RAFT_SERVER }}
+        run: |
+          flutter build appbundle --release \
+            --dart-define=RAFT_SERVER="${RAFT_SERVER:-https://envious-dropbox-taste.ngrok-free.dev/Battle-Ship-Blitz-Mobile-Game/server}"
+
+      - name: Stage artifacts
+        run: |
+          mkdir -p dist
+          tag="${{ needs.release-please.outputs.tag_name }}"
+          # tag_name is already "raft_rumble-v1.0.1" (component + version) —
+          # strip the component prefix so it is not repeated in the filename,
+          # i.e. "raft-rumble-v1.0.1.apk" rather than
+          # "raft-rumble-raft_rumble-v1.0.1.apk".
+          version="${tag#raft_rumble-}"
+          cp build/app/outputs/flutter-apk/app-release.apk "dist/raft-rumble-${version}.apk"
+          cp build/app/outputs/bundle/release/app-release.aab "dist/raft-rumble-${version}.aab"
+
+      # The Release itself — tag, title and changelog body — already exists,
+      # written by release-please. This step only attaches the built
+      # installables to it, so there is deliberately no `name`/`body`/
+      # `generate_release_notes` here: setting any of those would blow away
+      # the changelog release-please wrote.
+      - name: Attach build artifacts to the release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.release-please.outputs.tag_name }}
+          files: dist/*

@@ -43,3 +43,12 @@ app.*.map.json
 /android/app/debug
 /android/app/profile
 /android/app/release
+
+# Release signing — never commit the key or its passwords. See
+# docs/RELEASE_SIGNING.md. Losing these means no future build can install
+# over an existing one without an uninstall, so keep a copy off this machine.
+android/key.properties
+android/app/key.properties
+android/release-key.jks
+android/app/release-key.jks
+docs/.keystore-base64.txt

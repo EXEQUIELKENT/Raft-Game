@@ -1,0 +1,137 @@
+name: PR Update Summary
+
+# Runs whenever a pull request is opened, reopened, or has new commits pushed
+# to it (synchronize). It posts — or updates — a single comment on the PR
+# that lists the PR's title and every commit's title + full description, so
+# reviewers see the complete change context without having to click through
+# to the commits tab.
+#
+# NOT the release PRs. GitHub deliberately refuses to start a workflow from
+# an event raised by the built-in GITHUB_TOKEN, so the "chore: release X.Y.Z"
+# pull request that release-please opens as github-actions[bot] never fires
+# `pull_request` here — which is why those PRs listed bare commit titles and
+# nothing else. They are handled inside `release-please.yml` instead, on the
+# push-to-main run that creates them; see the comment-posting step there.
+#
+# A release PR would want a different commit range anyway: its own diff is
+# just the version bump and the changelog, while the commits the release is
+# actually made of are everything since the previous tag.
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  pull-requests: write
+  contents: read
+
+jobs:
+  summarize:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+
+      # Build the summary body. We gather the PR title and, for each commit
+      # in the PR, its subject line plus the full commit body (description).
+      # Using the PR head ref as the base ensures we only list commits that
+      # are actually part of this PR, not everything on main.
+      - name: Build PR summary
+        id: summary
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+
+          # A commit description is arbitrary text from a person, so it can
+          # contain a line reading exactly "EOF" — which would close this
+          # heredoc early and corrupt (or let someone inject into) the step
+          # output. A per-run random delimiter cannot be guessed or typed
+          # into a commit message by accident.
+          delim="PRSUMMARY_${RANDOM}${RANDOM}"
+
+          {
+            echo "body<<${delim}"
+            echo "### 🚀 New Update — ${PR_TITLE}"
+            echo ""
+            echo "---"
+            echo ""
+
+            # List each commit in the PR, oldest first, with its full
+            # description (commit body) preserved.
+            #
+            # BUGFIX: this used to ask git for one NUL-delimited record per
+            # commit (`--format='%s%x01%b%x00'`) and split it in the shell.
+            # git still writes a newline BETWEEN entries, so every record
+            # after the first arrived with a leading newline glued to the
+            # subject — which came out as `- **` on one line and the
+            # subject on the next, breaking the bullet for every commit but
+            # the first. Reading a plain list of SHAs and asking for each
+            # message separately sidesteps the parsing entirely, and
+            # `$(...)` strips the trailing newlines git puts after a body
+            # for free.
+            while IFS= read -r sha; do
+              subject="$(git log -1 --pretty=%s "$sha")"
+              body="$(git log -1 --pretty=%b "$sha")"
+
+              echo "- **${subject}**"
+              # Print the description only when there is a real one, so a
+              # clean single-line commit doesn't leave a blank quote behind
+              # (a body of nothing but whitespace counts as none).
+              if [ -n "$(printf '%s' "$body" | tr -d '[:space:]')" ]; then
+                echo ""
+                # Indent the body so it nests under the bullet in
+                # Markdown — reads like a quote of the commit message.
+                printf '%s\n' "$body" | sed 's/^/  /'
+              fi
+              echo ""
+            done < <(git rev-list --reverse "${BASE_SHA}..${HEAD_SHA}")
+
+            echo "---"
+            echo ""
+            echo "_Posted by PR Update Summary workflow_"
+            echo "${delim}"
+          } >> "$GITHUB_OUTPUT"
+
+      # Post the summary as a comment, or update the one we already left if a
+      # new push landed on the PR. We search the PR's comments for one
+      # carrying our unique HTML marker and update it in place if found,
+      # otherwise create a fresh one — so there is exactly one summary
+      # comment no matter how many times new commits land on the PR.
+      - name: Post or update PR comment
+        uses: actions/github-script@v7
+        env:
+          SUMMARY_BODY: ${{ steps.summary.outputs.body }}
+        with:
+          script: |
+            const body = process.env.SUMMARY_BODY;
+            const marker = '<!-- PR_UPDATE_SUMMARY -->';
+            const taggedBody = marker + '\n' + body;
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+
+            const ours = comments.find((c) => c.body && c.body.includes(marker));
+            if (ours) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: ours.id,
+                body: taggedBody,
+              });
+              console.log(`Updated existing summary comment #${ours.id}`);
+            } else {
+              const { data: created } = await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: taggedBody,
+              });
+              console.log(`Created summary comment #${created.id}`);
+            }

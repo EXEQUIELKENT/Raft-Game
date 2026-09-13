@@ -1,0 +1,84 @@
+name: Build Android APK
+
+# Every push to main gets an installable APK, attached to the run as a build
+# artifact. This is the "grab the current build" path — it publishes nothing
+# and cuts no version. Releases come from release-please.yml.
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch: {}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: 'stable'
+          cache: true
+
+      # Sign with the SAME key local builds use, so an APK from here can be
+      # installed straight over one built on the dev machine (and vice versa)
+      # instead of being rejected for a signature mismatch.
+      #
+      # Without these secrets the build still succeeds — it just falls back to
+      # the debug keystore, which the CI runner generates fresh for itself, so
+      # the resulting APK will NOT install over any other build. See
+      # docs/RELEASE_SIGNING.md for the one-time setup.
+      #
+      # Note there is deliberately no `if:` on this step. A step's `if:`
+      # cannot read an `env:` block declared on that same step — GitHub only
+      # exposes step-level env once the step is already running — so gating
+      # this on `env.HAS_KEYSTORE` would make it silently never run even with
+      # the secrets set correctly. The step always runs and the script decides.
+      - name: Restore release keystore
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.ANDROID_STORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+        run: |
+          if [ -z "$KEYSTORE_BASE64" ]; then
+            echo "::warning::ANDROID_KEYSTORE_BASE64 is not set — this APK will be"
+            echo "::warning::signed with a throwaway debug key and will NOT install"
+            echo "::warning::over a build made anywhere else."
+            exit 0
+          fi
+          echo "$KEYSTORE_BASE64" | base64 -d > android/app/release-key.jks
+          {
+            echo "storePassword=$STORE_PASSWORD"
+            echo "keyPassword=$KEY_PASSWORD"
+            echo "keyAlias=${KEY_ALIAS:-raftrumble}"
+          } > android/app/key.properties
+
+      - name: Install dependencies
+        run: flutter pub get
+
+      - name: Analyze
+        run: flutter analyze --no-fatal-infos
+
+      - name: Test
+        run: flutter test
+
+      # The online lobby needs a server address baked in, or a release player
+      # has nothing to ping. Set the RAFT_SERVER repository *variable* to
+      # override; the fallback matches the default in server_discovery.dart.
+      - name: Build release APK
+        env:
+          RAFT_SERVER: ${{ vars.RAFT_SERVER }}
+        run: |
+          flutter build apk --release \
+            --dart-define=RAFT_SERVER="${RAFT_SERVER:-https://envious-dropbox-taste.ngrok-free.dev/Battle-Ship-Blitz-Mobile-Game/server}"
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: raft-rumble-apk
+          path: build/app/outputs/flutter-apk/app-release.apk

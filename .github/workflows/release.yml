@@ -1,0 +1,105 @@
+name: Release
+
+# The manual path: push a plain `v1.2.3` tag (or run this by hand) and it
+# builds a signed APK + AAB and publishes a GitHub Release with them attached.
+#
+# The everyday path is release-please.yml, which cuts releases automatically
+# from Conventional Commits. This one exists for cutting a release by hand —
+# a hotfix off a branch, or re-publishing a version whose build failed.
+# Release-please's own tags look like `raft_rumble-v1.2.3` and deliberately do
+# NOT match the pattern below, so the two never fight over the same tag.
+on:
+  push:
+    tags:
+      - 'v*.*.*'          # e.g. v1.0.0, v1.2.3
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version tag to release (e.g. v1.0.1)'
+        required: true
+
+permissions:
+  contents: write          # needed so the action can create the Release/tag
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: 'stable'
+          cache: true
+
+      - name: Install dependencies
+        run: flutter pub get
+
+      - name: Resolve release tag
+        id: ver
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=${{ github.event.inputs.version }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Decode the real signing key from GitHub Secrets. No `if:` on this
+      # step, deliberately — see the note in build-apk.yml: a step's `if:`
+      # cannot read that step's own `env:`, so gating it on a secret-derived
+      # env var makes it silently never run, and every release then falls back
+      # to a throwaway debug key and refuses to install over the last one.
+      - name: Set up Android signing
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_STORE_PASSWORD: ${{ secrets.ANDROID_STORE_PASSWORD }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+        run: |
+          if [ -z "$ANDROID_KEYSTORE_BASE64" ]; then
+            echo "::warning::ANDROID_KEYSTORE_BASE64 is not set — this build"
+            echo "::warning::will be signed with a throwaway debug key and"
+            echo "::warning::will NOT install over any previous release."
+            exit 0
+          fi
+          echo "$ANDROID_KEYSTORE_BASE64" | base64 -d > android/app/release-key.jks
+          {
+            echo "storePassword=$ANDROID_STORE_PASSWORD"
+            echo "keyPassword=$ANDROID_KEY_PASSWORD"
+            echo "keyAlias=${ANDROID_KEY_ALIAS:-raftrumble}"
+          } > android/app/key.properties
+
+      - name: Build release APK
+        env:
+          RAFT_SERVER: ${{ vars.RAFT_SERVER }}
+        run: |
+          flutter build apk --release \
+            --dart-define=RAFT_SERVER="${RAFT_SERVER:-https://envious-dropbox-taste.ngrok-free.dev/Battle-Ship-Blitz-Mobile-Game/server}"
+
+      - name: Build release App Bundle
+        env:
+          RAFT_SERVER: ${{ vars.RAFT_SERVER }}
+        run: |
+          flutter build appbundle --release \
+            --dart-define=RAFT_SERVER="${RAFT_SERVER:-https://envious-dropbox-taste.ngrok-free.dev/Battle-Ship-Blitz-Mobile-Game/server}"
+
+      - name: Stage artifacts
+        run: |
+          mkdir -p dist
+          cp build/app/outputs/flutter-apk/app-release.apk \
+             "dist/raft-rumble-${{ steps.ver.outputs.tag }}.apk"
+          cp build/app/outputs/bundle/release/app-release.aab \
+             "dist/raft-rumble-${{ steps.ver.outputs.tag }}.aab"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.tag }}
+          name: Raft Rumble ${{ steps.ver.outputs.tag }}
+          generate_release_notes: true
+          files: dist/*
