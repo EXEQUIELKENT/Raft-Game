@@ -81,7 +81,10 @@ void main() {
     );
     // Long enough for the outgoing route to be disposed, which is the half
     // of the transition that used to overwrite the music.
-    await tester.pumpAndSettle(const Duration(seconds: 2));
+    // pump, not pumpAndSettle: the battle screen renders every frame by
+    // design, so there is no quiescent state to settle into.
+    await tester.pump(const Duration(milliseconds: 400));
+    await tester.pump(const Duration(milliseconds: 400));
 
     expect(AudioService.instance.lastMusicRequest, 'music_battle',
         reason: 'the outgoing level handed the music back to the menu over '
@@ -91,6 +94,7 @@ void main() {
   testWidgets('leaving the last battle does give the music back',
       (tester) async {
     phone(tester);
+    // The counting must not go so far the other way that the menu never
     // gets its own theme back.
     final nav = GlobalKey<NavigatorState>();
     await tester.pumpWidget(MaterialApp(
@@ -100,11 +104,14 @@ void main() {
     nav.currentState!.push(
       MaterialPageRoute(builder: (_) => battle(GameMaps.all.first)),
     );
-    await tester.pumpAndSettle();
+    await tester.pump(const Duration(milliseconds: 400));
     expect(AudioService.instance.lastMusicRequest, 'music_battle');
 
     nav.currentState!.pop();
-    await tester.pumpAndSettle(const Duration(seconds: 2));
+    // pump, not pumpAndSettle: the battle screen renders every frame by
+    // design, so there is no quiescent state to settle into.
+    await tester.pump(const Duration(milliseconds: 400));
+    await tester.pump(const Duration(milliseconds: 400));
 
     expect(AudioService.instance.lastMusicRequest, 'music_menu',
         reason: 'the battle theme kept playing back on the menu');
@@ -113,6 +120,7 @@ void main() {
   testWidgets('a whole run of levels never falls back to the menu theme',
       (tester) async {
     phone(tester);
+    // Three levels deep, because a counter that is wrong by one survives a
     // single transition and fails on the next.
     final nav = GlobalKey<NavigatorState>();
     await tester.pumpWidget(MaterialApp(
@@ -126,7 +134,10 @@ void main() {
         MaterialPageRoute(
             builder: (_) => battle(GameMaps.all[i % GameMaps.all.length])),
       );
-      await tester.pumpAndSettle(const Duration(seconds: 2));
+      // pump, not pumpAndSettle: the battle screen renders every frame
+      // by design, so there is no quiescent state to settle into.
+      await tester.pump(const Duration(milliseconds: 400));
+      await tester.pump(const Duration(milliseconds: 400));
       expect(AudioService.instance.lastMusicRequest, 'music_battle',
           reason: 'the menu theme came back on level ${i + 1}');
     }

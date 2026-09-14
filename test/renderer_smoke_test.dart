@@ -2,7 +2,6 @@ import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
-import 'package:google_fonts/google_fonts.dart';
 import 'package:raft_rumble/game/battle.dart';
 import 'package:raft_rumble/game/characters.dart';
 import 'package:raft_rumble/game/maps.dart';
@@ -43,12 +42,7 @@ WorldRenderer _battle(BattleWorld world) => WorldRenderer(world, map: world.map)
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
 
-  setUp(() {
-    SaveService.instance.data = SaveData();
-    // Widget tests have no network; without this google_fonts tries to
-    // fetch webfonts and the paint pass reports fetch failures.
-    GoogleFonts.config.allowRuntimeFetching = false;
-  });
+  setUp(() => SaveService.instance.data = SaveData());
 
   RaftLoadout loadout({int color = 0}) =>
       RaftLoadout.custom(hullId: 'tube', sizeId: 'medium', colorIndex: color);

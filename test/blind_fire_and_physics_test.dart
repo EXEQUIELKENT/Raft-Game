@@ -439,7 +439,15 @@ void main() {
       ctrl.dispose();
     });
 
-    test('Firing holds on the shooter for a beat, then cuts to the projectile', () async {
+    test('Firing holds on the shooter for a beat, then cuts to the projectile',
+        () {
+      // Stepped rather than slept through. This used to wait on real
+      // `Future.delayed`s and let the controller's own wall-clock timer
+      // advance the world underneath — which stopped working the moment the
+      // loop moved onto the display's vsync, because a plain unit test
+      // produces no frames. Driving it explicitly is what the rest of this
+      // file already does, and it is deterministic besides: no test should
+      // depend on how many timer ticks happened to land in 100ms.
       final ctrl = newMatch();
       final world = ctrl.world;
 
@@ -449,20 +457,27 @@ void main() {
       ctrl.humanFire();
       expect(ctrl.phase, GamePhase.firing);
 
+      void run(int ms) {
+        for (int i = 0; i < ms * 60 ~/ 1000; i++) {
+          ctrl.stepForTest(1 / 60);
+        }
+      }
+
       // The opening beat: the view stays on the shooter while the shot
-      // leaves the barrel. 100ms cannot possibly reach the end of the hold
-      // (the ticker's dt is clamped at 50ms and the hold is 450ms), so this
+      // leaves the barrel. 100ms is well inside the 450ms hold, so this
       // asserts the hold rather than racing it.
-      await Future<void>.delayed(const Duration(milliseconds: 100));
-      expect(ctrl.phase, GamePhase.firing, reason: 'the shot is still in flight');
+      run(100);
+      expect(ctrl.phase, GamePhase.firing,
+          reason: 'the shot is still in flight');
       expect((world.cam - camAtFire).abs(), lessThan(40),
-          reason: 'the camera has not cut away yet — the shooter gets their beat');
+          reason: 'the camera has not cut away yet — the shooter gets their '
+              'beat');
 
       // Past the hold window the view has cut to the projectile and is
       // travelling with it toward the target. The cut alone clears this:
       // by then the ball is a few hundred units out, so centring on it
       // moves the camera well past the shooter.
-      await Future<void>.delayed(const Duration(milliseconds: 900));
+      run(900);
       expect(world.cam, greaterThan(camAtFire + 100),
           reason: 'the camera has cut to the projectile and followed it out');
 

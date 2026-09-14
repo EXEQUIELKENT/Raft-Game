@@ -55,6 +55,19 @@ class WorldRenderer {
     Raft? buildTarget,
   }) {
     _buildTarget = buildTarget;
+    // A degenerate canvas is refused rather than divided by.
+    //
+    // `viewWidth` below is `size.width / scale`, and `scale` is proportional
+    // to the height — so a zero-sized paint makes it `0 / 0`, and NaN does
+    // not stay put. It is written straight onto the world, where the camera
+    // clamp picks it up, and from that moment every frame is NaN: the match
+    // renders as a flat void and never recovers, because nothing ever
+    // divides its way back to a real number.
+    //
+    // Layout can legitimately hand over a zero size for a frame — during a
+    // route transition, or while a parent is between measurements. Skipping
+    // that frame costs nothing and cannot corrupt anything.
+    if (size.width <= 0 || size.height <= 0) return;
     final scale = size.height / BattleConst.worldH;
     world.viewWidth = size.width / scale;
     if (!_decorBuilt) _buildDecor();
@@ -74,23 +87,39 @@ class WorldRenderer {
       );
     }
 
-    _drawSky(canvas, time);
-    _drawClouds(canvas, time);
-    _drawProps(canvas, time);
-    _drawWater(canvas, time);
-    _drawObstacles(canvas, time);
-    _drawRafts(
-      canvas, time,
-      currentPlayer: currentPlayer,
-      isAiming: isAiming,
-      aimAngleDeg: aimAngleDeg,
-      weapon: weapon,
-    );
-    _drawShot(canvas);
-    _drawEffects(canvas);
+    if (!skipLayers.contains('sky')) _drawSky(canvas, time);
+    if (!skipLayers.contains('clouds')) _drawClouds(canvas, time);
+    if (!skipLayers.contains('props')) _drawProps(canvas, time);
+    if (!skipLayers.contains('water')) _drawWater(canvas, time);
+    if (!skipLayers.contains('obstacles')) _drawObstacles(canvas, time);
+    if (!skipLayers.contains('rafts')) {
+      _drawRafts(
+        canvas, time,
+        currentPlayer: currentPlayer,
+        isAiming: isAiming,
+        aimAngleDeg: aimAngleDeg,
+        weapon: weapon,
+      );
+    }
+    if (!skipLayers.contains('shot')) _drawShot(canvas);
+    if (!skipLayers.contains('effects')) _drawEffects(canvas);
 
     canvas.restore();
   }
+
+  /// Layers to leave out of the scene.
+  ///
+  /// Two uses, and they are why this is a real setting rather than a debug
+  /// flag. The main menu draws its mascot by rendering an actual raft and
+  /// crew through this renderer with everything but `rafts` held out — so
+  /// the character on the menu is the same drawing, from the same code, as
+  /// the one you play (see `MenuMascot`). And a frame budget is only ever
+  /// blown by one or two things, which reading the code is a poor way to
+  /// find: rendering repeatedly with one layer held out names the culprit,
+  /// and then says whether the fix worked (see `tool/bench.dart`).
+  ///
+  /// Empty for an ordinary battle frame.
+  Set<String> skipLayers = const {};
 
   // ---------------------------------------------------------------------------
   // Decoration

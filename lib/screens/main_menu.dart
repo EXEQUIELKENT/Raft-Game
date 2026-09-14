@@ -1,12 +1,10 @@
-import 'dart:math';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import '../game/audio.dart';
-import '../game/character_art.dart';
-import '../game/characters.dart';
 import '../game/save.dart';
 import '../theme.dart';
+import '../widgets/menu_mascot.dart';
 import 'armory_screen.dart';
 import 'campaign_screen.dart';
 import 'characters_screen.dart';
@@ -181,7 +179,7 @@ class _MainMenuScreenState extends State<MainMenuScreen> with TickerProviderStat
           const SizedBox(width: 5),
           Text('${save.wins} WINS', style: RT.body(size: 13, color: RT.ink, weight: FontWeight.w800)),
           const SizedBox(width: 12),
-          const Text('◉', style: TextStyle(color: RT.yellow, fontSize: 15, fontWeight: FontWeight.w900)),
+          const Icon(Icons.monetization_on, color: RT.yellow, size: 15),
           const SizedBox(width: 5),
           Text('${save.doubloons}', style: RT.body(size: 13, color: RT.ink, weight: FontWeight.w800)),
         ],
@@ -261,171 +259,6 @@ class _Cloud extends StatelessWidget {
         height: h,
         decoration: BoxDecoration(color: Colors.white.withOpacity(opacity), borderRadius: BorderRadius.circular(h)),
       );
-}
-
-/// The menu mascot: the player's OWN captain, on a raft.
-///
-/// It used to be a hand-assembled stack of [Container]s — a plain circle, two
-/// floating eyebrow bars, a nose dot, a rectangle for a body and an orange
-/// pill for a tube — put together before the crew art existed in its current
-/// form. It had drifted into looking like nothing in the game: no hat, no
-/// character, no relation to the person you actually play.
-///
-/// This draws the same character the battle draws, through the same
-/// [CharacterArt] the roster picker uses, from the look saved in
-/// [SaveData.character]. Two things follow from that, and both are the point:
-/// the menu shows whoever the player has equipped, and it can never go stale
-/// again, because there is no second copy of the art to fall behind.
-class MenuMascot extends StatelessWidget {
-  /// Whose captain to draw. Defaults to the one the player has equipped,
-  /// which is the whole point of it on the menu; naming one is for tests
-  /// and for any screen that wants to show a specific character.
-  final CrewLook? look;
-
-  const MenuMascot({super.key, this.look});
-
-  @override
-  Widget build(BuildContext context) {
-    final look = this.look ??
-        Cast.byId(SaveService.instance.data.character).look;
-    return SizedBox(
-      width: 150,
-      height: 168,
-      child: CustomPaint(painter: _MascotPainter(look)),
-    );
-  }
-}
-
-class _MascotPainter extends CustomPainter {
-  final CrewLook look;
-  const _MascotPainter(this.look);
-
-  @override
-  void paint(Canvas canvas, Size size) {
-    final ch = Cast.of(look);
-    final w = size.width, h = size.height;
-    final cx = w * 0.5;
-
-    // Chunky ink keyline, the same one the buttons and cards use, so the
-    // mascot belongs to this UI rather than to the battle canvas.
-    final line = Paint()
-      ..color = RT.ink
-      ..style = PaintingStyle.stroke
-      ..strokeWidth = 3.4
-      ..strokeJoin = StrokeJoin.round;
-
-    // The raft under them, so they are standing on something. Drawn first
-    // and low, because the character is what the eye should land on.
-    final deckY = h * 0.80;
-    final raft = RRect.fromRectAndRadius(
-      Rect.fromCenter(center: Offset(cx, deckY), width: w * 0.92, height: 20),
-      const Radius.circular(8),
-    );
-    canvas.drawRRect(raft, Paint()..color = const Color(0xFF9A6438));
-    canvas.drawRRect(
-      RRect.fromRectAndRadius(
-        Rect.fromCenter(center: Offset(cx, deckY + 6), width: w * 0.92, height: 8),
-        const Radius.circular(4),
-      ),
-      Paint()..color = const Color(0xFF6B4525),
-    );
-    final seam = Paint()
-      ..color = const Color(0xFF6B4525)
-      ..strokeWidth = 2;
-    for (final f in [-0.30, -0.10, 0.10, 0.30]) {
-      canvas.drawLine(Offset(cx + w * f, deckY - 10),
-          Offset(cx + w * f, deckY + 9), seam);
-    }
-    canvas.drawRRect(raft, line);
-
-    // Arms, behind the torso: one raised in a wave, because the mascot is
-    // greeting you and a mascot with both arms down reads as a mugshot.
-    final limb = Paint()
-      ..color = ch.outfit
-      ..style = PaintingStyle.stroke
-      ..strokeWidth = 11
-      ..strokeCap = StrokeCap.round;
-    final limbLine = Paint()
-      ..color = RT.ink
-      ..style = PaintingStyle.stroke
-      ..strokeWidth = 15
-      ..strokeCap = StrokeCap.round;
-    final shoulderL = Offset(cx - w * 0.15, h * 0.60);
-    final shoulderR = Offset(cx + w * 0.15, h * 0.60);
-    final handUp = Offset(cx + w * 0.33, h * 0.40);
-    final handDown = Offset(cx - w * 0.25, h * 0.72);
-    for (final pair in [(shoulderR, handUp), (shoulderL, handDown)]) {
-      canvas.drawLine(pair.$1, pair.$2, limbLine);
-    }
-    for (final pair in [(shoulderR, handUp), (shoulderL, handDown)]) {
-      canvas.drawLine(pair.$1, pair.$2, limb);
-    }
-    for (final hand in [handUp, handDown]) {
-      canvas.drawCircle(hand, 7.5, Paint()..color = RT.ink);
-      canvas.drawCircle(hand, 5.5, Paint()..color = ch.skin);
-    }
-
-    // Torso, with the character's own sash across it.
-    final torso = RRect.fromRectAndCorners(
-      Rect.fromCenter(center: Offset(cx, h * 0.70), width: w * 0.40, height: h * 0.26),
-      topLeft: const Radius.circular(18),
-      topRight: const Radius.circular(18),
-      bottomLeft: const Radius.circular(5),
-      bottomRight: const Radius.circular(5),
-    );
-    canvas.drawRRect(torso, Paint()..color = ch.outfit);
-    canvas.drawRRect(
-      RRect.fromRectAndRadius(
-        Rect.fromCenter(center: Offset(cx, h * 0.68), width: w * 0.40, height: 8),
-        const Radius.circular(4),
-      ),
-      Paint()..color = ch.accent,
-    );
-    canvas.drawRRect(torso, line);
-
-    // The head — cartoon-large, which is the proportion the crew use too.
-    final headR = w * 0.235;
-    final headC = Offset(cx, h * 0.36);
-    canvas.drawCircle(headC, headR, Paint()..color = ch.skin);
-    canvas.drawArc(
-      Rect.fromCircle(center: headC, radius: headR),
-      0.35, pi * 0.7, false,
-      Paint()
-        ..color = Colors.black.withOpacity(0.07)
-        ..style = PaintingStyle.stroke
-        ..strokeWidth = headR * 0.22,
-    );
-    canvas.drawCircle(headC, headR, line);
-
-    // A cheerful resting face. The battle's expression system is driven by
-    // combat state, and a menu has none — so this is the one place the
-    // expression is a constant rather than a reading.
-    final ink = Paint()..color = RT.ink;
-    for (final s in [-1.0, 1.0]) {
-      canvas.drawCircle(headC + Offset(s * headR * 0.36, -headR * 0.06), headR * 0.16, ink);
-      canvas.drawCircle(headC + Offset(s * headR * 0.36 + headR * 0.06, -headR * 0.13),
-          headR * 0.055, Paint()..color = Colors.white);
-    }
-    canvas.drawArc(
-      Rect.fromCenter(
-          center: headC + Offset(0, headR * 0.36),
-          width: headR * 0.78,
-          height: headR * 0.5),
-      0.2, 2.74, false,
-      Paint()
-        ..color = RT.ink
-        ..style = PaintingStyle.stroke
-        ..strokeWidth = headR * 0.12
-        ..strokeCap = StrokeCap.round,
-    );
-
-    // Hat last, from the shared painter — the whole reason this is drawn
-    // rather than assembled.
-    CharacterArt.headgear(canvas, look, headC, headR, 1);
-  }
-
-  @override
-  bool shouldRepaint(covariant _MascotPainter old) => old.look != look;
 }
 
 class _WavePainter extends CustomPainter {

@@ -2,7 +2,6 @@ import 'dart:ui' show Offset;
 
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
-import 'package:google_fonts/google_fonts.dart';
 
 import 'package:raft_rumble/game/ai.dart';
 import 'package:raft_rumble/game/battle.dart';
@@ -25,7 +24,6 @@ void main() {
 
   setUp(() {
     SaveService.instance.data = SaveData();
-    GoogleFonts.config.allowRuntimeFetching = false;
   });
 
   BattleWorld world({BuildPlan? plan}) {

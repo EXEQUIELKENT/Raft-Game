@@ -11,7 +11,6 @@ dependencies:
     sdk: flutter
   shared_preferences: 2.5.3
   audioplayers: 6.1.0
-  google_fonts: ^6.2.1
 
 dev_dependencies:
   flutter_test:
@@ -22,3 +21,25 @@ flutter:
   uses-material-design: true
   assets:
     - assets/sfx/
+  # Bundled rather than fetched. google_fonts pulled Baloo 2 and Nunito from
+  # fonts.gstatic.com at runtime, which cost an HTTP round trip on first
+  # launch, re-laid out every label when it landed, and left the game in a
+  # fallback typeface entirely on a device with no internet — which a
+  # hotspot match very often is.
+  fonts:
+    - family: Baloo2
+      fonts:
+        - asset: assets/fonts/Baloo2-SemiBold.ttf
+          weight: 600
+        - asset: assets/fonts/Baloo2-Bold.ttf
+          weight: 700
+        - asset: assets/fonts/Baloo2-ExtraBold.ttf
+          weight: 800
+    - family: Nunito
+      fonts:
+        - asset: assets/fonts/Nunito-SemiBold.ttf
+          weight: 600
+        - asset: assets/fonts/Nunito-Bold.ttf
+          weight: 700
+        - asset: assets/fonts/Nunito-ExtraBold.ttf
+          weight: 800

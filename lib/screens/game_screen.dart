@@ -441,11 +441,45 @@ class _GameScreenState extends State<GameScreen> {
           onPointerUp: _onPointerUp,
           onPointerCancel: _onPointerCancel,
           child: Stack(
+            // The stack fills the screen on its own account, rather than
+            // taking its size from whichever children happen to be in it.
+            //
+            // It used to size itself from its children, and a Stack holding
+            // nothing but Positioned ones collapses. That is exactly what
+            // the build phase produces — the scene and the build overlay are
+            // both Positioned.fill and the battle HUD is held back — so once
+            // the HUD returned at SET SAIL the stack came back 0x0. The
+            // world then painted into nothing: `viewWidth` became
+            // `0 / 0`, the camera went NaN with it, and the whole match
+            // rendered as a flat teal void.
+            //
+            // Every non-positioned child here wants the full screen anyway:
+            // the HUD, and the game-over scrim.
+            fit: StackFit.expand,
             children: [
+              // The world gets a layer of its own.
+              //
+              // Without the boundary the scene and the HUD are one layer, and
+              // the scene repaints every single frame by definition — so the
+              // health bar, the weapon chips and the fire button were being
+              // re-rasterised sixty times a second to show exactly what they
+              // showed before. Split off, the HUD only costs anything on the
+              // frames it actually changes on.
+              //
+              // `willChange` is the other half: it tells the raster cache not
+              // to try to cache this picture. Cached content that is thrown
+              // away and rebuilt every frame is worse than uncached, because
+              // the cache pays to store it first.
               Positioned.fill(
-                child: AnimatedBuilder(
-                  animation: ctrl,
-                  builder: (_, __) => CustomPaint(painter: _ScenePainter(ctrl, renderer)),
+                child: RepaintBoundary(
+                  child: AnimatedBuilder(
+                    animation: ctrl,
+                    builder: (_, __) => CustomPaint(
+                      painter: _ScenePainter(ctrl, renderer),
+                      isComplex: true,
+                      willChange: true,
+                    ),
+                  ),
                 ),
               ),
               // The build overlay sits over the world it is editing, so a
@@ -601,8 +635,21 @@ class _GameScreenState extends State<GameScreen> {
               child: Container(
                 padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 7),
                 decoration: RT.pill(color: RT.ink, opacity: 0.6, radius: 12),
-                child: Text('${ctrl.offscreenFoes} FOE OVER THE HORIZON ▸',
-                    style: RT.body(size: 11, color: Colors.white, weight: FontWeight.w800)),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Text('${ctrl.offscreenFoes} FOE OVER THE HORIZON',
+                        style: RT.body(
+                            size: 11,
+                            color: Colors.white,
+                            weight: FontWeight.w800)),
+                    // An icon, not U+25B8: Nunito has no Geometric Shapes at
+                    // all, so the arrow was down to whatever the platform
+                    // happened to substitute.
+                    const Icon(Icons.chevron_right,
+                        size: 15, color: Colors.white),
+                  ],
+                ),
               ),
             ),
           ),
@@ -621,18 +668,20 @@ class _GameScreenState extends State<GameScreen> {
       child: Row(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          _roundBtn('‹', () => Navigator.pop(context), size: 40),
+          _roundBtn(() => Navigator.pop(context), icon: Icons.arrow_back_ios_new, size: 40),
           const SizedBox(width: 10),
-          // Player health. Flexible with a cap rather than a fixed 210:
-          // the row's right-hand chips grow with the level label and the
-          // doubloon count, and a rigid health pill made the whole bar
-          // overflow the screen instead of giving up its own slack.
-          Flexible(
-            flex: 3,
-            child: ConstrainedBox(
-              constraints: const BoxConstraints(maxWidth: 210),
-              child: Container(
-            width: double.infinity,
+          // Player health, at a fixed width and claiming no share of the
+          // free space.
+          //
+          // It was briefly Flexible, to stop the bar overflowing on a narrow
+          // screen — but a flex child takes its share of the leftover width
+          // whether it needs it or not, and at flex 3 against the chips'
+          // flex 1 it swallowed three quarters of the row. The chips then
+          // had nowhere to go but left. The overflow it was guarding against
+          // came from the chips anyway, and they scroll now.
+          SizedBox(
+            width: 210,
+            child: Container(
             padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
             decoration: RT.pill(opacity: 0.8, radius: 14),
             child: Column(
@@ -661,16 +710,21 @@ class _GameScreenState extends State<GameScreen> {
                 ),
               ],
             ),
-          ),
             ),
           ),
           const SizedBox(width: 8),
-          // The readouts, right-aligned and allowed to scroll off to the
-          // LEFT if they cannot all fit. Reversed so the things that must
-          // never be lost — the purse and the crew count — keep the right
-          // edge, and the aim readout is the first to go.
-          Flexible(
-            flex: 5,
+          // The readouts, held against the RIGHT edge and allowed to scroll
+          // off to the left if they cannot all fit. Reversed so the things
+          // that must never be lost — the purse and the crew count — keep
+          // the right edge, and the aim readout is the first to go.
+          //
+          // Expanded rather than Flexible, and this is the whole of it: a
+          // Flexible box only claims its share of the free space, so on a
+          // wide window the chips ended up sitting just after the health
+          // bar with half the screen empty to their right. Expanded takes
+          // everything that is left, so the box it right-aligns inside
+          // actually reaches the edge of the screen.
+          Expanded(
             child: SingleChildScrollView(
               scrollDirection: Axis.horizontal,
               reverse: true,
@@ -685,11 +739,19 @@ class _GameScreenState extends State<GameScreen> {
                     padding:
                         const EdgeInsets.symmetric(horizontal: 12, vertical: 9),
                     decoration: RT.pill(color: RT.yellow, opacity: 1, radius: 13),
-                    child: Text('◉ ${save.doubloons}',
-                        style: RT.body(
-                            size: 12,
-                            color: const Color(0xFF6B4A00),
-                            weight: FontWeight.w800)),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        const Icon(Icons.monetization_on,
+                            size: 14, color: Color(0xFF6B4A00)),
+                        const SizedBox(width: 4),
+                        Text('${save.doubloons}',
+                            style: RT.body(
+                                size: 12,
+                                color: const Color(0xFF6B4A00),
+                                weight: FontWeight.w800)),
+                      ],
+                    ),
                   ),
                 ],
               ),
@@ -717,10 +779,14 @@ class _GameScreenState extends State<GameScreen> {
       child: Row(
         crossAxisAlignment: CrossAxisAlignment.end,
         children: [
-          // Flexible, because the weapon bar grows with however many rounds
-          // the match enables. Fixed, it pushed the fire button off the
-          // right-hand edge of the screen.
-          Flexible(
+          // Expanded, for two reasons at once. It has to be able to give up
+          // width, because the weapon bar grows with however many rounds the
+          // match enables and a rigid one pushed the fire button off the
+          // right-hand edge. And it has to CLAIM the leftover width, because
+          // this is what holds the fire button and the nudge pad against the
+          // right edge — a plain gap here left them stranded in the middle
+          // of a wide window with the whole right half of the screen empty.
+          Expanded(
             child: Column(
               mainAxisSize: MainAxisSize.min,
               crossAxisAlignment: CrossAxisAlignment.start,
@@ -830,13 +896,13 @@ class _GameScreenState extends State<GameScreen> {
       key: _nudgeBarKey,
       mainAxisSize: MainAxisSize.min,
       children: [
-        _roundBtn('▾', () => ctrl.nudgeAngle(-1)),
+        _roundBtn(() => ctrl.nudgeAngle(-1), icon: Icons.keyboard_arrow_down),
         const SizedBox(width: 6),
-        _roundBtn('▴', () => ctrl.nudgeAngle(1)),
+        _roundBtn(() => ctrl.nudgeAngle(1), icon: Icons.keyboard_arrow_up),
         const SizedBox(width: 6),
-        _roundBtn('−', () => ctrl.nudgePower(-1)),
+        _roundBtn(() => ctrl.nudgePower(-1), icon: Icons.remove),
         const SizedBox(width: 6),
-        _roundBtn('+', () => ctrl.nudgePower(1)),
+        _roundBtn(() => ctrl.nudgePower(1), icon: Icons.add),
         const SizedBox(width: 10),
         Container(
           padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 11),
@@ -958,7 +1024,24 @@ class _GameScreenState extends State<GameScreen> {
       ),
     );
   }
-  Widget _roundBtn(String glyph, VoidCallback onTap, {double size = 36}) {
+  /// A small round control. Give it [glyph] or [icon], whichever the mark
+  /// exists as.
+  ///
+  /// The distinction matters now that the typefaces ship with the app. While
+  /// Baloo 2 was being fetched over the network and usually failing, every
+  /// label fell back to a system font that had the whole of the Geometric
+  /// Shapes block; now that the real font loads, the glyphs it does not
+  /// contain are down to per-platform fallback, which is not something to
+  /// build a button out of. Baloo 2 has U+25C0/U+25B6 (the walk pads) but
+  /// not U+25BE/U+25B4 — so the nudge arrows are icons, which ship with the
+  /// app and look the same everywhere.
+  Widget _roundBtn(
+    VoidCallback onTap, {
+    String? glyph,
+    IconData? icon,
+    double size = 36,
+  }) {
+    assert(glyph != null || icon != null);
     return GestureDetector(
       onTap: () {
         AudioService.instance.sfx('click');
@@ -970,7 +1053,10 @@ class _GameScreenState extends State<GameScreen> {
         height: size,
         alignment: Alignment.center,
         decoration: RT.pill(opacity: 0.85, radius: 12),
-        child: Text(glyph, style: RT.chunky(size: size * 0.42, color: RT.ink)),
+        child: icon != null
+            ? Icon(icon, size: size * 0.62, color: RT.ink)
+            : Text(glyph!,
+                style: RT.chunky(size: size * 0.42, color: RT.ink)),
       ),
     );
   }

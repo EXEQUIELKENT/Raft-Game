@@ -3,7 +3,6 @@ import 'dart:ui' show PictureRecorder;
 
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
-import 'package:google_fonts/google_fonts.dart';
 
 import 'package:raft_rumble/game/audio.dart';
 import 'package:raft_rumble/game/characters.dart';
@@ -35,7 +34,6 @@ void main() {
 
   setUp(() {
     SaveService.instance.data = SaveData();
-    GoogleFonts.config.allowRuntimeFetching = false;
   });
 
   RaftLoadout loadout({String hull = 'tube', String size = 'medium', int color = 0}) =>
@@ -1114,7 +1112,7 @@ void main() {
       // TextPainter for each of them, for every crew member hit plus the
       // shooter gloating, was the largest measured share of the stutter.
       final r = paintFrames(hitDeck(), 120);
-      tester.takeException(); // google_fonts cannot fetch in a test
+      tester.takeException();
       expect(r.textLayouts, lessThan(20),
           reason: 'text was re-shaped ${r.textLayouts} times over 120 frames');
     });

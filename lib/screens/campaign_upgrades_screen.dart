@@ -157,7 +157,7 @@ class _CampaignUpgradesScreenState extends State<CampaignUpgradesScreen> {
                                     const SizedBox(width: 4),
                                     Text(
                                       !hasStars
-                                          ? 'NEEDS ${next!.starsRequired} ★ TOTAL'
+                                          ? 'NEEDS ${next!.starsRequired} STARS TOTAL'
                                           : 'UPGRADE — ${next.cost}',
                                       style: RT.chunky(size: 13, color: canAfford && hasStars ? Colors.white : Colors.grey.shade600),
                                     ),
@@ -344,8 +344,10 @@ class _CampaignUpgradesScreenState extends State<CampaignUpgradesScreen> {
                 ),
                 child: Text(
                   !hasStars
-                      ? 'NEEDS ${next.starsRequired} ★ TOTAL'
-                      : '${next.name.toUpperCase()} — ${next.cost} ◉  (${next.crewCapacity} CREW, +${next.hpBonus.round()} HP)',
+                      ? 'NEEDS ${next.starsRequired} STARS TOTAL'
+                      // The coin is spelled out rather than drawn as U+25C9,
+                      // which neither bundled typeface contains.
+                      : '${next.name.toUpperCase()} — ${next.cost} DOUBLOONS  (${next.crewCapacity} CREW, +${next.hpBonus.round()} HP)',
                   textAlign: TextAlign.center,
                   style: RT.chunky(
                       size: 13, color: canAfford && hasStars ? Colors.white : Colors.grey.shade600),
@@ -406,11 +408,27 @@ class _CampaignUpgradesScreenState extends State<CampaignUpgradesScreen> {
                       radius: 12,
                       border: 0,
                     ),
-                    child: Text('+${w.packSize} · ${w.packCost} ◉',
-                        style: RT.body(
-                            size: 11,
-                            color: save.doubloons >= w.packCost ? Colors.white : Colors.grey.shade600,
-                            weight: FontWeight.w800)),
+                    // The coin as an icon rather than U+25C9, which neither
+                    // bundled typeface contains — it matches the purse in
+                    // the header, which was already drawn this way.
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Text('+${w.packSize} · ${w.packCost}',
+                            style: RT.body(
+                                size: 11,
+                                color: save.doubloons >= w.packCost
+                                    ? Colors.white
+                                    : Colors.grey.shade600,
+                                weight: FontWeight.w800)),
+                        const SizedBox(width: 4),
+                        Icon(Icons.monetization_on,
+                            size: 12,
+                            color: save.doubloons >= w.packCost
+                                ? Colors.white
+                                : Colors.grey.shade600),
+                      ],
+                    ),
                   ),
                 ),
               ],

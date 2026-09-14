@@ -1,6 +1,5 @@
 import 'dart:math';
 import 'package:flutter/material.dart';
-import 'package:google_fonts/google_fonts.dart';
 
 /// Raft Rumble theme — "Raft Duel": pirate/nautical, sky-to-sea gradients,
 /// borderless chunky buttons with a color-matched drop shadow, frosted
@@ -41,6 +40,29 @@ class RT {
     Color(0xFFCC8400),
   ];
 
+  /// Built text styles, keyed by the arguments that made them.
+  ///
+  /// These came from the google_fonts package, whose baloo2() measured at
+  /// 30us a call and nunito() at 24us against 0.36us for a plain
+  /// [TextStyle] — eighty times over, because each call went back through
+  /// that package's font registry rather than just filling in a struct.
+  /// Nothing memoised it, so every rebuild of every screen paid it afresh
+  /// for every label: about 78us for one chunky/body pair.
+  ///
+  /// Worse, it fetched the typefaces over HTTP the first time they were
+  /// asked for. Both are now bundled with the app (see pubspec) and these
+  /// are ordinary styles naming a family.
+  ///
+  /// The cache stays regardless. The arguments are a tiny, highly
+  /// repetitive set — a handful of sizes in a handful of colours — and the
+  /// outlined variants build eight [Shadow] objects apiece, so there is no
+  /// reason to make the same one twice. The key is a record rather than a
+  /// hash, so two different styles can never collide onto one entry.
+  static final Map<
+      (double, int, double, int, double),
+      TextStyle> _chunkyCache = {};
+  static final Map<(double, int, int, double), TextStyle> _bodyCache = {};
+
   /// Chunky display text (Baloo 2) — used for titles, buttons, HUD numbers.
   /// [outline] draws an 8-direction ink outline for text sitting directly on
   /// a gradient/photo background; leave it at 0 for text already inside a
@@ -51,8 +73,21 @@ class RT {
     double outline = 0,
     FontWeight weight = FontWeight.w800,
     double letterSpacing = 0.2,
-  }) {
-    return GoogleFonts.baloo2(
+  }) =>
+      _chunkyCache.putIfAbsent(
+        (size, color.value, outline, weight.index, letterSpacing),
+        () => _chunky(size, color, outline, weight, letterSpacing),
+      );
+
+  static TextStyle _chunky(
+    double size,
+    Color color,
+    double outline,
+    FontWeight weight,
+    double letterSpacing,
+  ) {
+    return TextStyle(
+      fontFamily: 'Baloo2',
       fontSize: size,
       fontWeight: weight,
       color: color,
@@ -82,8 +117,20 @@ class RT {
     Color color = ink,
     FontWeight weight = FontWeight.w700,
     double letterSpacing = 0.2,
-  }) {
-    return GoogleFonts.nunito(
+  }) =>
+      _bodyCache.putIfAbsent(
+        (size, color.value, weight.index, letterSpacing),
+        () => _body(size, color, weight, letterSpacing),
+      );
+
+  static TextStyle _body(
+    double size,
+    Color color,
+    FontWeight weight,
+    double letterSpacing,
+  ) {
+    return TextStyle(
+      fontFamily: 'Nunito',
       fontSize: size,
       fontWeight: weight,
       color: color,

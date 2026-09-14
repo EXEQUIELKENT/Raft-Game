@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:ui' show Offset;
 
 import 'package:flutter/foundation.dart';
+import 'package:flutter/scheduler.dart';
 
 import 'ai.dart';
 import 'audio.dart';
@@ -196,8 +197,6 @@ class GameController extends ChangeNotifier {
   int shotsFired = 0;
   int shotsHit = 0;
 
-  Timer? _ticker;
-  DateTime _lastTick = DateTime.now();
   double _accum = 0;
   bool _disposed = false;
   bool _gameEnded = false;
@@ -449,10 +448,75 @@ class GameController extends ChangeNotifier {
   // Ticker
   // ---------------------------------------------------------------------------
 
+  /// Longest step the simulation will take in one go.
+  ///
+  /// After a stall — a garbage collection, a route transition, the app coming
+  /// back from the background — the elapsed time can be enormous. Feeding
+  /// that in whole would teleport shots through rafts and fast-forward the
+  /// turn clock, so the backlog is dropped instead. Slow motion for one
+  /// frame beats a world that jumped.
+  static const double _maxStep = 1 / 20;
+
+  /// Starts the loop on the display's own clock.
+  ///
+  /// This used to be `Timer.periodic(Duration(milliseconds: 16))`, and that
+  /// is the whole reason the game did not hold 60fps. Three separate faults,
+  /// all measured:
+  ///
+  ///  * **16ms is 62.5Hz, not 60.** Measured over 300 ticks it delivered
+  ///    62.4Hz, so it beat continuously against a 60Hz display: roughly
+  ///    twice a second an extra tick fell inside one refresh interval and
+  ///    the frame it produced was overwritten before it was ever shown.
+  ///  * **It is not aligned to vsync at all.** Ticks arrived anywhere from
+  ///    0.00ms to 31.64ms apart (p95 23.84ms). A tick landing just after a
+  ///    refresh shows its work a full frame late; two landing in one
+  ///    interval waste the first. That is visible judder no matter how
+  ///    cheap the frame is — and the frames here are cheap, around 1ms of
+  ///    paint against a 16.7ms budget.
+  ///  * **dt was quantised to whole milliseconds** by `inMilliseconds`, so
+  ///    a 15.9ms gap became 15ms and the motion it described was 6% short,
+  ///    unevenly, every frame.
+  ///
+  /// A frame callback is the display's own heartbeat: exactly one per
+  /// refresh, with the engine's own timestamp. The simulation then advances
+  /// by precisely the time that is about to be shown, which is the
+  /// definition of smooth. On a 90 or 120Hz panel it simply steps smaller
+  /// and renders more often, for free.
+  ///
+  /// The physics does not care what dt it is handed — shot flight and the
+  /// ragdolls each run their own fixed 60Hz accumulator (see
+  /// `_updateFiring` and `BattleWorld.update`) — so this changes when
+  /// frames are produced without changing what they contain.
   void _startTicker() {
-    _lastTick = DateTime.now();
-    _ticker?.cancel();
-    _ticker = Timer.periodic(const Duration(milliseconds: 16), (_) => _tick());
+    _lastStamp = null;
+    _frameScheduled = false;
+    _scheduleFrame();
+  }
+
+  Duration? _lastStamp;
+  bool _frameScheduled = false;
+
+  void _scheduleFrame() {
+    if (_disposed || _frameScheduled) return;
+    _frameScheduled = true;
+    // Also asks the engine for a frame, so the loop sustains itself even on
+    // a turn where nothing else marked anything dirty.
+    SchedulerBinding.instance.scheduleFrameCallback((stamp) {
+      _frameScheduled = false;
+      if (_disposed) return;
+      _onVsync(stamp);
+      _scheduleFrame();
+    });
+  }
+
+  void _onVsync(Duration stamp) {
+    final last = _lastStamp;
+    _lastStamp = stamp;
+    // The first callback only starts the clock; there is no interval yet.
+    if (last == null) return;
+    final dt = (stamp - last).inMicroseconds / 1e6;
+    if (dt <= 0) return;
+    _frame(dt < _maxStep ? dt : _maxStep);
   }
 
   /// Where the last resolved shot landed, horizontally. Exposed so the AI's
@@ -492,14 +556,6 @@ class GameController extends ChangeNotifier {
   /// useless for testing the sweep.
   @visibleForTesting
   void frameForTest(double dt) => _frame(dt);
-
-  void _tick() {
-    if (_disposed) return;
-    final now = DateTime.now();
-    final dt = (now.difference(_lastTick).inMilliseconds / 1000.0).clamp(0.0, 0.05);
-    _lastTick = now;
-    _frame(dt);
-  }
 
   void _frame(double dt) {
     time += dt;
@@ -1742,7 +1798,6 @@ class GameController extends ChangeNotifier {
   @override
   void dispose() {
     _disposed = true;
-    _ticker?.cancel();
     super.dispose();
   }
 }
