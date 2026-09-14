@@ -7,6 +7,8 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:raft_rumble/game/audio.dart';
 import 'package:raft_rumble/game/battle.dart';
 import 'package:raft_rumble/game/campaign.dart';
+import 'package:raft_rumble/game/maps.dart';
+import 'package:raft_rumble/game/raft.dart';
 import 'package:raft_rumble/game/models.dart';
 import 'package:raft_rumble/game/character_art.dart';
 import 'package:raft_rumble/game/characters.dart';
@@ -199,6 +201,28 @@ void main() {
 
   group('Whole-body expression', () {
     Crew crew() => Crew(hp: 100, maxHp: 100);
+    /// A two-raft world, so the activity gate can be asked about a specific
+    /// seat rather than about a lone crew member.
+    BattleWorld world() {
+      final w = BattleWorld(map: GameMaps.all.first, seed: 11);
+      w.obstacles.clear();
+      for (int p = 0; p < 2; p++) {
+        w.addRaft(Raft(
+          playerIndex: p,
+          x: p == 0 ? BattleConst.playerX : BattleConst.enemySlots.first,
+          loadout: RaftLoadout.custom(
+              hullId: 'galleon', sizeId: 'large', colorIndex: p),
+          look: p == 0 ? CrewLook.player : CrewLook.raider,
+          label: 'R$p',
+          facing: p == 0 ? 1 : -1,
+          crew: [
+            for (int k = 0; k < 3; k++)
+              Crew(hp: 100, maxHp: 100, bobPhase: k * 0.7),
+          ],
+        ));
+      }
+      return w;
+    }
 
     test('a healthy idle crew member stands still', () {
       expect(crew().bodyExpression(0).isNeutral, true);
@@ -389,6 +413,76 @@ void main() {
       }
     });
 
+
+    test('the crew member taking aim keeps still', () {
+      // A body twisting about mid-aim looks broken, so whoever is lining up
+      // the shot stays put. This is the half of the rule that must not be
+      // lost while fixing the other half.
+      final w = world();
+      final raft = w.rafts[0];
+      w.aimingPlayer = raft.playerIndex;
+      final shooter = raft.crew[raft.activeIndex];
+      shooter.idle = CrewIdle.none;
+      shooter.idleNextIn = 0;
+      for (int f = 0; f < 60 * 40; f++) {
+        w.update(1 / 60);
+        expect(shooter.idle, CrewIdle.none,
+            reason: 'the crew member taking aim started fidgeting');
+      }
+    });
+
+    test('everybody else stays alive, including the player\'s own shooter',
+        () {
+      // The gate used to be "are you your raft's active crew member?" alone.
+      // That silences the shooter — correct — but it also silences the
+      // PLAYER's chosen crew member for the whole match, including the long
+      // stretches while the other side is taking its turn. They are the one
+      // character the player looks at most and they were the only one on the
+      // deck who never did anything.
+      final w = world();
+      final raft = w.rafts[0];
+      // The OTHER side is up.
+      w.aimingPlayer = 1;
+      final chosen = raft.crew[raft.activeIndex];
+      chosen.idle = CrewIdle.none;
+      chosen.idleNextIn = 0;
+      var busy = 0;
+      for (int f = 0; f < 60 * 40; f++) {
+        w.update(1 / 60);
+        if (chosen.idle != CrewIdle.none) busy++;
+      }
+      expect(busy, greaterThan(200),
+          reason: 'the player\'s chosen crew member stood frozen through the '
+              'whole of the enemy turn');
+    });
+
+    test('a firing flourish may interrupt an ordinary activity', () {
+      // Having just fired is more interesting than whatever they were doing
+      // a moment ago; refusing here meant the shot went unremarked purely
+      // because of an activity the player had already stopped watching.
+      final c = crew();
+      var interrupted = 0;
+      for (int i = 0; i < 400; i++) {
+        c.idle = CrewIdle.yawn;
+        c.idleT = 1;
+        c.startFireFlourish();
+        if (Crew.fireFlourishes.contains(c.idle)) interrupted++;
+      }
+      expect(interrupted, greaterThan(80),
+          reason: 'a flourish never interrupts an activity, so a shot taken '
+              'mid-yawn is never acknowledged');
+    });
+
+    test('but a flourish never interrupts another flourish', () {
+      // That would cut the first pose off halfway.
+      final c = crew();
+      for (int i = 0; i < 200; i++) {
+        c.idle = CrewIdle.fistPump;
+        c.idleT = 1;
+        expect(c.startFireFlourish(), isNull);
+        expect(c.idle, CrewIdle.fistPump);
+      }
+    });
     test('a firing flourish only ever plays after a shot', () {
       // They read as a reaction to having fired — blowing the barrel, a
       // fist-pump — and would be nonsense on somebody standing about.
@@ -426,15 +520,6 @@ void main() {
       expect(thrown, lessThan(360), reason: 'every single shot throws one');
     });
 
-    test('a flourish never interrupts something already running', () {
-      final c = crew();
-      c.idle = CrewIdle.yawn;
-      c.idleT = 1;
-      for (int i = 0; i < 50; i++) {
-        expect(c.startFireFlourish(), isNull);
-        expect(c.idle, CrewIdle.yawn);
-      }
-    });
 
     test('a body being thrown about does not fidget', () {
       final c = crew();

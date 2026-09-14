@@ -83,7 +83,18 @@ class AudioService {
   double get _sfxVol => SaveService.instance.data.sfxVolume;
   double get _musicVol => SaveService.instance.data.musicVolume;
 
+  /// The track most recently asked for, whether or not there is a sound
+  /// device to play it on.
+  ///
+  /// Separate from [_currentMusic], which only moves when audio is actually
+  /// up: the question a test needs to answer is which track a screen ASKED
+  /// for and in what order, and that is exactly what goes wrong when two
+  /// screens hand the music back and forth during a route change.
+  @visibleForTesting
+  String? lastMusicRequest;
+
   Future<void> playMusic(String name) async {
+    lastMusicRequest = name;
     final m = _music;
     if (!_ready || !_available || m == null) return;
     if (_currentMusic == name) return;

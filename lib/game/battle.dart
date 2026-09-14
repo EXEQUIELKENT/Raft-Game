@@ -1,6 +1,8 @@
 import 'dart:math';
 import 'dart:ui';
+import 'package:flutter/foundation.dart' show visibleForTesting;
 
+import 'build.dart';
 import 'characters.dart';
 import 'maps.dart';
 import 'models.dart';
@@ -279,22 +281,38 @@ class BattleConst {
   /// very flattest shots, while a mast stands half again as tall as a person
   /// and has to be gone over.
   static const Map<String, (double halfW, double height, int hits)> obstacleSizes = {
-    'wreck': (70, 40, 0),
-    'rock': (42, 68, 0),
-    'iceberg': (62, 86, 0),
-    'buoy': (13, 92, 2),
-    'crate': (28, 104, 3),
-    'mast': (10, 150, 0),
+    'wreck': (70, 62, 0),
+    'rock': (42, 104, 0),
+    'iceberg': (62, 130, 0),
+    'buoy': (13, 140, 2),
+    'crate': (28, 158, 3),
+    'mast': (10, 224, 0),
+  };
+
+  /// The tallest each kind may ever be drawn relative to its own width.
+  ///
+  /// The height roll and the mid-channel bonus both scale a kind's base, and
+  /// scaling alone does not know what the thing IS: stretched to the same
+  /// multiple, a slender mast still reads as a mast while a crate becomes a
+  /// door and a rock becomes a menhir. Capping on the aspect ratio keeps each
+  /// kind recognisable however tall the channel wants it.
+  static const Map<String, double> obstacleMaxAspect = {
+    'wreck': 1.1,
+    'rock': 2.4,
+    'iceberg': 2.0,
+    'buoy': 6.5,
+    'crate': 3.0,
+    'mast': 12.0,
   };
 
   /// Random scale applied to every obstacle's height.
   ///
-  /// Without it the field is the same set of silhouettes every match and the
-  /// arc that cleared one crate clears every crate forever — which is the
-  /// same "learn the range once" problem the obstacles exist to solve, just
-  /// moved up a level.
-  static const double obstacleHeightMin = 0.8;
-  static const double obstacleHeightMax = 1.5;
+  /// Widened along with the heights themselves: the point of making them tall
+  /// is that the field genuinely dictates the arc, and a tall field that is
+  /// always the SAME tall field is a fixed puzzle you solve once. The spread
+  /// is what keeps each match's channel its own problem.
+  static const double obstacleHeightMin = 0.62;
+  static const double obstacleHeightMax = 1.6;
 
   /// Extra height for standing in mid-channel, at the very centre.
   ///
@@ -305,12 +323,16 @@ class BattleConst {
   /// aim. Putting the height where it changes the aim is the whole point.
   static const double obstacleCentreBoost = 0.6;
 
-  /// Nothing may stand taller than this above the waterline.
-  ///
-  /// The sky is three hundred units deep, and a shot has to be able to clear
-  /// the field with room to spare — an obstacle that reaches most of the way
-  /// up stops being an aiming problem and becomes a wall.
-  static const double obstacleMaxHeight = 205;
+  /// Most a kind may be stretched beyond its own base height. The roll and
+  /// the mid-channel bonus compound, and unclamped they reach about 2.5x,
+  /// which stops a slender kind reading as itself.
+  static const double obstacleStretchMax = 1.85;
+
+  /// Sky left above the tallest obstacle, in world units. The cap is
+  /// measured down from the water at that spot rather than being a fixed
+  /// height, because a terrace raises the water and lowers the ceiling with
+  /// it.
+  static const double obstacleSkyMargin = 26;
   static const double drownDepth = 14;
 
   /// Friction along the deck for a dead body — much slicker than for a
@@ -482,8 +504,21 @@ class BattleConst {
   // Death sequence
   // ---------------------------------------------------------------------------
 
-  /// White impact-flash duration on a killing blow.
-  static const double deathFlashTime = 0.16;
+  /// How long the flare at the wound lasts on a killing blow.
+  ///
+  /// This used to be a 0.16s white overlay across the WHOLE body at 0.85
+  /// alpha — a full-figure strobe on a two-frame timer, which is a flicker
+  /// rather than an impact, and it landed on the same frame the body
+  /// switched from its standing drawing to a ragdoll. Two discontinuities at
+  /// once read as the character being replaced rather than killed.
+  ///
+  /// It is now a flare at the point of impact that eases up and back down,
+  /// with sparks thrown off it, over roughly twice as long — so the eye is
+  /// pulled to the wound while the body takes over underneath.
+  static const double deathFlashTime = 0.34;
+
+  /// How long the body keeps throwing sparks after a killing blow.
+  static const double deathSparkTime = 0.5;
 
   /// Total time a drowned body takes to slip under, and the fraction of
   /// that spent bobbing at the surface before the descent begins.
@@ -1231,6 +1266,16 @@ class Crew {
   /// White impact-flash countdown fired by a killing blow.
   double deathFlash = 0;
 
+  /// Seconds of sparks still coming off a fresh kill. Counts down alongside
+  /// [deathFlash]; the renderer throws embers from the wound while it runs.
+  double deathSpark = 0;
+
+  /// Where the killing blow landed, in the body's own frame — so the flare
+  /// and the sparks come off the wound rather than off the middle of the
+  /// figure. The point of impact IS the thing to look at while the standing
+  /// drawing hands over to the ragdoll underneath it.
+  Offset deathWound = Offset.zero;
+
   // --- Facial expression ------------------------------------------------
 
   /// Seconds left showing a pained wince — set the instant a hit is
@@ -1440,7 +1485,12 @@ class Crew {
   /// Returns the voice line to play, or null.
   String? startFireFlourish() {
     if (!alive || ragdoll || pose != null) return null;
-    if (idle != CrewIdle.none) return null;
+    // A flourish may interrupt somebody mid-yawn — having just fired is more
+    // interesting than whatever they were doing a moment ago, and refusing
+    // here meant the shot went unremarked purely because of an activity the
+    // player had already stopped watching. It will not interrupt ANOTHER
+    // flourish, which would cut the first one off halfway.
+    if (fireFlourishes.contains(idle)) return null;
     if (_idleRng.nextInt(100) >= BattleConst.fireFlourishPercent) return null;
     return _begin(fireFlourishes[_idleRng.nextInt(fireFlourishes.length)]);
   }
@@ -2167,6 +2217,8 @@ class Crew {
         ? (d.dx < 0 ? -1.0 : 1.0)
         : (railDir < 0 ? -1.0 : 1.0);
     deathFlash = BattleConst.deathFlashTime;
+    deathSpark = BattleConst.deathSparkTime;
+    deathWound = hitLocal ?? const Offset(0, -34);
     ragdoll = true;
     ragdollTime = 0;
     rest = 0;
@@ -2224,10 +2276,22 @@ class Raft {
   /// Index of the crew member whose turn it is to shoot on this raft.
   int activeIndex = 0;
 
+  /// What this side is standing on.
+  ///
+  /// A raft is the common case and the default; the rest are the enemy
+  /// emplacements — an island, a rock ledge, lashed hulls, a cove. It
+  /// changes the floors, the width, and whether the thing bobs.
+  final Emplacement emplacement;
+
+  EmplacementDef get place => EmplacementDef.of(emplacement);
+
   /// The deck's platform layout, oriented so the raised stern work sits
   /// behind this raft's crew (see [DeckProfile.forLoadout]).
-  late final DeckProfile profile =
-      DeckProfile.forLoadout(loadout, facing: facing);
+  late final DeckProfile profile = DeckProfile.forLoadout(
+    loadout,
+    facing: facing,
+    emplacement: emplacement,
+  );
 
   Raft({
     required this.playerIndex,
@@ -2237,6 +2301,7 @@ class Raft {
     required this.label,
     required this.facing,
     required this.crew,
+    this.emplacement = Emplacement.raft,
   });
 
   bool get alive => crew.any((c) => c.alive);
@@ -2250,6 +2315,16 @@ class Raft {
   double get hpFrac => maxHp <= 0 ? 0 : (hp / maxHp).clamp(0.0, 1.0);
 
   /// The waterline THIS raft floats on.
+
+  /// The structure this player built, if they built one instead of picking a
+  /// prefab hull.
+  ///
+  /// It sits ON the deck: the hull underneath is still a hull, and the
+  /// blocks are what stands on it. That keeps every existing path working —
+  /// the hull still floats, still bounces shots off its flanks, still holds
+  /// the rails — and confines the new behaviour to the surface the crew walk
+  /// on and the blocks a shot can knock out.
+  BuildPlan? build;
   ///
   /// The sea is terraced (see [WaterProfile]), so a raft on the high side of
   /// a falls genuinely sits above one on the low side — which is the whole
@@ -2268,12 +2343,12 @@ class Raft {
   double get deckY => waterLine - loadout.deckRise;
 
   /// Half the walkable deck. Past this a crew member is over open water.
-  double get deckHalf => loadout.deckHalf;
+  double get deckHalf => loadout.deckHalf * place.widthScale;
 
   /// Half the solid hull — the walkable deck plus the rail/deck edges. A
   /// projectile whose x sits past this (but whose y is at water level) is
   /// clear of the raft entirely.
-  double get hullHalf => loadout.width * 0.5;
+  double get hullHalf => loadout.width * 0.5 * place.widthScale;
 
   /// Bottom edge of the solid hull block, below the waterline.
   double get hullBottom => deckY + loadout.hullHeight;
@@ -2282,9 +2357,27 @@ class Raft {
   /// (0 on the main deck, negative up on a raised platform), or null past
   /// the rails. This is the height-field the body physics and the walk-back
   /// both follow — platforms, ramps and deck are one continuous surface.
+
+  /// True when build column [col] sits fully on this raft's planks.
+  ///
+  /// The build grid is a fixed width so a plan can be carried between rafts
+  /// and the build screen is the same shape every time — which means a wide
+  /// plan on a narrow hull would hang its end blocks over the water. Those
+  /// columns are simply not built: skipped when drawing, skipped when a shot
+  /// tests against them, and contributing nothing to the walkable surface,
+  /// so all three agree.
+  bool buildColumnOnDeck(int col) =>
+      (BuildPlan.columnX(col)).abs() + BuildPlan.cellW / 2 <= deckHalf;
+  /// The walkable surface at hull-local [x], or null past the deck edge.
+  ///
+  /// The higher of the hull's own tiers and whatever the player built on top
+  /// of them, so a structure is something to stand on rather than scenery —
+  /// and so the surface DROPS when the blocks holding it up are shot away.
   double? surfaceY(double x) {
     if (x.abs() > deckHalf) return null;
-    return -profile.riseAt(x);
+    final col = BuildPlan.columnAt(x);
+    final built = (col >= 0 && buildColumnOnDeck(col)) ? build?.riseAt(x) ?? 0 : 0.0;
+    return -max(profile.riseAt(x), built);
   }
 
   /// Hull-local x of crew member [i]'s berth, taken from this raft's own
@@ -2354,7 +2447,14 @@ class Raft {
   /// hand exactly like the renderer does ([WeaponView.forCrew]).
   Offset muzzle({double aimAngleDeg = 45, WeaponDef? weapon}) {
     final i = activeIndex.clamp(0, max(0, crew.length - 1)).toInt();
-    final equippedId = crew[i].equipped ?? weapon?.id;
+    // An explicitly named weapon WINS over whatever is currently in the
+    // crew's hands. Both callers that name one — the fire path and the
+    // planner — are asking the same question: where will the ball leave
+    // from when this round is fired? Deferring to `equipped` answered a
+    // different question (where would it leave from with the last round
+    // still up), and since weapons differ in reach the two answers are a
+    // weapon-length apart.
+    final equippedId = weapon?.id ?? crew[i].equipped;
     final wv = WeaponView.forCrew(equippedId, weapon,
         variant: WeaponView.variantForPhase(crew[i].bobPhase, equippedId ?? 'tennis'));
     final gunSide = facing >= 0 ? 1.0 : -1.0;
@@ -2427,22 +2527,23 @@ class Raft {
   }
 }
 
-/// A projectile in flight.
-
-/// A solid thing floating in the channel, in world coordinates.
-///
-
-/// A step in the waterline, and the falls that joins the two levels.
+/// A step in the waterline, and whatever joins the two levels.
 ///
 /// The water to the right of [x] sits [rise] units higher than the water to
 /// its left — negative when it steps down instead. [width] is how far the
-/// surface takes to make the change, which is the falls itself.
+/// surface takes to make the change, which is the transition itself.
 class WaterStep {
   final double x;
   final double rise;
   final double width;
+  final WaterStepKind kind;
 
-  const WaterStep({required this.x, required this.rise, required this.width});
+  const WaterStep({
+    required this.x,
+    required this.rise,
+    required this.width,
+    this.kind = WaterStepKind.falls,
+  });
 
   double get left => x - width / 2;
   double get right => x + width / 2;
@@ -2574,6 +2675,8 @@ class Obstacle {
   Rect get rect =>
       Rect.fromCenter(center: pos, width: halfW * 2, height: halfH * 2);
 }
+
+/// A projectile in flight.
 class Shot {
   Offset pos;
   Offset vel;
@@ -2721,6 +2824,20 @@ class BattleWorld {
   /// belongs to whoever is firing — never to their target.
   int camAnchor = 0;
 
+  /// The seat currently lining up a shot, or -1 when nobody is.
+  ///
+  /// Activities are suppressed for the crew member actually taking aim,
+  /// because a body twisting about mid-aim looks broken. That used to be
+  /// decided by "are you your raft's active crew member?" alone — which
+  /// covers the shooter, but also silences the PLAYER's chosen crew member
+  /// for the whole match, including the long stretches while the other side
+  /// is taking its turn. They are the one character the player looks at
+  /// most, and they were the only one on the deck who never did anything.
+  ///
+  /// Set by the controller at the start of each turn and cleared the moment
+  /// the shot is away.
+  int aimingPlayer = -1;
+
   /// Team check: the human side is seat 0; every other seat belongs to the
   /// enemy team. AI shots can therefore never wound their own side — the
   /// enemies kept bombing each other across the gap, which read as a bug
@@ -2801,10 +2918,19 @@ class BattleWorld {
     // habit and keep it. Levels are rises above the base, so "player high"
     // is a positive step DOWN as you move right, and vice versa.
     final drop = r.range(BattleConst.waterStepMin, BattleConst.waterStepMax);
+    // Which kind of transition joins the two levels, themed to the scene:
+    // an ice shelf belongs in the frozen swell and a built weir belongs in a
+    // harbour, and neither belongs in the other. Each kind also sets its own
+    // width — see [stepWidthScale] — so a weir is an abrupt sill and a shoal
+    // is a long ramp.
+    final kind = map.waterSteps[r.nextInt(map.waterSteps.length)];
+    final baseWidth =
+        r.range(BattleConst.fallsWidthMin, BattleConst.fallsWidthMax);
     steps.add(WaterStep(
       x: mainX,
       rise: r.nextBool() ? -drop : drop,
-      width: r.range(BattleConst.fallsWidthMin, BattleConst.fallsWidthMax),
+      width: baseWidth * stepWidthScale(kind),
+      kind: kind,
     ));
 
     // Sometimes a second, smaller step out among the enemy slots, so a map
@@ -2821,12 +2947,24 @@ class BattleWorld {
       final gapEnd = BattleConst.enemySlots[1] - BattleConst.raftClearance;
       final free = gapEnd - gapStart;
       if (free >= BattleConst.fallsWidthMin) {
+        // Narrow gap out here, so only the abrupt kinds fit.
+        const tight = [
+          WaterStepKind.weir,
+          WaterStepKind.ledge,
+          WaterStepKind.falls,
+          WaterStepKind.iceShelf,
+        ];
+        final kinds = map.waterSteps.where(tight.contains).toList();
+        final kind = kinds.isEmpty
+            ? WaterStepKind.ledge
+            : kinds[r.nextInt(kinds.length)];
         steps.add(WaterStep(
           x: (gapStart + gapEnd) / 2,
           rise: (r.nextBool() ? -1 : 1) *
               r.range(BattleConst.waterStepMin * 0.5,
                   BattleConst.waterStepMax * 0.7),
-          width: min(BattleConst.fallsWidthMax, free),
+          width: min(free, BattleConst.fallsWidthMax * stepWidthScale(kind)),
+          kind: kind,
         ));
       }
     }
@@ -2898,7 +3036,51 @@ class BattleWorld {
       final centre = BattleConst.obstacleBandStart + slot * (i + 0.5);
       // Kept a half-width inside its own slot so neighbours never touch.
       final room = max(0.0, slot / 2 - halfW - 8);
-      final x = centre + r.range(-room, room);
+      var x = centre + r.range(-room, room);
+
+      /// True if an obstacle of this width centred at [cx] would sit on flat
+      /// water, inside the band, and clear of everything already placed.
+      bool spotIsClear(double cx) {
+        if (water.onFalls(cx, margin: halfW + 6)) return false;
+        if (cx - halfW < BattleConst.obstacleBandStart) return false;
+        if (cx + halfW > BattleConst.obstacleBandEnd) return false;
+        for (final placed in obstacles) {
+          if ((cx - placed.pos.dx).abs() < halfW + placed.halfW + 8) {
+            return false;
+          }
+        }
+        return true;
+      }
+
+      // Keep it off the falls.
+      //
+      // An obstacle sits ON the water at its own centre, which is fine on a
+      // flat terrace and wrong on a slope: across the width of a wreck the
+      // surface can drop sixty units, so one end hangs clear in the air and
+      // the other is buried. The obstacle band and the main falls overlap by
+      // most of their length, so roughly one obstacle in eight landed on the
+      // slope before this.
+      //
+      // Rather than reject the roll, the channel is searched outward from the
+      // chosen point for the nearest spot that is flat AND still clear of the
+      // obstacles already placed — the search is allowed to leave its own
+      // slot, so it has to re-check spacing itself rather than relying on the
+      // slot to guarantee it. Only if nothing within reach works does it give
+      // up and leave the slot empty, which is the right answer: there is
+      // nowhere flat to put anything.
+      if (!spotIsClear(x)) {
+        var placed = false;
+        for (double step = 6; step <= slot * 1.5; step += 6) {
+          for (final candidate in [x - step, x + step]) {
+            if (!spotIsClear(candidate)) continue;
+            x = candidate;
+            placed = true;
+            break;
+          }
+          if (placed) break;
+        }
+        if (!placed) continue;
+      }
 
       // Height: the base for the kind, scaled by a roll and again by how
       // close to mid-channel this one stands.
@@ -2916,12 +3098,25 @@ class BattleWorld {
       final halfSpan = span / 2;
       final centreness =
           halfSpan <= 0 ? 1.0 : (1 - (x - mid).abs() / halfSpan).clamp(0.0, 1.0);
-      final height = min(
-        BattleConst.obstacleMaxHeight,
-        size.$2 *
-            r.range(BattleConst.obstacleHeightMin, BattleConst.obstacleHeightMax) *
-            (1 + centreness * BattleConst.obstacleCentreBoost),
-      );
+      // The two multipliers compound, so they are clamped together rather
+      // than separately: at full stretch a roll and a mid-channel bonus
+      // would otherwise take a kind to two and a half times its own base,
+      // which turns a slender buoy into a needle and stops it reading as
+      // the thing it is meant to be.
+      final stretch =
+          (r.range(BattleConst.obstacleHeightMin, BattleConst.obstacleHeightMax) *
+                  (1 + centreness * BattleConst.obstacleCentreBoost))
+              .clamp(BattleConst.obstacleHeightMin, BattleConst.obstacleStretchMax);
+      // Capped against the sky ACTUALLY above this spot, not a fixed number.
+      // The sea is terraced now, so an obstacle on a raised terrace has
+      // markedly less room above it than one on the base line, and a flat
+      // cap let the tall kinds run off the top of the world there.
+      final headroom = waterAt(x) - BattleConst.obstacleSkyMargin;
+      // Also capped by what this kind can be stretched to and still read as
+      // itself — see [BattleConst.obstacleMaxAspect].
+      final aspectCap =
+          halfW * 2 * (BattleConst.obstacleMaxAspect[kind.name] ?? 3.0);
+      final height = min(min(headroom, aspectCap), size.$2 * stretch);
       final halfH = height / 2;
 
       obstacles.add(Obstacle(
@@ -3390,6 +3585,52 @@ class BattleWorld {
       final top = raft.deckY;
       final bottom = raft.hullBottom;
 
+      // 0. Built blocks. Tested before the deck, because a structure stands
+      //    ON the deck and a round coming down on it must hit the blocks
+      //    rather than passing through them to the planks underneath.
+      //
+      //    Each block is its own box, so a shot knocks out the one it
+      //    actually struck — which is what makes dismantling a tower a real
+      //    play: take the bottom out and everything it was holding up comes
+      //    down with it.
+      final plan = raft.build;
+      if (plan != null) {
+        for (final (col, row, cell) in plan.standing) {
+          if (!raft.buildColumnOnDeck(col)) continue;
+          final cx = raft.x + BuildPlan.columnX(col);
+          final cyTop = raft.deckY - (row + 1) * BuildPlan.cellH;
+          final box = Rect.fromLTWH(
+            cx - BuildPlan.cellW / 2,
+            cyTop,
+            BuildPlan.cellW,
+            BuildPlan.cellH,
+          );
+          final sweep = BattleWorld.segmentRectHit(prev, s.pos, box);
+          if (sweep == null || sweep.t >= bestT) continue;
+          bestT = sweep.t;
+          final hit = prev + (s.pos - prev) * sweep.t;
+          final struckRaft = raft;
+          final struckCol = col;
+          final struckRow = row;
+          act = () {
+            // Damage lands on the block, not on the crew: cover works.
+            final before = cell.hp;
+            struckRaft.build?.damageAt(
+              BuildPlan.columnX(struckCol),
+              struckRow * BuildPlan.cellH + BuildPlan.cellH / 2,
+              s.weapon.damage,
+            );
+            cell.flash = BattleConst.obstacleStruckTime;
+            onSfx?.call(cell.broken && before > 0 ? 'explosion' : 'hit');
+            bumpShake(cell.broken ? 2.4 : 1.2);
+            // Resolved as a hit on the structure. An explosive round still
+            // throws its splash from where it struck, so a bomb against the
+            // wall still reaches whoever is standing behind it.
+            resolve = _resolve(s, null, -1, hitPoint: hit);
+          };
+        }
+      }
+
       // 1. Deck/platform top, within the walkable deck.
       if (localX.abs() <= raft.deckHalf) {
         final surf = top + (raft.surfaceY(localX) ?? 0.0);
@@ -3710,10 +3951,19 @@ class BattleWorld {
           onSfx?.call('hit');
           bumpShake(1.2);
         } else {
-          // Head hits somersault; the heavier the round, the likelier and
-          // the harder it whips. A backflip rotates *away* from the shot,
-          // which is the read that sells it — the occasional front flip is
-          // a rarer, funnier accident rather than a coin toss.
+          // Head hits somersault BACKWARDS, always. The rotation is thrown
+          // away from the shot, which is the read that sells it: you see
+          // where the blow came from in which way the body goes over.
+          //
+          // There used to be a 22% chance of a front flip instead, as "a
+          // rarer, funnier accident". It is not funnier — it is the same
+          // animation mirrored, it reads as the physics getting the
+          // direction wrong rather than as a variation, and a fifth of every
+          // player's headshots looking like a bug is a bad trade for a joke
+          // nobody identified as one. Variety in a tumble comes from
+          // [RagdollStyle], which varies how it goes over rather than which
+          // way.
+          //
           // Per-character flip bias: a wiry runner cartwheels off a hit that
           // merely topples a dockhand.
           final flipChance =
@@ -3721,10 +3971,8 @@ class BattleWorld {
           final flips =
               zone == HitZone.head && (forced == 'flip' || _hitChance(s, 0x11, flipChance));
           final backward = s.vel.dx >= 0 ? 1.0 : -1.0;
-          final frontFlip = _hitChance(s, 0x22, 0.22);
           final spin = flips
               ? backward *
-                  (frontFlip ? -1 : 1) *
                   BattleConst.headshotSpin *
                   (0.8 + s.weapon.weight * 0.35)
               : (zone == HitZone.legs &&
@@ -3915,10 +4163,40 @@ class BattleWorld {
   int _tumbleSeed(Shot s, int extra) =>
       (s.firedAt * 104729).round() ^ (s.pos.dx * 61).round() ^ (extra * 2246822519);
 
+  /// A deterministic per-shot coin flip, one independent stream per [salt].
+  ///
+  /// The salt used to be XORed straight into the hash and the low ten bits
+  /// read off the result — which does not separate the streams at all, it
+  /// only permutes a few low bits. Every roll on a given shot was therefore
+  /// reading the SAME number with a tiny perturbation, so the rolls were
+  /// strongly correlated with each other: asking "does this hit flip them?"
+  /// and then "is it a front flip?" was really asking the same question
+  /// twice. Conditioning on the first made the second far likelier than its
+  /// stated probability — a head hit that flipped at all came out a front
+  /// flip about 56% of the time against an intended 22%, so the backflip
+  /// that is supposed to be the common, readable one was the minority.
+  ///
+  /// Mixing the salt through a multiply-and-shift avalanche instead gives
+  /// each salt its own stream, so 0.22 means 0.22 whatever else was rolled
+  /// on the same shot.
   bool _hitChance(Shot s, int salt, double probability) {
-    final hash = (s.firedAt * 7919).round() ^ (s.pos.dx * 31).round() ^ salt;
-    return (hash & 0x3FF) / 1024 < probability;
+    var h = (s.firedAt * 7919).round() ^ (s.pos.dx * 31).round();
+    h = (h + salt * 0x9E3779B1) & 0x7FFFFFFF;
+    h ^= h >>> 15;
+    h = (h * 0x85EBCA6B) & 0x7FFFFFFF;
+    h ^= h >>> 13;
+    return (h & 0x3FF) / 1024 < probability;
   }
+
+  /// The raw roll behind every zone reaction, exposed so its distribution can
+  /// be tested.
+  ///
+  /// Worth a seam of its own: a biased roll here is invisible from outside —
+  /// the body still flips, it just flips the wrong way more often than it
+  /// should — and the only symptom is a vague "the backflips look wrong".
+  @visibleForTesting
+  bool hitChanceForTest(Shot s, int salt, double probability) =>
+      _hitChance(s, salt, probability);
 
   // ---------------------------------------------------------------------------
   // Per-frame update
@@ -4118,6 +4396,16 @@ class BattleWorld {
         if (c.deathFlash > 0) {
           c.deathFlash = max(0, c.deathFlash - dt);
         }
+        // Built blocks shudder for a moment after being struck.
+        final plan = raft.build;
+        if (plan != null) {
+          for (final (_, _, cell) in plan.standing) {
+            if (cell.flash > 0) cell.flash = max(0, cell.flash - dt);
+          }
+        }
+        if (c.deathSpark > 0) {
+          c.deathSpark = max(0, c.deathSpark - dt);
+        }
 
         if (c.hitReactT > 0) c.hitReactT = max(0, c.hitReactT - dt);
         if (c.gloatT > 0) c.gloatT = max(0, c.gloatT - dt);
@@ -4135,9 +4423,13 @@ class BattleWorld {
         }
         if (c.grabT > 0) c.grabT = max(0, c.grabT - dt);
 
-        // Idle fidgets: anyone standing around who isn't the active
-        // shooter may pick a little activity — and voice it.
-        final voice = c.updateIdle(dt, allowNew: raft.activeIndex != i);
+        // Idle fidgets: anyone standing around may pick a little activity —
+        // and voice it. Only the crew member actually taking aim right now
+        // is kept still; everybody else, including the player's own chosen
+        // crew member while the other side is shooting, stays alive.
+        final takingAim =
+            raft.activeIndex == i && raft.playerIndex == aimingPlayer;
+        final voice = c.updateIdle(dt, allowNew: !takingAim);
         if (voice != null) onVoice?.call(voice);
 
         if (c.ragdoll) {
@@ -4599,8 +4891,12 @@ class BattleWorld {
 
   /// Vertical bob offset for a raft at the current time — the design's gentle
   /// `bob` keyframe, scaled by the scene's chop.
-  double bobOf(Raft raft) =>
-      sin(elapsed * 1.9 + raft.x * 0.01) * 3.2 * map.chop;
+  ///
+  /// Zero for anything rooted to the seabed. An island rising and falling on
+  /// the swell reads as a bug rather than as weather.
+  double bobOf(Raft raft) => raft.place.floats
+      ? sin(elapsed * 1.9 + raft.x * 0.01) * 3.2 * map.chop
+      : 0.0;
 }
 
 /// The player's aim as shaped by a pull-back drag.

@@ -2,6 +2,7 @@ import 'dart:math';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:raft_rumble/game/battle.dart';
+import 'package:raft_rumble/game/characters.dart';
 import 'package:raft_rumble/game/maps.dart';
 import 'package:raft_rumble/game/models.dart';
 import 'package:raft_rumble/game/raft.dart';
@@ -254,6 +255,103 @@ void main() {
     });
   });
 
+
+  group('Zone rolls are independent of each other', () {
+    // Every zone reaction on a hit is a deterministic coin flip off the same
+    // shot. They have to be independent, because the game asks several of
+    // them about the SAME shot and acts on the combination: "does this head
+    // hit flip them?" and then "is it a front flip?".
+    //
+    // The salt used to be XORed straight into the hash with the low ten bits
+    // read off the result, which does not separate the streams — it permutes
+    // a few low bits. So every roll on a given shot was the same number
+    // barely disturbed, and conditioning on one skewed the next. A head hit
+    // that flipped at all came out a FRONT flip about 40% of the time
+    // against an intended 22%, so the backflip that is meant to be the
+    // common, readable one was barely commoner than the rare funny one.
+    //
+    // Each roll's rate in isolation was fine, which is exactly why this
+    // survived: it is only visible in the conditional, and the conditional
+    // is the only way the game ever uses it.
+    test('one roll does not skew another on the same shot', () {
+      final w = world(raftXs: [const Offset(300, 0), const Offset(1300, 0)]);
+      const n = 20000;
+      const flipChance = 0.55;
+      var flipped = 0;
+      var frontAll = 0;
+      var frontGivenFlip = 0;
+
+      for (int i = 0; i < n; i++) {
+        final s = Shot(
+          pos: Offset(300 + i * 0.37, 250),
+          vel: const Offset(6, -2),
+          weapon: Weapons.byId('bomb'),
+          owner: 0,
+          firedAt: i * 0.0137,
+        );
+        final flips = w.hitChanceForTest(s, 0x11, flipChance);
+        final front = w.hitChanceForTest(s, 0x22, 0.22);
+        if (front) frontAll++;
+        if (flips) {
+          flipped++;
+          if (front) frontGivenFlip++;
+        }
+      }
+
+      // Each roll on its own — these passed even when the streams were
+      // correlated, so on their own they prove nothing.
+      expect(flipped / n, closeTo(flipChance, 0.03));
+      expect(frontAll / n, closeTo(0.22, 0.03));
+
+      // The one that matters.
+      final conditional = frontGivenFlip / flipped;
+      expect(conditional, closeTo(0.22, 0.04),
+          reason: 'a flip came out a front flip '
+              '${(conditional * 100).round()}% of the time instead of 22% — '
+              'the rolls are correlated, so backflips are being crowded out');
+    });
+
+    test('every pair of salts the game uses is independent', () {
+      // The five salts in play: flip, front flip, leg plant, torso clutch,
+      // sweep spin. Any correlated pair produces the same class of bug.
+      final w = world(raftXs: [const Offset(300, 0), const Offset(1300, 0)]);
+      const salts = [0x11, 0x22, 0x44, 0x55, 0x66];
+      const n = 8000;
+      for (final a in salts) {
+        for (final b in salts) {
+          if (a >= b) continue;
+          var both = 0;
+          var aYes = 0;
+          var bYes = 0;
+          for (int i = 0; i < n; i++) {
+            final s = Shot(
+              pos: Offset(300 + i * 0.37, 250),
+              vel: const Offset(6, -2),
+              weapon: Weapons.byId('bomb'),
+              owner: 0,
+              firedAt: i * 0.0137,
+            );
+            final ra = w.hitChanceForTest(s, a, 0.5);
+            final rb = w.hitChanceForTest(s, b, 0.5);
+            if (ra) aYes++;
+            if (rb) bYes++;
+            if (ra && rb) both++;
+          }
+          // Each coin is fair on its own — checked first, so a failure on
+          // the joint rate below can only mean correlation and not simply a
+          // lopsided salt.
+          expect(aYes / n, closeTo(0.5, 0.04), reason: 'salt $a is not fair');
+          expect(bYes / n, closeTo(0.5, 0.04), reason: 'salt $b is not fair');
+          // Two fair, independent coins come up heads together a quarter of
+          // the time.
+          expect(both / n, closeTo(0.25, 0.04),
+              reason: 'salts $a and $b co-occur '
+                  '${(both / n * 100).round()}% of the time, not 25% — they '
+                  'are reading the same bits');
+        }
+      }
+    });
+  });
   group('Zone ragdoll comedy', () {
     ShotOutcome fireAtHeight(
       BattleWorld w, {
@@ -329,6 +427,75 @@ void main() {
       return peak;
     }
 
+
+    test('a head hit always goes over BACKWARDS', () {
+      // Thrown away from the shot, which is the read that sells it: you see
+      // where the blow came from in which way the body goes over.
+      //
+      // There used to be a 22% chance of a front flip instead, as a rarer
+      // funnier accident. It is not funnier — it is the same animation
+      // mirrored, and it reads as the physics getting the direction wrong
+      // rather than as a variation. Variety comes from [RagdollStyle], which
+      // varies HOW a body goes over rather than which way.
+      //
+      // Swept across the whole roster and every weapon because the spin is
+      // only one of the terms: the impulse torque, the head kick and the
+      // per-tumble twist all push on the same rotation, and a heavy enough
+      // blow on a light enough character could in principle overwhelm it.
+      var checked = 0;
+      final wrongWay = <String>[];
+
+      for (final def in Cast.all) {
+        for (final weapon in Weapons.all) {
+          for (final facing in [1, -1]) {
+            final w = world(raftXs: [const Offset(300, 0)]);
+            w.rafts.clear();
+            w.addRaft(Raft(
+              playerIndex: 0,
+              x: BattleConst.playerX,
+              loadout: RaftLoadout.custom(
+                  hullId: 'barrel', sizeId: 'large', colorIndex: 0),
+              look: def.look,
+              label: 'P',
+              facing: facing,
+              crew: [Crew(hp: 100, maxHp: 100, traits: def.ragdoll)],
+            ));
+            final c = w.rafts[0].crew[0];
+            // Shot from in front, the way a real one arrives.
+            final dx = -facing.toDouble();
+            final backward = dx >= 0 ? 1.0 : -1.0;
+            c.knock(Offset(dx, -0.3), Crew.impactForce(weapon),
+                hitLocal: const Offset(0, -50),
+                zone: HitZone.head,
+                spin: backward *
+                    BattleConst.headshotSpin *
+                    (0.8 + weapon.weight * 0.35),
+                headKick: 4.2 + weapon.weight * 1.5,
+                seed: facing * 31 + weapon.id.hashCode);
+
+            final pose = c.pose!;
+            final start = (pose.head.pos - pose.hip.pos).dx;
+            for (int f = 0; f < 6; f++) {
+              w.update(1 / 60);
+            }
+            final p = c.pose;
+            if (p == null) continue;
+            checked++;
+            // Backward for this victim is -facing; a backflip takes the head
+            // that way as it goes over.
+            final moved = (p.head.pos - p.hip.pos).dx;
+            if ((moved - start) * -facing <= 0) {
+              wrongWay.add('${def.id}/${weapon.id}/facing$facing');
+            }
+          }
+        }
+      }
+
+      expect(checked, greaterThan(100), reason: 'this test swept nothing');
+      expect(wrongWay, isEmpty,
+          reason: '${wrongWay.length} of $checked head hits went over '
+              'FORWARDS, e.g. ${wrongWay.take(4).join(", ")}');
+    });
     test('A backflip actually comes all the way round', () {
       // The point of the tuck: the point speed cap bleeds rotation out of a
       // sprawled body, so a flip that never curls in stalls partway and flops

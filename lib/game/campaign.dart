@@ -257,6 +257,11 @@ class Campaign {
       ammo: save.battleAmmo(),
       difficultyTier: difficultyTierOf(level),
       isBoss: level.isBoss,
+      // Campaign has no pre-battle setup screen, so the choice between a
+      // prefab hull and a deck of your own is made once in the shipyard and
+      // carried into every level from there. Without this the building
+      // mechanic existed only in skirmishes.
+      buildYourRaft: save.buildOwnRaft,
     );
 
     final boss = level.isBoss ? Bosses.forWorld(level.worldId) : null;

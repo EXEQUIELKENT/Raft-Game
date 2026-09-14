@@ -179,6 +179,65 @@ class _CampaignUpgradesScreenState extends State<CampaignUpgradesScreen> {
     );
   }
 
+  /// Prefab hull, or a deck the captain lays out themselves at the start of
+  /// each battle.
+  ///
+  /// It lives here, in the shipyard, because campaign battles launch
+  /// straight from the map with nothing to ask on the way — and because
+  /// this is already the screen where you decide what you are sailing. The
+  /// same saved flag backs the skirmish screen's chips, so the answer only
+  /// has to be given once.
+  Widget _deckModePicker(SaveData save) {
+    void pick(bool own) {
+      AudioService.instance.sfx('click');
+      save.buildOwnRaft = own;
+      SaveService.instance.save();
+      setState(() {});
+    }
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text('DECK',
+            style: RT.body(
+                size: 10,
+                color: RT.ink.withOpacity(0.6),
+                weight: FontWeight.w800,
+                letterSpacing: 1.4)),
+        const SizedBox(height: 6),
+        Wrap(
+          spacing: 8,
+          runSpacing: 8,
+          children: [
+            _pickChip(
+              label: 'PREFAB',
+              selected: !save.buildOwnRaft,
+              onTap: () => pick(false),
+            ),
+            _pickChip(
+              label: 'BUILD IT',
+              selected: save.buildOwnRaft,
+              onTap: () => pick(true),
+            ),
+          ],
+        ),
+        const SizedBox(height: 6),
+        Text(
+          save.buildOwnRaft
+              ? 'You lay out your own deck from thatch, driftwood, plank, '
+                  'barrels and iron before each battle starts. Tougher '
+                  'materials cost more of the budget, and every block can be '
+                  'shot off.'
+              : 'You sail the hull above, deck and all.',
+          style: RT.body(
+              size: 11,
+              color: RT.ink.withOpacity(0.62),
+              weight: FontWeight.w700),
+        ),
+      ],
+    );
+  }
+
   /// Raft upgrade track: crew capacity, hull unlocks and bonus HP, plus the
   /// hull/colour pickers for the raft the player already owns.
   Widget _raftSection(SaveData save, int totalStars) {
@@ -203,6 +262,8 @@ class _CampaignUpgradesScreenState extends State<CampaignUpgradesScreen> {
           ),
           const SizedBox(height: 10),
           RaftPreview(loadout: save.raftLoadout),
+          const SizedBox(height: 12),
+          _deckModePicker(save),
           const SizedBox(height: 12),
           Text('HULL', style: RT.body(size: 10, color: RT.ink.withOpacity(0.6), weight: FontWeight.w800, letterSpacing: 1.4)),
           const SizedBox(height: 6),
@@ -364,8 +425,8 @@ class _CampaignUpgradesScreenState extends State<CampaignUpgradesScreen> {
   Widget _pickChip({
     required String label,
     required bool selected,
-    required bool locked,
-    required String lockLabel,
+    bool locked = false,
+    String lockLabel = '',
     required VoidCallback onTap,
   }) {
     return GestureDetector(

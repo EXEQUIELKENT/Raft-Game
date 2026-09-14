@@ -124,6 +124,65 @@ void main() {
       }
     });
 
+
+    test('nothing is ever placed on the falls', () {
+      // An obstacle sits ON the water at its own centre, which is right on a
+      // flat terrace and wrong on a slope: across the width of a wreck the
+      // surface can drop sixty units, so one end hangs clear in the air and
+      // the other is buried. The obstacle band and the main falls overlap by
+      // most of their length, so this is not a rare corner — before the
+      // placement searched for flat water, about one obstacle in eight
+      // landed on the slope.
+      for (final map in GameMaps.all) {
+        for (int seed = 0; seed < 60; seed++) {
+          final w = world(map: map, seed: seed);
+          for (final o in w.obstacles) {
+            expect(w.water.onFalls(o.pos.dx, margin: o.halfW), false,
+                reason: '${map.id} seed $seed: a ${o.kind.name} straddles a '
+                    'falls');
+          }
+        }
+      }
+    });
+
+    test('both ends of an obstacle meet the water', () {
+      // The symptom the rule above exists to prevent, measured directly on
+      // the drawn box rather than on the placement: whatever the terrain
+      // does, neither edge may float or sink.
+      for (final map in GameMaps.all) {
+        for (int seed = 0; seed < 60; seed++) {
+          final w = world(map: map, seed: seed);
+          for (final o in w.obstacles) {
+            for (final edge in [o.pos.dx - o.halfW, o.pos.dx + o.halfW]) {
+              final gap = o.rect.bottom - w.waterAt(edge);
+              // The box bottom sits a touch under the surface on purpose so
+              // nothing appears to hover; anything beyond that is the box
+              // disagreeing with the water it is meant to be floating on.
+              expect(gap, inInclusiveRange(-1, 12),
+                  reason: '${map.id} seed $seed: a ${o.kind.name} edge is '
+                      '${gap.toStringAsFixed(0)} units out of the water');
+            }
+          }
+        }
+      }
+    });
+
+    test('keeping clear of the falls does not empty the channel', () {
+      // The lazy fix is to reject any roll that lands on the slope, which
+      // quietly thins the field wherever a falls happens to sit. Searching
+      // the slot for flat water instead keeps it stocked.
+      var obstacles = 0;
+      var worlds = 0;
+      for (final map in GameMaps.all) {
+        for (int seed = 0; seed < 40; seed++) {
+          obstacles += world(map: map, seed: seed).obstacles.length;
+          worlds++;
+        }
+      }
+      expect(obstacles / worlds, greaterThan(2.2),
+          reason: 'only ${(obstacles / worlds).toStringAsFixed(1)} obstacles '
+              'per match survive the falls clearance');
+    });
     test('obstacles never overlap each other', () {
       // Two boxes sharing space read as one strange shape, and the gap
       // between them becomes impossible to judge.
@@ -213,21 +272,79 @@ void main() {
       });
     });
 
-    test('nothing grows taller than the cap', () {
-      // The sky is three hundred units deep and a lob has to clear the field
-      // with room to spare. An obstacle that reaches most of the way up
-      // stops being an aiming problem and becomes a wall.
+    test('nothing ever reaches the top of the world', () {
+      // The cap is measured against the sky ACTUALLY above each obstacle,
+      // not a fixed height — the sea is terraced, so one on a raised terrace
+      // has markedly less room above it, and a flat cap let the tall kinds
+      // run clean off the top of the frame there.
       for (final map in GameMaps.all) {
         for (int seed = 0; seed < 60; seed++) {
           final w = world(map: map, seed: seed);
           for (final o in w.obstacles) {
-            final height = w.waterAt(o.pos.dx) - o.rect.top;
-            expect(height, lessThanOrEqualTo(BattleConst.obstacleMaxHeight + 1),
-                reason: '${map.id} seed $seed: a ${o.kind.name} stands '
-                    '${height.round()} above the water');
+            expect(o.rect.top,
+                greaterThanOrEqualTo(BattleConst.obstacleSkyMargin - 1),
+                reason: '${map.id} seed $seed: a ${o.kind.name} reaches '
+                    '${o.rect.top.round()} — off the top of the world');
           }
         }
       }
+    });
+
+    test('no kind is stretched out of its own proportions', () {
+      // The roll and the mid-channel bonus compound. Unclamped they reach
+      // about two and a half times a kind's base, which turns a slender buoy
+      // into a needle and stops it reading as the thing it is meant to be.
+      for (final map in GameMaps.all) {
+        for (int seed = 0; seed < 60; seed++) {
+          final w = world(map: map, seed: seed);
+          for (final o in w.obstacles) {
+            final base = BattleConst.obstacleSizes[o.kind.name]!.$2;
+            final height = w.waterAt(o.pos.dx) - o.rect.top;
+            expect(height / base,
+                lessThanOrEqualTo(BattleConst.obstacleStretchMax + 0.02),
+                reason: '${map.id} seed $seed: a ${o.kind.name} is '
+                    '${(height / base).toStringAsFixed(2)}x its base height');
+          }
+        }
+      }
+    });
+
+
+    test('no kind is stretched out of recognition', () {
+      // Scaling alone does not know what a thing IS: stretched to the same
+      // multiple, a slender mast still reads as a mast while a crate becomes
+      // a door and a rock becomes a menhir.
+      for (final map in GameMaps.all) {
+        for (int seed = 0; seed < 40; seed++) {
+          final w = world(map: map, seed: seed);
+          for (final o in w.obstacles) {
+            final height = w.waterAt(o.pos.dx) - o.rect.top;
+            final aspect = height / (o.halfW * 2);
+            final cap = BattleConst.obstacleMaxAspect[o.kind.name]!;
+            expect(aspect, lessThanOrEqualTo(cap + 0.02),
+                reason: '${map.id} seed $seed: a ${o.kind.name} is '
+                    '${aspect.toStringAsFixed(1)} times as tall as it is '
+                    'wide, past its limit of $cap');
+          }
+        }
+      }
+    });
+    test('the field is genuinely tall', () {
+      // The whole point of raising them: a crew member stands about a
+      // hundred units, so anything the player has to shoot over should be
+      // well clear of that rather than ankle-height scenery.
+      var tallest = 0.0;
+      for (final map in GameMaps.all) {
+        for (int seed = 0; seed < 40; seed++) {
+          final w = world(map: map, seed: seed);
+          for (final o in w.obstacles) {
+            tallest = max(tallest, w.waterAt(o.pos.dx) - o.rect.top);
+          }
+        }
+      }
+      expect(tallest, greaterThan(200),
+          reason: 'the tallest obstacle anywhere is only ${tallest.round()} '
+              'units — barely twice a crew member');
     });
 
     test('the tall ones stand in mid-channel', () {

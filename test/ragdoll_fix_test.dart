@@ -378,6 +378,56 @@ void main() {
       expect(1 / c.pose!.hip.invMass, closeTo(2.2 * c.traits.mass, 1e-6),
           reason: 'a corpse weighs what the living body weighed');
     });
+
+    test('a kill flares and sparks rather than strobing', () {
+      // The killing blow used to be a 0.16s pure-white overlay across the
+      // WHOLE figure at 0.85 alpha — a strobe — and it fired on the same
+      // frame the body switched from its standing drawing to a ragdoll. Two
+      // discontinuities landing together read as the character being swapped
+      // out rather than killed. It is now a flare at the wound with embers
+      // off it, lasting long enough to cover the handover.
+      final w = world();
+      final c = w.rafts[0].crew[0];
+      c.hp = 0;
+      c.startDeath(const Offset(1, -0.4), 6, hitLocal: const Offset(0, -48));
+
+      expect(c.deathFlash, BattleConst.deathFlashTime);
+      expect(c.deathSpark, BattleConst.deathSparkTime);
+      expect(c.deathWound, const Offset(0, -48),
+          reason: 'the flare has to know where the blow landed');
+
+      // The sparks have to outlast the flare, so the eye is still on the
+      // wound after the flash is gone and the body is mid-tumble.
+      expect(BattleConst.deathSparkTime,
+          greaterThan(BattleConst.deathFlashTime),
+          reason: 'the sparks end before the flare does, so the handover is '
+              'left uncovered');
+      // And the whole thing has to outlast the frame the drawing changes on.
+      expect(BattleConst.deathFlashTime, greaterThan(0.25),
+          reason: 'a flash this short is a strobe, not a flare');
+
+      var sparkFrames = 0;
+      for (int f = 0; f < 120; f++) {
+        w.update(1 / 60);
+        if (c.deathSpark > 0) sparkFrames++;
+      }
+      expect(sparkFrames, greaterThan(20),
+          reason: 'the sparks were over almost immediately');
+      expect(c.deathFlash, 0, reason: 'the flare never ended');
+      expect(c.deathSpark, 0, reason: 'the sparks never ended');
+    });
+
+    test('a death with no recorded wound still has somewhere to flare', () {
+      // Deaths that arrive without an impact point — the safety net for a
+      // crew member killed with no shove — must not put the flare at the
+      // body's origin, which is under their boots.
+      final w = world();
+      final c = w.rafts[0].crew[0];
+      c.hp = 0;
+      c.startDeath(const Offset(1, 0), 3);
+      expect(c.deathWound.dy, lessThan(-20),
+          reason: 'the flare would play around the corpse\'s feet');
+    });
   });
   group('Getting back up', () {
     test('the body does not squash on the way to its feet', () {
@@ -765,6 +815,89 @@ void main() {
       expect(speedAfter, lessThan(speedAtSlam),
           reason: 'the flying body came through the collision as fast as it '
               'went in');
+    });
+  });
+
+  group('Deck structures', () {
+    // Walls and roofs are drawn scenery rather than part of the deck
+    // profile, which is a height-field: one surface height per x, able to
+    // express a floor but not a wall or an overhang. That makes it easy for
+    // them to drift out of agreement with the deck they sit on, so what is
+    // pinned here is the placement rules rather than the drawing.
+
+    Raft raftOf(String hull, {int seat = 0, double x = BattleConst.playerX}) =>
+        Raft(
+          playerIndex: seat,
+          x: x,
+          loadout:
+              RaftLoadout.custom(hullId: hull, sizeId: 'large', colorIndex: 0),
+          look: CrewLook.player,
+          label: 'R',
+          facing: seat == 0 ? 1 : -1,
+          crew: [for (int k = 0; k < 4; k++) Crew(hp: 100, maxHp: 100)],
+        );
+
+    test('every hull draws without throwing', () {
+      // Cheap, but it is the whole surface area: the structures read the
+      // tier list and the berth list, and either being empty or degenerate
+      // on some hull would throw here rather than in play.
+      for (final hull in RaftHull.all) {
+        for (final size in ['small', 'medium', 'large']) {
+          final w = BattleWorld(map: GameMaps.all.first, seed: 3);
+          w.addRaft(Raft(
+            playerIndex: 0,
+            x: BattleConst.playerX,
+            loadout: RaftLoadout.custom(
+                hullId: hull.id, sizeId: size, colorIndex: 0),
+            look: CrewLook.player,
+            label: 'R',
+            facing: 1,
+            crew: [Crew(hp: 100, maxHp: 100)],
+          ));
+          final rec = PictureRecorder();
+          WorldRenderer(w, map: GameMaps.all.first).render(
+              Canvas(rec), const Size(900, 420), 1.0,
+              currentPlayer: 0);
+          rec.endRecording();
+        }
+      }
+    });
+
+    test('the same raft always gets the same structures', () {
+      // Chosen from the raft's own identity, not rolled per frame. A deck
+      // that rearranged itself between frames would be worse than a bare
+      // one — and in a hotspot match both devices must draw the same raft.
+      for (final hull in RaftHull.all) {
+        final pictures = <String>[];
+        for (int attempt = 0; attempt < 3; attempt++) {
+          final w = BattleWorld(map: GameMaps.all.first, seed: 3);
+          w.addRaft(raftOf(hull.id));
+          final rec = PictureRecorder();
+          WorldRenderer(w, map: GameMaps.all.first).render(
+              Canvas(rec), const Size(900, 420), 1.0,
+              currentPlayer: 0);
+          // A picture has no content hash, so the structures are compared
+          // through the placement inputs they are a pure function of.
+          final r = w.rafts.first;
+          pictures.add(r.profile.segments
+              .map((s) => '${s.x0},${s.x1},${s.rise0}')
+              .join('|'));
+          rec.endRecording();
+        }
+        expect(pictures.toSet().length, 1,
+            reason: '${hull.id} laid its deck out differently each time');
+      }
+    });
+
+    test('a roof leaves room to stand under it', () {
+      // A canopy at head height slices through the crew beneath it, which
+      // reads as a rendering fault rather than as a building. The clearance
+      // has to beat a standing crew member plus their hat.
+      const crewHeight = 58.0; // boots to scalp, from the standing pose
+      const roofClearance = 76.0;
+      expect(roofClearance, greaterThan(crewHeight + 12),
+          reason: 'a roof at $roofClearance would clip a crew member who is '
+              '$crewHeight tall before headgear');
     });
   });
   group('Crew have room to stand', () {

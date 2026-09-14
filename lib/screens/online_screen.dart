@@ -11,6 +11,7 @@ import '../game/online_service.dart';
 import '../game/raft.dart';
 import '../game/save.dart';
 import '../theme.dart';
+import '../widgets/lobby.dart';
 import 'net_match.dart';
 
 /// Internet play: sign in, keep a friends list, and find someone to battle.
@@ -27,9 +28,16 @@ class OnlineScreen extends StatefulWidget {
   State<OnlineScreen> createState() => _OnlineScreenState();
 }
 
-class _OnlineScreenState extends State<OnlineScreen> {
+class _OnlineScreenState extends State<OnlineScreen>
+    with SingleTickerProviderStateMixin {
   final OnlineService _online = OnlineService();
   final NetService _net = NetService.instance;
+
+  /// FRIENDS / QUICK MATCH. Two tabs rather than one long scroll: browsing
+  /// for people and pressing one button to be matched with a stranger are
+  /// different errands, and stacking them meant the quick-match control sat
+  /// halfway down a list of friends.
+  late final TabController _tab = TabController(length: 2, vsync: this);
 
   final _serverController = TextEditingController();
   final _searchController = TextEditingController();
@@ -58,6 +66,7 @@ class _OnlineScreenState extends State<OnlineScreen> {
 
   @override
   void dispose() {
+    _tab.dispose();
     _online.removeListener(_onOnline);
     _online.dispose();
     _serverController.dispose();
@@ -259,52 +268,66 @@ class _OnlineScreenState extends State<OnlineScreen> {
 
   @override
   Widget build(BuildContext context) {
-    final match = _online.match;
     return Scaffold(
       body: Container(
         decoration: const BoxDecoration(gradient: RT.sunset),
         child: SafeArea(
           child: Column(
             children: [
-              _header(),
-              Expanded(
-                child: SingleChildScrollView(
-                  padding: const EdgeInsets.all(14),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.stretch,
-                    children: [
-                      if (!_online.signedIn) _serverCard(),
-                      if (_online.signedIn) ...[
-                        _meCard(),
-                        const SizedBox(height: 14),
-                        if (_resumable != null) ...[
-                          _resumeCard(_resumable!),
-                          const SizedBox(height: 14),
-                        ],
-                        if (match != null && match.isFound) _foundCard(match),
-                        if (match != null && match.isIncomingInvite)
-                          _inviteCard(match),
-                        if (match != null &&
-                            (match.isFound || match.isIncomingInvite))
-                          const SizedBox(height: 14),
-                        _quickMatchCard(),
-                        const SizedBox(height: 14),
-                        _findCard(),
-                        const SizedBox(height: 14),
-                        _friendsCard(),
-                      ],
-                      if (_online.lastError != null) ...[
-                        const SizedBox(height: 14),
-                        Container(
-                          padding: const EdgeInsets.all(12),
-                          decoration: RT.card(color: RT.red, border: 0),
-                          child: Text(_online.lastError!,
-                              style: RT.chunky(size: 12, color: Colors.white),
-                              textAlign: TextAlign.center),
-                        ),
-                      ],
+              LobbyHeader(
+                title: 'ONLINE BATTLE',
+                busy: _online.busy,
+                onBack: () {
+                  _online.stopHeartbeat();
+                  Navigator.pop(context);
+                },
+              ),
+              // No account yet, so the setup card replaces both tabs rather
+              // than leaving a dead tab bar over a page that cannot work.
+              if (_online.signedIn)
+                Container(
+                  color: RT.ink,
+                  child: TabBar(
+                    controller: _tab,
+                    indicatorColor: RT.orange,
+                    indicatorWeight: 4,
+                    labelColor: RT.cream,
+                    unselectedLabelColor: RT.cream.withOpacity(0.55),
+                    labelStyle: RT.chunky(size: 13, color: RT.cream),
+                    unselectedLabelStyle: RT.chunky(size: 13, color: RT.cream),
+                    tabs: const [
+                      Tab(text: 'FRIENDS'),
+                      Tab(text: 'QUICK MATCH'),
                     ],
                   ),
+                ),
+              // Signing in only ever happens in the first seconds of a
+              // session, or after a real connection problem — so this fires
+              // rarely, and when it does, jumping straight from "we cannot
+              // reach a server" to a populated friends list read as the
+              // screen having glitched rather than the connection having
+              // come back. A cross-fade says "state changed".
+              Expanded(
+                child: AnimatedSwitcher(
+                  duration: const Duration(milliseconds: 420),
+                  switchInCurve: Curves.easeOutCubic,
+                  switchOutCurve: Curves.easeIn,
+                  child: _online.signedIn
+                      ? TabBarView(
+                          key: const ValueKey('online-tabs'),
+                          controller: _tab,
+                          children: [
+                            _friendsTab(),
+                            _quickMatchTab(),
+                          ],
+                        )
+                      : KeyedSubtree(
+                          key: const ValueKey('online-setup'),
+                          child: ListView(
+                            padding: const EdgeInsets.all(16),
+                            children: [_serverCard()],
+                          ),
+                        ),
                 ),
               ),
             ],
@@ -314,34 +337,167 @@ class _OnlineScreenState extends State<OnlineScreen> {
     );
   }
 
-  Widget _header() => Padding(
-        padding: const EdgeInsets.all(10),
-        child: Row(
-          children: [
-            GestureDetector(
-              onTap: () {
-                _online.stopHeartbeat();
-                Navigator.pop(context);
-              },
-              child: Container(
-                padding: const EdgeInsets.all(8),
-                decoration: RT.card(color: Colors.white, radius: 12, border: 3),
-                child: const Icon(Icons.arrow_back, color: RT.ink),
-              ),
+  /// Anything demanding an answer right now — an invite, a match found, a
+  /// battle left running — goes above everything else on whichever tab is
+  /// open. These are the only things on either tab that are time-limited,
+  /// so burying them under the browsing furniture is how they get missed.
+  List<Widget> _banners(PopSequence pop) {
+    final match = _online.match;
+    return [
+      if (_resumable != null) ...[
+        pop.wrap(_resumeCard(_resumable!)),
+        const SizedBox(height: 14),
+      ],
+      if (match != null && match.isFound) ...[
+        pop.wrap(_foundCard(match)),
+        const SizedBox(height: 14),
+      ],
+      if (match != null && match.isIncomingInvite) ...[
+        pop.wrap(_inviteCard(match)),
+        const SizedBox(height: 14),
+      ],
+    ];
+  }
+
+  Widget _errorLine() => _online.lastError == null
+      ? const SizedBox.shrink()
+      : Padding(
+          padding: const EdgeInsets.only(top: 18),
+          child: Text(
+            _online.lastError!,
+            textAlign: TextAlign.center,
+            style: RT.body(size: 10, color: RT.red, weight: FontWeight.w800),
+          ),
+        );
+
+  /// The browsing half: who you are, who you are looking for, and who you
+  /// already know — with each group under its own heading and count rather
+  /// than all folded into one FRIENDS card, so a pending request is
+  /// something you see rather than something you scroll past.
+  Widget _friendsTab() {
+    final pop = PopSequence();
+    final incoming = _online.incomingRequests;
+    final friends = _online.friends;
+    return ListView(
+      padding: const EdgeInsets.fromLTRB(16, 16, 16, 28),
+      children: [
+        ..._banners(pop),
+        pop.wrap(_meCard()),
+        const SizedBox(height: 14),
+        pop.wrap(_findCard()),
+        if (_results.isNotEmpty) ...[
+          const SizedBox(height: 18),
+          LobbySection('SEARCH RESULTS', count: _results.length),
+          ..._staggered(_results, _resultTile),
+        ],
+        if (incoming.isNotEmpty) ...[
+          const SizedBox(height: 18),
+          LobbySection('WANTS TO BE FRIENDS', count: incoming.length),
+          ..._staggered(incoming, _requestTile),
+        ],
+        const SizedBox(height: 18),
+        LobbySection('YOUR CREW', count: friends.length),
+        if (friends.isEmpty)
+          Padding(
+            padding: const EdgeInsets.symmetric(vertical: 16),
+            child: Text(
+              'Nobody yet. Search for a captain by name or friend code '
+              'above, tap the add button, and once they accept you can '
+              'invite them to a battle.',
+              textAlign: TextAlign.center,
+              style: RT.body(size: 12, color: RT.ink.withOpacity(0.65)),
             ),
-            const SizedBox(width: 10),
-            Text('ONLINE BATTLE', style: RT.chunky(size: 24, outline: 3)),
-            const Spacer(),
-            if (_online.busy)
-              const SizedBox(
-                width: 20,
-                height: 20,
-                child: CircularProgressIndicator(strokeWidth: 2.5, color: Colors.white),
-              ),
+          ),
+        ..._staggered(friends, _friendTile),
+        _errorLine(),
+      ],
+    );
+  }
+
+  /// The other half: one thing to press, and whatever it is currently doing.
+  Widget _quickMatchTab() {
+    final pop = PopSequence();
+    return ListView(
+      padding: const EdgeInsets.fromLTRB(16, 16, 16, 28),
+      children: [
+        ..._banners(pop),
+        pop.wrap(_quickMatchCard()),
+        _errorLine(),
+      ],
+    );
+  }
+
+  /// Wraps each row in a list so a batch settles onto the page one after
+  /// another rather than snapping in as a block whenever a search returns or
+  /// the friends list refreshes. Keyed by player id so rows keep their own
+  /// animation across the rebuilds that polling causes.
+  List<Widget> _staggered(
+    List<OnlinePlayer> players,
+    Widget Function(OnlinePlayer) build,
+  ) =>
+      [
+        for (var i = 0; i < players.length; i++)
+          PopIn(
+            key: ValueKey('captain-${players[i].id}'),
+            delay: Duration(milliseconds: 80 * i.clamp(0, 6)),
+            child: build(players[i]),
+          ),
+      ];
+
+  Widget _resultTile(OnlinePlayer p) => _playerRow(
+        p,
+        trailing: _online.isFriend(p.id)
+            ? Text('FRIEND',
+                style: RT.body(
+                    size: 10, color: RT.green, weight: FontWeight.w800))
+            : _online.hasOutgoingRequest(p.id)
+                ? Text('ASKED',
+                    style: RT.body(
+                        size: 10,
+                        color: RT.ink.withOpacity(0.5),
+                        weight: FontWeight.w800))
+                : _iconBtn(Icons.person_add, RT.orange, () {
+                    _tap();
+                    unawaited(_online.requestById(p.id));
+                  }),
+      );
+
+  Widget _requestTile(OnlinePlayer p) => _playerRow(
+        p,
+        trailing: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            _iconBtn(Icons.check, RT.green, () {
+              _tap();
+              unawaited(_online.respondToRequest(p.id, true));
+            }),
+            const SizedBox(width: 6),
+            _iconBtn(Icons.close, RT.red, () {
+              _tap();
+              unawaited(_online.respondToRequest(p.id, false));
+            }),
           ],
         ),
       );
 
+  Widget _friendTile(OnlinePlayer p) => _playerRow(
+        p,
+        trailing: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            if (p.online)
+              _iconBtn(Icons.sports_esports, RT.orange, () {
+                _tap();
+                unawaited(_online.invite(p.id));
+              }),
+            const SizedBox(width: 6),
+            _iconBtn(Icons.person_remove, RT.ink.withOpacity(0.45), () {
+              _tap();
+              unawaited(_online.unfriend(p.id));
+            }),
+          ],
+        ),
+      );
   Widget _card({required String title, required Widget child}) => Container(
         padding: const EdgeInsets.all(14),
         decoration: RT.card(),
@@ -650,58 +806,6 @@ class _OnlineScreenState extends State<OnlineScreen> {
         ),
       );
 
-  Widget _friendsCard() {
-    final incoming = _online.incomingRequests;
-    final friends = _online.friends;
-    return _card(
-      title: 'FRIENDS',
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [
-          if (incoming.isEmpty && friends.isEmpty)
-            Text('Nobody yet — search for a captain above.',
-                style: RT.body(size: 12, color: RT.ink.withOpacity(0.6))),
-          for (final p in incoming)
-            _playerRow(
-              p,
-              trailing: Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  _iconBtn(Icons.check, RT.green, () {
-                    _tap();
-                    unawaited(_online.respondToRequest(p.id, true));
-                  }),
-                  const SizedBox(width: 6),
-                  _iconBtn(Icons.close, RT.red, () {
-                    _tap();
-                    unawaited(_online.respondToRequest(p.id, false));
-                  }),
-                ],
-              ),
-            ),
-          for (final p in friends)
-            _playerRow(
-              p,
-              trailing: Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  if (p.online)
-                    _iconBtn(Icons.sports_esports, RT.orange, () {
-                      _tap();
-                      unawaited(_online.invite(p.id));
-                    }),
-                  const SizedBox(width: 6),
-                  _iconBtn(Icons.person_remove, RT.ink.withOpacity(0.45), () {
-                    _tap();
-                    unawaited(_online.unfriend(p.id));
-                  }),
-                ],
-              ),
-            ),
-        ],
-      ),
-    );
-  }
 
   Widget _playerRow(OnlinePlayer p, {required Widget trailing}) => Padding(
         padding: const EdgeInsets.only(top: 10),

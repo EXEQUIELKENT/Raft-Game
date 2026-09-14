@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import '../game/ai.dart';
 import '../game/audio.dart';
@@ -25,6 +27,16 @@ class _MatchSetupScreenState extends State<MatchSetupScreen> {
   double _startHp = 100;
   double _turnSeconds = 30;
   int _aiLevel = 1; // 0 easy 1 normal 2 hard 3 expert
+
+  /// Build a raft block by block instead of sailing the prefab hull picked
+  /// below. An alternative rather than a replacement — the hull is still
+  /// what floats, and still what a shot bounces off; the build is what
+  /// stands on it.
+  ///
+  /// Seeded from, and written back to, the saved preference the shipyard
+  /// sets, so a captain who has decided they build their own decks does not
+  /// have to say so again on every skirmish.
+  late bool _buildOwn = SaveService.instance.data.buildOwnRaft;
   final Set<String> _weapons = Weapons.all.map((w) => w.id).toSet();
 
   // Per-seat raft customization. Seat 0 is the local player in both modes;
@@ -55,6 +67,20 @@ class _MatchSetupScreenState extends State<MatchSetupScreen> {
                   child: Column(
                     children: [
                       _section('WATERS', _mapPicker(save)),
+                      // Above the hull pickers, because it decides whether
+                      // they matter: BUILD IT is the alternative to bringing
+                      // a prefab deck, not a trim option on one. It sat
+                      // below them, roughly two screens down on a phone,
+                      // where nobody found it.
+                      _section(
+                        'RAFT DECK',
+                        _buildPicker(),
+                        blurb: _buildOwn
+                            ? 'Lay out your own deck from timber, barrels and '
+                                'iron once the match opens. It can be shot '
+                                'apart.'
+                            : 'Sail the hull you picked below, deck and all.',
+                      ),
                       if (!isAi) _section('EDITING RAFT', _seatPicker()),
                       _section(isAi ? 'YOUR RAFT' : 'RAFT ${_editingSeat + 1}', _raftPicker()),
                       _section('STARTING HEALTH', _hpPicker()),
@@ -110,7 +136,7 @@ class _MatchSetupScreenState extends State<MatchSetupScreen> {
     );
   }
 
-  Widget _section(String title, Widget child) {
+  Widget _section(String title, Widget child, {String? blurb}) {
     return Container(
       margin: const EdgeInsets.only(bottom: 14),
       padding: const EdgeInsets.all(12),
@@ -119,6 +145,18 @@ class _MatchSetupScreenState extends State<MatchSetupScreen> {
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Text(title, style: RT.chunky(size: 16, color: RT.ink)),
+          // A line of plain English under the heading, for the sections
+          // whose options are not self-describing. "BUILD IT" is a
+          // completely different way to play and two words cannot carry
+          // that on their own.
+          if (blurb != null) ...[
+            const SizedBox(height: 3),
+            Text(blurb,
+                style: RT.body(
+                    size: 11,
+                    color: RT.ink.withOpacity(0.62),
+                    weight: FontWeight.w700)),
+          ],
           const SizedBox(height: 8),
           child,
         ],
@@ -126,12 +164,27 @@ class _MatchSetupScreenState extends State<MatchSetupScreen> {
     );
   }
 
+  /// The waters, with everything the player can actually pick FIRST.
+  ///
+  /// This is a horizontal strip, and it used to run in fixed order — which
+  /// put the newest map, The Open Blue, seventh of seven and so a bare
+  /// sliver past the right edge on a phone, behind four greyed-out locked
+  /// tiles. The visible run ended in a lock, which reads as the end of the
+  /// list, so a map that unlocks at level 1 was effectively invisible.
+  ///
+  /// Sorting the reachable ones to the front costs nothing — a locked tile
+  /// cannot be chosen, so it has no claim on the space a player looks at
+  /// first — and it keeps working as more maps are added. Order is
+  /// otherwise preserved, so the strip does not reshuffle itself as the
+  /// player levels up; tiles only ever move earlier.
   Widget _mapPicker(SaveData save) {
+    final open = [for (final m in GameMaps.all) if (m.levelLock <= save.level) m];
+    final shut = [for (final m in GameMaps.all) if (m.levelLock > save.level) m];
     return SizedBox(
       height: 118,
       child: ListView(
         scrollDirection: Axis.horizontal,
-        children: GameMaps.all.map((m) {
+        children: [...open, ...shut].map((m) {
           final locked = m.levelLock > save.level;
           final sel = _map.id == m.id;
           return GestureDetector(
@@ -279,6 +332,25 @@ class _MatchSetupScreenState extends State<MatchSetupScreen> {
     );
   }
 
+
+  /// Prefab deck, or lay it out yourself once the match opens.
+  Widget _buildPicker() {
+    void pick(bool own) {
+      setState(() => _buildOwn = own);
+      // Remembered for next time, and shared with the campaign — which has
+      // no setup screen of its own to ask on.
+      SaveService.instance.data.buildOwnRaft = own;
+      unawaited(SaveService.instance.save());
+    }
+
+    return Row(
+      mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+      children: [
+        _chip('PREFAB', !_buildOwn, () => pick(false)),
+        _chip('BUILD IT', _buildOwn, () => pick(true)),
+      ],
+    );
+  }
   Widget _aiPicker() {
     return Row(
       mainAxisAlignment: MainAxisAlignment.spaceEvenly,
@@ -365,6 +437,10 @@ class _MatchSetupScreenState extends State<MatchSetupScreen> {
         localBoth ? _startHp + save.bonusHp : _startHp,
       ],
       ammo: save.battleAmmo(),
+      // The alternative to bringing a prefab hull: the hull still floats,
+      // but what stands on it is laid out by the player after the opening
+      // sweep. See BuildOverlay.
+      buildYourRaft: _buildOwn,
     );
 
     RaftLoadout seatLoadout(int seat) => RaftLoadout.custom(

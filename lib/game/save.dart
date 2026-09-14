@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'campaign.dart';
+import 'build.dart';
 import 'characters.dart';
 import 'models.dart';
 import 'progression.dart';
@@ -26,6 +27,26 @@ class SaveData {
   /// server's friends lists. Kept here rather than in the online service
   /// because a LAN match needs it too, with no account involved.
   String playerName = 'Captain';
+
+  /// The raft the player last built, if they build rather than pick a hull.
+  ///
+  /// Stored as the plan's own compact text (see [BuildPlan.encode]) rather
+  /// than as a nested structure: it is a fixed-size grid of single characters,
+  /// so a string is both the smallest form and the one that survives a schema
+  /// change without a migration.
+  BuildPlan? buildPlan;
+
+  /// Whether the player brings a deck they laid out themselves instead of a
+  /// prefab hull.
+  ///
+  /// Persisted, and deliberately not per-match: it is the same choice every
+  /// time you set out, and asking again at the top of every battle would be
+  /// a question with the same answer. Campaign has no setup screen at all,
+  /// so without somewhere durable to keep this, building would have been
+  /// reachable only in a skirmish — which is most of why it could not be
+  /// found. The skirmish screen reads and writes the same flag, so the two
+  /// can never disagree about what you are sailing.
+  bool buildOwnRaft = false;
   int hatIndex = 0;
   int colorIndex = 0;
 
@@ -118,6 +139,7 @@ class SaveData {
         'quality': quality, 'sensitivity': sensitivity, 'aimAssist': aimAssist,
         'showTrajectory': showTrajectory, 'achievements': achievements,
         'matchHistory': matchHistory,
+        'buildPlan': buildPlan?.encode(), 'buildOwnRaft': buildOwnRaft,
         'doubloons': doubloons, 'campaignStars': campaignStars, 'upgradeTiers': upgradeTiers,
       };
 
@@ -128,6 +150,11 @@ class SaveData {
     shotsFired = j['shotsFired'] ?? 0;
     totalDamage = j['totalDamage'] ?? 0;
     playerName = j['playerName'] ?? 'Captain';
+    buildOwnRaft = j['buildOwnRaft'] ?? false;
+    final planText = j['buildPlan'];
+    buildPlan = (planText is String && planText.isNotEmpty)
+        ? BuildPlan.decode(planText)
+        : null;
     // Old saves stored 'captain', a label with no character behind it. It
     // now names an enemy-only definition, so anything that is not a playable
     // character falls back to the default rather than dressing the player as

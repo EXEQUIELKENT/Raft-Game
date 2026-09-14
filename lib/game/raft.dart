@@ -270,6 +270,136 @@ class DeckStation {
 /// The deck layout for one hull — a series of platforms of varying shape
 /// and height, ordered stern-to-bow, that together tile the whole deck,
 /// plus the crew berths posted across them.
+
+/// What the enemy is standing on.
+///
+/// Every opponent used to be a raft — the same floating hull as the player's,
+/// in a different colour — so however much the hulls themselves varied, the
+/// far side of the water always read as "another one of me". These are
+/// genuinely different places to be attacked: a beach you have to lob onto,
+/// a shelf with a sheer face, three hulls lashed together with gaps between
+/// them, a cove whose walls are cover.
+///
+/// The variety that matters is the DECK PLAN, not the picture. Each kind
+/// lays its floors out differently, so where the crew can stand, what they
+/// can hide behind, and which of them a flat shot can even reach are
+/// different problems on each — and the crew-walking, the ragdoll settling
+/// and the shot collision all read the same height-field, so none of them
+/// needed to learn anything new.
+enum Emplacement {
+  /// The floating hull. What every enemy used to be, and still the most
+  /// common.
+  raft,
+
+  /// A sand mound standing out of the water: a long shallow beach up each
+  /// side to a broad flat crown. Wide and low, so there is plenty of room to
+  /// stand and almost nothing to hide behind — the exposed one.
+  island,
+
+  /// A rock shelf with a sheer face and a high flat top. Narrow, tall, and
+  /// awkward to land on: a shot has to clear the lip or it hits rock.
+  ledge,
+
+  /// Three small hulls lashed together, each sitting a little differently in
+  /// the water. Wide, uneven, and the steps between them are real cover.
+  flotilla,
+
+  /// A cove: high rock at both ends with a sheltered floor between them. The
+  /// crew in the middle are behind a wall from either side, so it has to be
+  /// dropped into rather than shot across.
+  bay,
+}
+
+/// The numbers and the floor plan behind each emplacement.
+class EmplacementDef {
+  final Emplacement kind;
+  final String name;
+
+  /// Floors, stern-to-bow, exactly as a hull's own plan is written — spans
+  /// are proportional and normalised on use.
+  final List<DeckTier> plan;
+
+  /// How much wider than the hull's own deck this stands. An island is a
+  /// landmass and a ledge is a perch, and the difference in how much room
+  /// the crew have is most of how they play.
+  final double widthScale;
+
+  /// False for anything rooted to the seabed. Land does not bob, and an
+  /// island rising and falling on the swell is the sort of thing that reads
+  /// as a bug rather than as weather.
+  final bool floats;
+
+  const EmplacementDef({
+    required this.kind,
+    required this.name,
+    required this.plan,
+    this.widthScale = 1,
+    this.floats = true,
+  });
+
+  static const raft = EmplacementDef(
+    kind: Emplacement.raft,
+    name: 'Raft',
+    // Empty: a raft keeps its hull's own plan, whatever that hull is.
+    plan: [],
+  );
+
+  static const island = EmplacementDef(
+    kind: Emplacement.island,
+    name: 'Island',
+    widthScale: 1.5,
+    floats: false,
+    plan: [
+      DeckTier(span: 0.22, rise: 0, crewWeight: 1),
+      DeckTier(span: 0.18, rise: 16, crewWeight: 1),
+      DeckTier(span: 0.30, rise: 30, crewWeight: 2),
+      DeckTier(span: 0.18, rise: 16, crewWeight: 1),
+      DeckTier(span: 0.12, rise: 0, crewWeight: 1),
+    ],
+  );
+
+  static const ledge = EmplacementDef(
+    kind: Emplacement.ledge,
+    name: 'Ledge',
+    widthScale: 0.82,
+    floats: false,
+    plan: [
+      DeckTier(span: 0.16, rise: 0, crewWeight: 0),
+      DeckTier(span: 0.62, rise: 52, crewWeight: 3, style: DeckStyle.castle),
+      DeckTier(span: 0.22, rise: 26, crewWeight: 1),
+    ],
+  );
+
+  static const flotilla = EmplacementDef(
+    kind: Emplacement.flotilla,
+    name: 'Lashed Rafts',
+    widthScale: 1.65,
+    plan: [
+      DeckTier(span: 0.30, rise: 22, crewWeight: 1, style: DeckStyle.lashed),
+      DeckTier(span: 0.06, rise: 0, crewWeight: 0),
+      DeckTier(span: 0.28, rise: 34, crewWeight: 2, style: DeckStyle.cargo),
+      DeckTier(span: 0.06, rise: 0, crewWeight: 0),
+      DeckTier(span: 0.30, rise: 14, crewWeight: 1, style: DeckStyle.barrels),
+    ],
+  );
+
+  static const bay = EmplacementDef(
+    kind: Emplacement.bay,
+    name: 'Bay',
+    widthScale: 1.45,
+    floats: false,
+    plan: [
+      DeckTier(span: 0.22, rise: 60, crewWeight: 1, style: DeckStyle.castle),
+      DeckTier(span: 0.56, rise: 0, crewWeight: 2),
+      DeckTier(span: 0.22, rise: 60, crewWeight: 1, style: DeckStyle.castle),
+    ],
+  );
+
+  static const all = [raft, island, ledge, flotilla, bay];
+
+  static EmplacementDef of(Emplacement k) =>
+      all.firstWhere((e) => e.kind == k, orElse: () => raft);
+}
 class DeckProfile {
   final String hullId;
   final List<DeckSegment> segments;
@@ -403,10 +533,22 @@ class DeckProfile {
   /// joined to the next by a ramp meeting both at their exact heights — which
   /// is the structural-integrity guarantee: a tumbling body can slide from
   /// the castle down to the main deck without ever finding a crack.
-  factory DeckProfile.forLoadout(RaftLoadout loadout, {required int facing}) {
-    final half = loadout.deckHalf;
+  factory DeckProfile.forLoadout(
+    RaftLoadout loadout, {
+    required int facing,
+    Emplacement emplacement = Emplacement.raft,
+  }) {
+    final place = EmplacementDef.of(emplacement);
+    // An emplacement is wider or narrower than the hull it stands in for,
+    // and the floors have to be laid out across the width they will actually
+    // occupy — building them at hull width and scaling afterwards would
+    // stretch the ramps out of proportion with the flats.
+    final half = loadout.deckHalf * place.widthScale;
     final deck = half * 2;
-    final plan = _plans[loadout.hull.id] ?? _plans['tube']!;
+    // A raft keeps its hull own plan; everything else brings its own floors.
+    final plan = place.plan.isNotEmpty
+        ? place.plan
+        : (_plans[loadout.hull.id] ?? _plans['tube']!);
 
     // 1. Lay the tiers out edge to edge across the deck, stern to bow.
     final spanTotal = plan.fold<double>(0, (s, t) => s + t.span);

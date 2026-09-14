@@ -52,6 +52,53 @@ enum ObstacleKind {
   /// channel, so it punishes the flat shot and nothing else.
   wreck,
 }
+/// What kind of thing joins two terraces.
+///
+/// The terraces were all joined by the same cascade, so however much the
+/// heights varied, every match's middle looked identical. These are five
+/// genuinely different transitions — different widths, different profiles,
+/// different materials — so the elevation change is part of the scene rather
+/// than one recurring prop dropped into it.
+///
+/// The kind also decides how WIDE the transition is, which is not cosmetic:
+/// the width is the run over which the surface changes, so a weir is an
+/// abrupt drop a shot can clear in one hop and a shoal is a long ramp that
+/// changes the whole middle of the channel.
+enum WaterStepKind {
+  /// A plunging cascade: narrow, steep, loud. The original.
+  falls,
+
+  /// A long shallow run of broken water. Wide and gentle — barely a step,
+  /// mostly a texture.
+  rapids,
+
+  /// Built, not grown: a straight-edged sill with a smooth curtain over it
+  /// and a churning pool below. The narrowest and most abrupt of them.
+  weir,
+
+  /// A rock shelf, stepping down in strata.
+  ledge,
+
+  /// A shoal: a long pale ramp of sand or shingle showing through the water.
+  /// The gentlest, and the one that reads as terrain rather than as water.
+  shoal,
+
+  /// A calving ice edge — pale blue, blocky, with meltwater running off it.
+  iceShelf,
+}
+
+/// How wide each kind's transition runs, as a multiple of the base width.
+///
+/// Steep kinds are narrow and gentle ones are long, which is what makes them
+/// feel like different features rather than one feature repainted.
+double stepWidthScale(WaterStepKind kind) => switch (kind) {
+      WaterStepKind.falls => 1.0,
+      WaterStepKind.rapids => 2.4,
+      WaterStepKind.weir => 0.55,
+      WaterStepKind.ledge => 0.85,
+      WaterStepKind.shoal => 2.9,
+      WaterStepKind.iceShelf => 0.8,
+    };
 class MapDef {
   final String id;
   final String name;
@@ -80,6 +127,14 @@ class MapDef {
   /// the frozen swell, crates and masts in the harbour.
   final List<ObstacleKind> obstacles;
 
+
+  /// Which kinds of elevation change this scene may put in its channel.
+  ///
+  /// Themed, because a transition is terrain: an ice shelf belongs in the
+  /// frozen swell, a built weir in a harbour, a shoal of pale sand in the
+  /// tropics. Every scene lists several so the middle of the map is not the
+  /// same feature every match.
+  final List<WaterStepKind> waterSteps;
   /// What the solid things in this scene are MADE of.
   ///
   /// The shapes alone were not enough: a rock was the same grey lump in the
@@ -109,6 +164,11 @@ class MapDef {
     this.props = const [SceneProp.palm, SceneProp.rock],
     this.chop = 1.0,
     this.obstacles = const [ObstacleKind.rock, ObstacleKind.buoy],
+    this.waterSteps = const [
+      WaterStepKind.falls,
+      WaterStepKind.rapids,
+      WaterStepKind.ledge,
+    ],
     this.stone = const Color(0xFF6E6A63),
     this.stoneShade = const Color(0xFF514E49),
     this.timber = const Color(0xFF8A6134),
@@ -129,6 +189,7 @@ class GameMaps {
       props: [SceneProp.palm, SceneProp.rock, SceneProp.buoy],
       obstacles: [ObstacleKind.rock, ObstacleKind.buoy],
       // Weathered sea granite and salt-bleached driftwood.
+      waterSteps: [WaterStepKind.falls, WaterStepKind.rapids, WaterStepKind.ledge, WaterStepKind.shoal],
       stone: Color(0xFF6E6A63), stoneShade: Color(0xFF4E4B46),
       timber: Color(0xFF9A7346), timberShade: Color(0xFF6A4C2C),
       chop: 1.0,
@@ -141,6 +202,7 @@ class GameMaps {
       props: [SceneProp.palm, SceneProp.hut, SceneProp.rock],
       obstacles: [ObstacleKind.rock, ObstacleKind.crate, ObstacleKind.buoy],
       // Warm coral limestone and fresh palm timber.
+      waterSteps: [WaterStepKind.shoal, WaterStepKind.rapids, WaterStepKind.ledge],
       stone: Color(0xFFC9A87C), stoneShade: Color(0xFF9C7B52),
       timber: Color(0xFFC08A4A), timberShade: Color(0xFF8A5C28),
       chop: 0.75,
@@ -153,6 +215,7 @@ class GameMaps {
       props: [SceneProp.iceberg, SceneProp.rock],
       obstacles: [ObstacleKind.iceberg, ObstacleKind.rock, ObstacleKind.iceberg],
       // Wet dark slate against pale blue ice.
+      waterSteps: [WaterStepKind.iceShelf, WaterStepKind.ledge, WaterStepKind.falls],
       stone: Color(0xFF6E7B85), stoneShade: Color(0xFF4A555F),
       timber: Color(0xFF7A6A5C), timberShade: Color(0xFF52463C),
       chop: 1.45, levelLock: 2,
@@ -165,6 +228,7 @@ class GameMaps {
       props: [SceneProp.cactus, SceneProp.wreck, SceneProp.rock],
       obstacles: [ObstacleKind.wreck, ObstacleKind.rock, ObstacleKind.mast],
       // Sun-baked sandstone and timber bleached silver-grey.
+      waterSteps: [WaterStepKind.shoal, WaterStepKind.ledge, WaterStepKind.rapids],
       stone: Color(0xFFD3A96A), stoneShade: Color(0xFFA37C42),
       timber: Color(0xFFB49A78), timberShade: Color(0xFF7E6850),
       chop: 0.6, levelLock: 3,
@@ -177,6 +241,7 @@ class GameMaps {
       props: [SceneProp.ember, SceneProp.rock, SceneProp.wreck],
       obstacles: [ObstacleKind.rock, ObstacleKind.wreck, ObstacleKind.rock],
       // Black basalt and charred, half-burnt planking.
+      waterSteps: [WaterStepKind.ledge, WaterStepKind.falls, WaterStepKind.rapids],
       stone: Color(0xFF4A4148), stoneShade: Color(0xFF2E282E),
       timber: Color(0xFF6B4438), timberShade: Color(0xFF3E2620),
       chop: 1.2, levelLock: 5,
@@ -189,9 +254,31 @@ class GameMaps {
       props: [SceneProp.rig, SceneProp.crane, SceneProp.buoy],
       obstacles: [ObstacleKind.crate, ObstacleKind.mast, ObstacleKind.crate, ObstacleKind.buoy],
       // Harbour concrete and painted dock timber.
+      waterSteps: [WaterStepKind.weir, WaterStepKind.ledge, WaterStepKind.falls],
       stone: Color(0xFF7E8590), stoneShade: Color(0xFF565C66),
       timber: Color(0xFF8C6A4E), timberShade: Color(0xFF5C4430),
       chop: 0.9, levelLock: 7,
+    ),
+    MapDef(
+      id: 'openwater', name: 'The Open Blue',
+      tagline: 'No land, no shelter — only what you build',
+      icon: Icons.waves,
+      // No sand band and no shoreline tone: the horizon is sky meeting sea
+      // all the way round, which is the whole point of the place.
+      sky: [Color(0xFF5FA8D8), Color(0xFF9FD0EA), Color(0xFFC8E6F2), Color(0xFFD8EEF6)],
+      water: Color(0xFF2A7FA0), waterDeep: Color(0xFF103E58),
+      shore: Color(0xFFC8E6F2),
+      // Nothing on the horizon to see. Everything that breaks the skyline
+      // here is either a raft or something the players put there.
+      props: [],
+      // What little floats out here has drifted a long way to get here.
+      obstacles: [ObstacleKind.buoy, ObstacleKind.wreck, ObstacleKind.crate],
+      // Deep-ocean swell: no shelf to break on, so the only steps are
+      // long rolling ones rather than anything that plunges.
+      waterSteps: [WaterStepKind.rapids, WaterStepKind.shoal],
+      stone: Color(0xFF5E6E78), stoneShade: Color(0xFF3C4952),
+      timber: Color(0xFF8A7358), timberShade: Color(0xFF5A4A38),
+      chop: 1.35, levelLock: 1,
     ),
   ];
 

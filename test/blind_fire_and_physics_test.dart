@@ -1,3 +1,4 @@
+import 'dart:math';
 import 'dart:async';
 import 'dart:io';
 
@@ -24,8 +25,9 @@ void main() {
   GameController newMatch({
     int seed = 42,
     GameMode mode = GameMode.vsAi,
+    bool skipIntro = true,
   }) {
-    return GameController(
+    final ctrl = GameController(
       settings: MatchSettings(map: GameMaps.all.first, startHp: 100, turnSeconds: 30),
       players: [
         PlayerConfig(name: 'P1', loadout: loadout()),
@@ -39,6 +41,13 @@ void main() {
       mode: mode,
       seed: seed,
     );
+    // Past the opening sweep by default, which deliberately parks the
+    // camera on the enemy before travelling home. Almost everything in this
+    // file is about where the camera sits once a turn is under way, so it
+    // starts from the settled view rather than mid-cinematic — except the
+    // sweep own tests, which ask for it.
+    if (skipIntro) ctrl.skipIntro();
+    return ctrl;
   }
 
   /// Runs [frames] 60Hz ticks, the way the game loop does.
@@ -198,6 +207,112 @@ void main() {
     });
   });
 
+
+  group('The opening sweep', () {
+    // Before the first turn the camera shows you who you are up against and
+    // then travels home. It starts on the FURTHEST enemy so the trip home
+    // passes every other enemy raft on the way — one continuous move rather
+    // than a cut out and a cut back.
+
+    /// Where the camera is looking, in world x.
+    double lookingAt(GameController c) => c.world.cam + c.world.viewWidth / 2;
+
+    test('a match opens looking at the enemy, not at you', () {
+      final ctrl = newMatch(skipIntro: false);
+      expect(ctrl.inIntro, true, reason: 'the sweep did not start');
+      final enemy = ctrl.world.raftOf(1)!;
+      final me = ctrl.world.raftOf(0)!;
+      expect((lookingAt(ctrl) - enemy.x).abs(),
+          lessThan((lookingAt(ctrl) - me.x).abs()),
+          reason: 'the opening view is on the player, not the opposition');
+      ctrl.dispose();
+    });
+
+    test('it dwells there before setting off', () {
+      final ctrl = newMatch(skipIntro: false);
+      final enemy = ctrl.world.raftOf(1)!;
+      final atStart = lookingAt(ctrl);
+      for (int f = 0; f < (GameController.introDwell * 0.8 * 60).round(); f++) {
+        ctrl.frameForTest(1 / 60);
+      }
+      expect((lookingAt(ctrl) - atStart).abs(), lessThan(2),
+          reason: 'the camera set off before anybody could look at the enemy');
+      expect((lookingAt(ctrl) - enemy.x).abs(), lessThan(2));
+      ctrl.dispose();
+    });
+
+    test('it arrives home, and only then hands over the turn', () {
+      final ctrl = newMatch(skipIntro: false);
+      final total = GameController.introDwell + GameController.introPan;
+      for (int f = 0; f < (total * 60).round() + 4; f++) {
+        ctrl.frameForTest(1 / 60);
+      }
+      expect(ctrl.inIntro, false, reason: 'the sweep never finished');
+      final me = ctrl.world.raftOf(0)!;
+      // Home is the shooter's own lead position, the same place a turn puts
+      // the camera.
+      expect((lookingAt(ctrl) - (me.x + me.facing * BattleConst.camLead)).abs(),
+          lessThan(30),
+          reason: 'the sweep did not finish on the player');
+      ctrl.dispose();
+    });
+
+    test('it is a slow move, not a jump', () {
+      // The thing that makes it read as a camera move rather than a cut: no
+      // single frame covers much ground, and it eases at both ends.
+      final ctrl = newMatch(skipIntro: false);
+      final total = GameController.introDwell + GameController.introPan;
+      var biggestStep = 0.0;
+      var previous = lookingAt(ctrl);
+      for (int f = 0; f < (total * 60).round(); f++) {
+        ctrl.frameForTest(1 / 60);
+        final here = lookingAt(ctrl);
+        biggestStep = max(biggestStep, (here - previous).abs());
+        previous = here;
+      }
+      // The whole trip is well over a thousand units; at 60Hz a linear pan
+      // would be about 8 a frame and an eased one peaks near 13. Anything
+      // near a hundred is a cut.
+      expect(biggestStep, lessThan(30),
+          reason: 'the camera jumped ${biggestStep.round()} units in one '
+              'frame — that is a cut, not a pan');
+      ctrl.dispose();
+    });
+
+    test('nothing can be fired mid-sweep without cancelling it', () {
+      // The sweep is a camera move, not a gate on play: a player who has
+      // already decided what to do is never told to wait for it.
+      final ctrl = newMatch(skipIntro: false);
+      expect(ctrl.inIntro, true);
+      ctrl.humanFire();
+      expect(ctrl.inIntro, false, reason: 'firing did not cancel the sweep');
+      expect(ctrl.world.shot, isNotNull, reason: 'the shot was swallowed');
+      ctrl.dispose();
+    });
+
+    test('a tap skips it and puts the camera where the turn wants it', () {
+      final ctrl = newMatch(skipIntro: false);
+      ctrl.skipIntro();
+      expect(ctrl.inIntro, false);
+      final me = ctrl.world.raftOf(0)!;
+      expect((lookingAt(ctrl) - (me.x + me.facing * BattleConst.camLead)).abs(),
+          lessThan(30));
+      ctrl.dispose();
+    });
+
+    test('the turn clock does not run while it plays', () {
+      // Otherwise the player loses several seconds of their first turn to a
+      // camera move they did not ask for.
+      final ctrl = newMatch(skipIntro: false);
+      final before = ctrl.turnTimeLeft;
+      for (int f = 0; f < 60; f++) {
+        ctrl.frameForTest(1 / 60);
+      }
+      expect(ctrl.turnTimeLeft, closeTo(before, 0.01),
+          reason: 'the first turn was counting down during the sweep');
+      ctrl.dispose();
+    });
+  });
   group('Camera tracking during flight', () {
     test('A shot in flight pulls the camera past the shooter', () {
       final ctrl = newMatch();
@@ -507,8 +622,9 @@ void main() {
       final foe = world.raftOf(1)!;
       final c = foe.crew.first;
 
-      expect(c.ragdoll, false);
-      expect(c.offset, Offset.zero);
+      expect(c.offset, foe.restOffset(0),
+          reason: 'a crew member starts at their berth, which on a '
+              'raised tier is not the origin');
 
       c.knock(const Offset(1, 0), Crew.impactForce(Weapons.byId('grenade')));
 
@@ -522,7 +638,7 @@ void main() {
       // Let it settle. It should come to rest and then walk back to station.
       tick(ctrl, 400);
       expect(c.ragdoll, false, reason: 'the body settles');
-      expect(c.offset.distance, lessThan(0.5),
+      expect((c.offset - foe.restOffset(0)).distance, lessThan(0.5),
           reason: 'and shuffles back to where it was standing');
     });
 
@@ -633,13 +749,19 @@ void main() {
       final foe = ctrl.world.raftOf(1)!;
       final force = Crew.impactForce(Weapons.byId('grenade'));
 
-      // A blow to the head turns the body over — that is what a ragdoll is.
+      // Hit points are measured from each crew member's OWN feet, not from
+      // the deck plane. `hitLocal` is deck-relative, so a fixed -55 is a head
+      // hit for somebody on the flat and a hip hit for somebody standing a
+      // tier up — which compares a head hit to a hip hit only when both
+      // happen to be on the same level.
       final headHit = foe.crew.first;
-      headHit.knock(const Offset(1, 0), force, hitLocal: const Offset(0, -55));
+      headHit.knock(const Offset(1, 0), force,
+          hitLocal: Offset(0, headHit.offset.dy - 55));
 
       // The same blow dead-centre at the hips is a clean shove.
       final centreHit = foe.crew.last;
-      centreHit.knock(const Offset(1, 0), force, hitLocal: const Offset(0, -15));
+      centreHit.knock(const Offset(1, 0), force,
+          hitLocal: Offset(0, centreHit.offset.dy - 15));
 
       expect(headHit.pose!.maxSpin, greaterThan(centreHit.pose!.maxSpin * 1.5),
           reason: 'hitting high must tumble the body, not just push it');
@@ -660,11 +782,15 @@ void main() {
       var sawWalk = false;
       for (int i = 0; i < 900; i++) {
         ctrl.world.update(1 / 60);
-        if (c.walkAmp > 0.5 && c.offset != Offset.zero) sawWalk = true;
+        if (c.walkAmp > 0.5 && c.offset != foe.restOffset(0)) sawWalk = true;
       }
 
       expect(sawWalk, true, reason: 'the walk back to station is animated');
-      expect(c.offset, Offset.zero, reason: 'they end up where they started');
+      // Their BERTH, not the origin: a berth on a raised tier has never sat
+      // at zero, so comparing against Offset.zero only ever passed because
+      // the hull under test happened to post its crew on the flat.
+      expect(c.offset, foe.restOffset(0),
+          reason: 'they end up where they started');
       expect(c.walkAmp, 0, reason: 'and the walk eases out on arrival');
       ctrl.dispose();
     });

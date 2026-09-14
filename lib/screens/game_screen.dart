@@ -3,12 +3,14 @@ import 'package:flutter/services.dart';
 
 import '../game/audio.dart';
 import '../game/battle.dart';
+import '../game/build.dart';
 import '../game/campaign.dart';
 import '../game/controller.dart';
 import '../game/models.dart';
 import '../game/renderer.dart';
 import '../game/save.dart';
 import '../theme.dart';
+import '../widgets/build_overlay.dart';
 
 class GameScreen extends StatefulWidget {
   final MatchSettings settings;
@@ -64,6 +66,10 @@ class _GameScreenState extends State<GameScreen> {
   final GlobalKey _fireBtnKey = GlobalKey();
   final GlobalKey _topBarKey = GlobalKey();
 
+  /// The build overlay's two bars, for the same exclusion.
+  final GlobalKey _buildTopKey = GlobalKey();
+  final GlobalKey _buildBottomKey = GlobalKey();
+
   /// Desktop only: the battle is driven by a pull-back drag, which a mouse
   /// can do perfectly well, but aiming to the nearest degree with a mouse is
   /// miserable. These keys drive the same nudge buttons the touch HUD uses.
@@ -89,9 +95,24 @@ class _GameScreenState extends State<GameScreen> {
   int? _campaignStars;
   int? _campaignReward;
 
+  /// How many battle screens are currently alive.
+  ///
+  /// Advancing to the next campaign level is a [Navigator.pushReplacement],
+  /// and Flutter builds the incoming route before it disposes the outgoing
+  /// one — so the new level's `initState` asked for the battle track and
+  /// then the old level's `dispose` handed the music back to the menu a
+  /// moment later, over the top of the battle that had just started. The
+  /// menu theme then played for the whole level.
+  ///
+  /// Counting live screens is what makes the handover safe: the music only
+  /// goes back to the menu when the LAST battle screen goes away, so a
+  /// level-to-level transition (1 -> 2 -> 1) never releases it.
+  static int _liveBattles = 0;
+
   @override
   void initState() {
     super.initState();
+    _liveBattles++;
     AudioService.instance.playMusic('music_battle');
     ctrl = widget.controller ??
         GameController(
@@ -112,7 +133,13 @@ class _GameScreenState extends State<GameScreen> {
     } else {
       ctrl.removeListener(_onUpdate);
     }
-    AudioService.instance.playMusic('music_menu');
+    // Only the last battle screen to leave gives the music back. See
+    // [_liveBattles].
+    _liveBattles--;
+    if (_liveBattles <= 0) {
+      _liveBattles = 0;
+      AudioService.instance.playMusic('music_menu');
+    }
     super.dispose();
   }
 
@@ -247,6 +274,11 @@ class _GameScreenState extends State<GameScreen> {
       _topBarKey,
       _walkBarKey,
       _fireBtnKey,
+      // The build bars own their taps too — a finger on the material
+      // palette or on SET SAIL must not also land a block on the deck
+      // behind it.
+      _buildTopKey,
+      _buildBottomKey,
     ]) {
       final box = key.currentContext?.findRenderObject() as RenderBox?;
       if (box == null || !box.attached) continue;
@@ -255,10 +287,66 @@ class _GameScreenState extends State<GameScreen> {
     return rects;
   }
 
+  /// True while the player is laying out their raft.
+  bool get _building => ctrl.buildPhase && !ctrl.inIntro;
+
+  /// Turns a screen point into a world point.
+  ///
+  /// The scene transform is the whole of what the painter does before it
+  /// draws: fit the world's height to the screen, then pan by the camera
+  /// (see [WorldRenderer.render]). Inverting it here is what lets the
+  /// player edit the raft by touching the raft, rather than by touching a
+  /// diagram of it somewhere else on the screen.
+  Offset _worldAt(Offset local, Size size) {
+    final scale = size.height / BattleConst.worldH;
+    return Offset(local.dx / scale + ctrl.world.cam, local.dy / scale);
+  }
+
+  /// Places or clears a block from a tap on the raft itself.
+  ///
+  /// Tapping an empty cell builds in the selected material; tapping a block
+  /// takes it away. One gesture both ways, so there is no eraser mode to
+  /// get stuck in — and the thing being tapped is the actual raft, at the
+  /// size it will be fought at, with the crew standing on it.
+  void _buildTap(Offset local, Size size) {
+    final raft = ctrl.world.raftOf(ctrl.localPlayerIndex);
+    final plan = ctrl.editingPlan;
+    if (raft == null || plan == null) return;
+
+    final w = _worldAt(local, size);
+    final deckTop = raft.waterLine - raft.loadout.deckRise;
+    final lx = w.dx - raft.x;
+    final ly = w.dy - ctrl.world.bobOf(raft);
+
+    final col = BuildPlan.columnAt(lx);
+    if (col < 0 || !raft.buildColumnOnDeck(col)) return;
+    final row = ((deckTop - ly) / BuildPlan.cellH).floor();
+    if (row < 0 || row >= BuildPlan.rows) return;
+
+    AudioService.instance.sfx('click');
+    ctrl.setBlock(col, row, plan.at(col, row) != null ? null : buildMaterial);
+    setState(() {});
+  }
+
+  /// The material the next tap on the raft lays down. Owned here rather than
+  /// inside [BuildOverlay] because the tap that uses it lands on the world
+  /// behind the overlay, not on the overlay itself.
+  BuildMaterial buildMaterial = BuildMaterial.driftwood;
+
   void _onPointerDown(PointerDownEvent e) {
     if (_activePointerId != null) return;
     for (final rect in _excludedRects()) {
       if (rect.contains(e.position)) return;
+    }
+    // A tap skips the opening sweep. An unskippable cinematic is a nuisance
+    // by the third match, and this one plays before every single one.
+    if (ctrl.inIntro) {
+      ctrl.skipIntro();
+      return;
+    }
+    if (_building) {
+      _buildTap(e.localPosition, context.size ?? MediaQuery.sizeOf(context));
+      return;
     }
     if (!ctrl.canHumanAct) return;
     _activePointerId = e.pointer;
@@ -360,7 +448,23 @@ class _GameScreenState extends State<GameScreen> {
                   builder: (_, __) => CustomPaint(painter: _ScenePainter(ctrl, renderer)),
                 ),
               ),
-              SafeArea(child: _buildHud()),
+              // The build overlay sits over the world it is editing, so a
+              // wall is judged against the crew who will stand behind it.
+              if (_building)
+                BuildOverlay(
+                  ctrl: ctrl,
+                  selected: buildMaterial,
+                  onSelect: (m) => setState(() => buildMaterial = m),
+                  topBarKey: _buildTopKey,
+                  bottomBarKey: _buildBottomKey,
+                ),
+              // The battle HUD is hidden while building, not drawn behind
+              // it. It used to sit ON TOP of the overlay — the health bar
+              // over the title, the walk arrows under the palette, a FIRE
+              // button for a turn that has not started — which made the
+              // build screen unreadable and let a stray tap drive the match
+              // instead of the raft.
+              if (!_building) SafeArea(child: _buildHud()),
               if (ctrl.net?.isNetworked ?? false) _chatOverlay(),
               if (ctrl.phase == GamePhase.aiming && ctrl.canHumanAct)
                 _pullReadout(),
@@ -519,9 +623,16 @@ class _GameScreenState extends State<GameScreen> {
         children: [
           _roundBtn('‹', () => Navigator.pop(context), size: 40),
           const SizedBox(width: 10),
-          // Player health
-          Container(
-            width: 210,
+          // Player health. Flexible with a cap rather than a fixed 210:
+          // the row's right-hand chips grow with the level label and the
+          // doubloon count, and a rigid health pill made the whole bar
+          // overflow the screen instead of giving up its own slack.
+          Flexible(
+            flex: 3,
+            child: ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 210),
+              child: Container(
+            width: double.infinity,
             padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
             decoration: RT.pill(opacity: 0.8, radius: 14),
             child: Column(
@@ -551,16 +662,38 @@ class _GameScreenState extends State<GameScreen> {
               ],
             ),
           ),
-          const Spacer(),
-          _infoChip('ANGLE ${ctrl.aimAngle.round()}° · PWR ${ctrl.aimPower.round()}%'),
+            ),
+          ),
           const SizedBox(width: 8),
-          _infoChip('${_levelLabel()} · ${ctrl.foesLeft} CREW LEFT'),
-          const SizedBox(width: 8),
-          Container(
-            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 9),
-            decoration: RT.pill(color: RT.yellow, opacity: 1, radius: 13),
-            child: Text('◉ ${save.doubloons}',
-                style: RT.body(size: 12, color: const Color(0xFF6B4A00), weight: FontWeight.w800)),
+          // The readouts, right-aligned and allowed to scroll off to the
+          // LEFT if they cannot all fit. Reversed so the things that must
+          // never be lost — the purse and the crew count — keep the right
+          // edge, and the aim readout is the first to go.
+          Flexible(
+            flex: 5,
+            child: SingleChildScrollView(
+              scrollDirection: Axis.horizontal,
+              reverse: true,
+              child: Row(
+                children: [
+                  _infoChip(
+                      'ANGLE ${ctrl.aimAngle.round()}° · PWR ${ctrl.aimPower.round()}%'),
+                  const SizedBox(width: 8),
+                  _infoChip('${_levelLabel()} · ${ctrl.foesLeft} CREW LEFT'),
+                  const SizedBox(width: 8),
+                  Container(
+                    padding:
+                        const EdgeInsets.symmetric(horizontal: 12, vertical: 9),
+                    decoration: RT.pill(color: RT.yellow, opacity: 1, radius: 13),
+                    child: Text('◉ ${save.doubloons}',
+                        style: RT.body(
+                            size: 12,
+                            color: const Color(0xFF6B4A00),
+                            weight: FontWeight.w800)),
+                  ),
+                ],
+              ),
+            ),
           ),
         ],
       ),
@@ -584,20 +717,27 @@ class _GameScreenState extends State<GameScreen> {
       child: Row(
         crossAxisAlignment: CrossAxisAlignment.end,
         children: [
-          Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              // Only on your own turn, and only while there is somebody on
-              // their feet to walk — the pads would be a lie otherwise.
-              if (ctrl.canSteer) ...[
-                _walkBar(),
-                const SizedBox(height: 8),
+          // Flexible, because the weapon bar grows with however many rounds
+          // the match enables. Fixed, it pushed the fire button off the
+          // right-hand edge of the screen.
+          Flexible(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                // Only on your own turn, and only while there is somebody on
+                // their feet to walk — the pads would be a lie otherwise.
+                if (ctrl.canSteer) ...[
+                  _walkBar(),
+                  const SizedBox(height: 8),
+                ],
+                _weaponBar(),
               ],
-              _weaponBar(),
-            ],
+            ),
           ),
-          const Spacer(),
+          const SizedBox(width: 12),
+          // Never flexible: aiming and firing are the controls the turn
+          // cannot be taken without.
           Column(
             mainAxisSize: MainAxisSize.min,
             crossAxisAlignment: CrossAxisAlignment.end,
@@ -612,17 +752,26 @@ class _GameScreenState extends State<GameScreen> {
     );
   }
 
+  /// The rounds on hand.
+  ///
+  /// Scrollable, because a match can enable every weapon in the game and
+  /// the bar is pinned to the bottom-left corner of a phone in landscape.
+  /// The key sits on the scroll view rather than on the inner row so the
+  /// rect excluded from aim-drags is the part actually on screen.
   Widget _weaponBar() {
     final weapons = ctrl.availableWeapons;
-    return Row(
+    return SingleChildScrollView(
       key: _weaponBarKey,
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        for (final w in weapons) ...[
-          _weaponChip(w),
-          const SizedBox(width: 8),
+      scrollDirection: Axis.horizontal,
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          for (final w in weapons) ...[
+            _weaponChip(w),
+            const SizedBox(width: 8),
+          ],
         ],
-      ],
+      ),
     );
   }
 
@@ -744,15 +893,22 @@ class _GameScreenState extends State<GameScreen> {
         const SizedBox(width: 8),
         pad('▶', 1),
         const SizedBox(width: 10),
-        Container(
-          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-          decoration: RT.pill(color: RT.ink, opacity: 0.5, radius: 14),
-          child: Text('TAP A CREW MEMBER TO SWITCH',
-              style: RT.body(
-                  size: 9,
-                  color: Colors.white.withOpacity(0.85),
-                  weight: FontWeight.w800,
-                  letterSpacing: 0.8)),
+        // The hint gives way before the pads do. It is the only thing in
+        // this row that is merely nice to know, so on a narrow screen it
+        // shortens rather than shoving the walk controls off the edge.
+        Flexible(
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+            decoration: RT.pill(color: RT.ink, opacity: 0.5, radius: 14),
+            child: Text('TAP A CREW MEMBER TO SWITCH',
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: RT.body(
+                    size: 9,
+                    color: Colors.white.withOpacity(0.85),
+                    weight: FontWeight.w800,
+                    letterSpacing: 0.8)),
+          ),
         ),
       ],
     );
@@ -1136,6 +1292,11 @@ class _ScenePainter extends CustomPainter {
       isAiming: ctrl.phase == GamePhase.aiming,
       aimAngleDeg: ctrl.aimAngle,
       weapon: ctrl.selectedWeapon,
+      // While laying out a raft, show the player where blocks may go — on
+      // the raft itself, which is the only place the question makes sense.
+      buildTarget: ctrl.buildPhase && !ctrl.inIntro
+          ? ctrl.world.raftOf(ctrl.localPlayerIndex)
+          : null,
     );
 
     // Trajectory preview for the human shooter, drawn over the scene.

@@ -6,6 +6,7 @@ import 'package:flutter/foundation.dart';
 import 'ai.dart';
 import 'audio.dart';
 import 'battle.dart';
+import 'build.dart';
 import 'bosses.dart';
 import 'maps.dart';
 import 'models.dart';
@@ -86,6 +87,11 @@ class MatchSettings {
   /// True for a world's final battle. Worth half again as much XP.
   bool isBoss;
 
+  /// True when the player lays out their own raft before the first turn,
+  /// instead of bringing a prefab hull. The alternative to picking a hull,
+  /// not a replacement for it — a match is set up one way or the other.
+  bool buildYourRaft;
+
   MatchSettings({
     MapDef? map,
     this.startHp = 100,
@@ -95,6 +101,7 @@ class MatchSettings {
     this.ammo,
     this.difficultyTier = 0,
     this.isBoss = false,
+    this.buildYourRaft = false,
   })  : map = map ?? GameMaps.all.first,
         enabledWeapons = enabledWeapons ?? Weapons.all.map((w) => w.id).toList();
 
@@ -270,6 +277,19 @@ class GameController extends ChangeNotifier {
           ? BattleConst.playerX
           : BattleConst.enemySlots[(i - 1).clamp(0, BattleConst.enemySlots.length - 1)];
       final hp = settings.startHpFor(i) + p.loadout.hpBonus;
+      // What the enemy is standing on.
+      //
+      // Every opponent used to be a raft — the same floating hull as the
+      // player's in another colour — so however much the hulls varied, the
+      // far side of the water always read as "another one of me". Drawn from
+      // the match seed, so both devices in a hotspot match build the same
+      // opposition and a replay is a replay.
+      //
+      // The player's side is always a raft: it is the one they chose, and
+      // the one they may have built on.
+      final place = isPlayerSide
+          ? Emplacement.raft
+          : _enemyEmplacement(world.rng, i);
       world.addRaft(Raft(
         playerIndex: i,
         x: x,
@@ -277,6 +297,7 @@ class GameController extends ChangeNotifier {
         look: p.look,
         label: p.name.toUpperCase(),
         facing: isPlayerSide ? 1 : -1,
+        emplacement: place,
         crew: List.generate(
           p.loadout.crewCount,
           (c) => Crew(
@@ -309,6 +330,8 @@ class GameController extends ChangeNotifier {
 
     world.lockCam(0);
     _beginTurn(0, initial: true);
+    // The opening look at the opposition, before anybody may act.
+    _startIntro();
     _hookNet();
     _startTicker();
   }
@@ -432,13 +455,43 @@ class GameController extends ChangeNotifier {
     _ticker = Timer.periodic(const Duration(milliseconds: 16), (_) => _tick());
   }
 
+  /// Where the last resolved shot landed, horizontally. Exposed so the AI's
+  /// accuracy can be measured as a distance rather than only as hit-or-miss:
+  /// "how far out" is the number that says whether the aim is close and
+  /// unlucky or simply wrong.
+  @visibleForTesting
+  double get impactXForTest => _impactX;
+
+  /// The point the last AI plan was aimed at, and the crew member it meant
+  /// to hit. Measuring aim needs both halves: a shot landing exactly where
+  /// it was aimed is a good shot even when it kills nobody, and that is a
+  /// completely different fault from one that lands short.
+  @visibleForTesting
+  Offset? lastAiAim;
+  @visibleForTesting
+  int lastAiTarget = -1;
+
   /// Runs one frame of exactly [dt].
   ///
   /// The live game is driven by a wall-clock timer, so a test cannot step it
   /// deterministically — and walking is a per-frame integration, which is
   /// precisely the kind of thing that needs stepping a known amount.
   @visibleForTesting
-  void stepForTest(double dt) => _frame(dt);
+  void stepForTest(double dt) {
+    // The opening sweep is presentation. A test driving the simulation
+    // directly is not watching it, and making every such test wait out four
+    // seconds of camera move would be four seconds of nothing.
+    if (inIntro) skipIntro();
+    _frame(dt);
+  }
+
+  /// One frame with NOTHING skipped — including the opening sweep.
+  ///
+  /// Separate from [stepForTest] because that one skips the sweep for the
+  /// convenience of every test that does not care about it, which makes it
+  /// useless for testing the sweep.
+  @visibleForTesting
+  void frameForTest(double dt) => _frame(dt);
 
   void _tick() {
     if (_disposed) return;
@@ -452,6 +505,24 @@ class GameController extends ChangeNotifier {
     time += dt;
 
     world.update(dt);
+
+    // The opening sweep owns the camera and holds the turn: nothing may be
+    // fired and the clock does not run until it is done. The world still
+    // ticks underneath it, so the sea moves and the crew are alive while you
+    // are being shown the opposition.
+    if (inIntro) {
+      _updateIntro(dt);
+      notifyListeners();
+      return;
+    }
+
+    // The build phase holds the turn in the same way the sweep does: the
+    // world ticks underneath so the sea moves and the crew are alive, but
+    // the clock does not run and nobody may act.
+    if (buildPhase) {
+      notifyListeners();
+      return;
+    }
 
     switch (phase) {
       case GamePhase.aiming:
@@ -473,6 +544,174 @@ class GameController extends ChangeNotifier {
     notifyListeners();
   }
 
+  // ---------------------------------------------------------------------------
+  // Opening sweep
+  //
+  // Before the first turn the camera shows you who you are up against, then
+  // travels home. It starts on the FURTHEST enemy and pans back, so the trip
+  // home passes every other enemy raft on the way rather than cutting to one
+  // of them and cutting back — one continuous move that reads as "here is the
+  // opposition, and here is you".
+  //
+  // It drives `world.cam` directly rather than going through `holdCam`.
+  // The camera lock exists to keep enemies OUT of the frame so shots are
+  // aimed blind (see `clampToLock`), which is exactly what this needs to
+  // ignore — it runs before anybody may fire, so the rule it breaks is not
+  // in force yet.
+  // ---------------------------------------------------------------------------
+
+
+  // ---------------------------------------------------------------------------
+  // Build phase
+  //
+  // Laying out your raft happens after the opening sweep and before the first
+  // turn: the camera shows you the opposition, and then you decide what to
+  // put between you and them. That order is the point — a wall is a response
+  // to what you have just been shown, not a decision made blind.
+  // ---------------------------------------------------------------------------
+
+  /// True while the player is still laying blocks. The turn clock does not
+  /// run and nothing can be fired.
+  bool buildPhase = false;
+
+  /// The plan being edited. Live — the build overlay mutates it directly and
+  /// the preview reads it back.
+  BuildPlan? editingPlan;
+
+  /// Opens the build phase, if this match was set up for one.
+
+  /// Which emplacement an enemy seat gets.
+  ///
+  /// Weighted rather than uniform: a plain raft is still the common case, so
+  /// the unusual ones stay unusual and read as a change of scene rather than
+  /// as the norm. Seeded off the world's shared RNG, so a hotspot match
+  /// builds the same opposition on both devices.
+  static Emplacement _enemyEmplacement(GameRng rng, int seat) {
+    const table = [
+      Emplacement.raft,
+      Emplacement.raft,
+      Emplacement.raft,
+      Emplacement.island,
+      Emplacement.ledge,
+      Emplacement.flotilla,
+      Emplacement.bay,
+    ];
+    return table[rng.nextInt(table.length)];
+  }
+  void _startBuildPhase() {
+    if (!settings.buildYourRaft) return;
+    buildPhase = true;
+    editingPlan = (SaveService.instance.data.buildPlan ?? BuildPlan.starter())
+        .copy();
+    // Shown on the raft straight away, so every edit is previewed in place
+    // rather than described in a panel.
+    world.raftOf(localPlayerIndex)?.build = editingPlan;
+    notifyListeners();
+  }
+
+  /// Accepts the current plan and starts the match.
+  ///
+  /// A plan that cannot stand is refused rather than silently repaired: the
+  /// player is looking at it, and quietly deleting their blocks is worse
+  /// than telling them which ones will not hold.
+  bool commitBuild() {
+    final plan = editingPlan;
+    if (plan == null || !plan.isValid) return false;
+    SaveService.instance.data.buildPlan = plan.copy();
+    unawaited(SaveService.instance.save());
+    world.raftOf(localPlayerIndex)?.build = plan;
+    buildPhase = false;
+    editingPlan = null;
+    // The first turn has been waiting for this.
+    _beginTurn(0, initial: true);
+    notifyListeners();
+    return true;
+  }
+
+  /// Places or clears one block, and previews it immediately.
+  void setBlock(int col, int row, BuildMaterial? material) {
+    final plan = editingPlan;
+    if (plan == null || !buildPhase) return;
+    plan.set(col, row, material);
+    notifyListeners();
+  }
+  /// Seconds spent looking at the enemy before setting off home.
+  static const double introDwell = 1.3;
+
+  /// Seconds the pan home takes. Deliberately unhurried: the whole point is
+  /// that it is a look around, not a cut.
+  static const double introPan = 2.6;
+
+  /// Progress through the opening sweep, or -1 once it is over (or was never
+  /// started, as in a restored match).
+  double _introT = -1;
+
+  /// True while the opening sweep is playing. Nothing may be fired and the
+  /// turn clock does not run.
+  bool get inIntro => _introT >= 0;
+
+  /// 0..1 through the whole sweep, for anything that wants to fade with it.
+  double get introProgress => _introT < 0
+      ? 1.0
+      : (_introT / (introDwell + introPan)).clamp(0.0, 1.0);
+
+  void _startIntro() {
+    // Nothing to show if there is no enemy to look at.
+    if (world.rafts.length < 2) return;
+    _introT = 0;
+    _driveIntroCam();
+  }
+
+  /// Ends the sweep early and puts the camera where the turn expects it.
+  ///
+  /// Wired to a tap: an opening cinematic that cannot be skipped is a
+  /// nuisance by the third match, and this one plays before every single one.
+  void skipIntro() {
+    if (!inIntro) return;
+    _introT = -1;
+    world.lockCam(isNetworked ? localPlayerIndex : currentPlayer);
+    // Laying out your raft comes next, if this match is built rather than
+    // picked. The order is the point: the sweep shows you the opposition,
+    // and then you decide what to put between you and them.
+    _startBuildPhase();
+    notifyListeners();
+  }
+
+  void _updateIntro(double dt) {
+    _introT += dt;
+    if (_introT >= introDwell + introPan) {
+      skipIntro();
+      return;
+    }
+    _driveIntroCam();
+  }
+
+  void _driveIntroCam() {
+    final me = world.raftOf(isNetworked ? localPlayerIndex : currentPlayer);
+    if (me == null) {
+      _introT = -1;
+      return;
+    }
+    // The furthest enemy from us — panning home from there sweeps past the
+    // nearer ones on the way.
+    Raft? far;
+    for (final r in world.rafts) {
+      if (BattleWorld.sameSide(r.playerIndex, me.playerIndex)) continue;
+      if (far == null || (r.x - me.x).abs() > (far.x - me.x).abs()) far = r;
+    }
+    if (far == null) {
+      _introT = -1;
+      return;
+    }
+
+    final from = far.x;
+    final to = me.x + me.facing * BattleConst.camLead;
+    final u = ((_introT - introDwell) / introPan).clamp(0.0, 1.0);
+    // Smoothstep so it leaves and arrives gently instead of starting and
+    // stopping dead — the difference between a camera move and a jump cut.
+    final eased = u * u * (3 - 2 * u);
+    world.snapCam(from + (to - from) * eased);
+  }
   // ---------------------------------------------------------------------------
   // Turn flow
   // ---------------------------------------------------------------------------
@@ -528,6 +767,9 @@ class GameController extends ChangeNotifier {
     // The cut is a hard one on purpose: the rafts are far enough apart that
     // easing across would just be a long sideways pan past the enemy.
     world.lockCam(isNetworked ? localPlayerIndex : player);
+    // Whoever is up is the one crew member kept still; everybody else on
+    // every deck is free to carry on doing things.
+    world.aimingPlayer = player;
 
     // A weapon THIS SEAT has run out of must not stay selected into their
     // next turn, or the fire button would silently do nothing. Scoped to the
@@ -726,7 +968,6 @@ class GameController extends ChangeNotifier {
         if (targetRaft.crew[i].alive) i
     ];
     if (liveIdx.isEmpty) return;
-    final targetPos = targetRaft.crewPos(liveIdx[world.rng.nextInt(liveIdx.length)]);
 
     // A boss reaching for its signature round narrows the arsenal to exactly
     // that one, so the planner solves the arc for the round it will actually
@@ -746,6 +987,78 @@ class GameController extends ChangeNotifier {
         : Weapons.all
             .where((w) => settings.enabledWeapons.contains(w.id))
             .toList();
+    // WHICH crew member, and with what.
+    //
+    // Both used to be coin flips — `rng.nextInt` over the living crew, and a
+    // heavy round on a fixed chance — and that, not the aim, is what made a
+    // hard opponent feel like a bad shot. Measured against a stationary crew
+    // member the solver already lands within a unit at every range and on
+    // every hull; what it did badly was choose. Spreading fire evenly over a
+    // full-health deck is the least effective thing a shooter can do,
+    // because nobody is ever removed and so nobody ever stops shooting back.
+    //
+    // Both draws come from the world's shared RNG, so the choice stays
+    // reproducible.
+    // Seeded from the match's own RNG rather than left to the clock. The
+    // aim jitter is the single biggest thing separating one AI turn from
+    // another, and an unseeded [Random] made it the one part of the
+    // simulation that could not be replayed: the same seed produced a
+    // different battle every time, so a reported miss could never be looked
+    // at twice and an accuracy measurement drifted between runs.
+    //
+    // Drawing the seed from [world.rng] keeps every turn different while
+    // keeping the whole match a function of its seed, which is the same
+    // rule the obstacle field, the emplacements and the target choice below
+    // already follow.
+    final ai = AiController(p.aiDifficulty, seed: world.rng.nextInt(1 << 30));
+    double roll() => world.rng.nextDouble();
+
+    /// What the AI knows about each candidate: how close to finished they
+    /// are, how many crewmates a splash would also catch, and how near the
+    /// rail they are standing — a body knocked off the deck drowns, which is
+    /// worth more than the damage that knocked it.
+    List<AiTarget> optionsFor(double splash) => [
+          for (final i in liveIdx)
+            AiTarget(
+              index: i,
+              hp: targetRaft.crew[i].hp,
+              hpFrac: targetRaft.crew[i].hpFrac,
+              splashNeighbours: splash <= 0
+                  ? 0
+                  : liveIdx
+                      .where((j) =>
+                          j != i &&
+                          (targetRaft.crewPos(j) - targetRaft.crewPos(i))
+                                  .distance <=
+                              splash)
+                      .length,
+              railGap: (targetRaft.deckHalf -
+                      (targetRaft.stationX(i) + targetRaft.crew[i].offset.dx)
+                          .abs())
+                  .abs(),
+            ),
+        ];
+
+    // Chicken and egg: the best target depends on the weapon's splash, and
+    // the best weapon depends on the target. Resolved in the order that
+    // matters more — the target is picked against the widest splash on
+    // offer, then the weapon is picked for that target.
+    final widestSplash =
+        arsenal.fold<double>(0, (m, w) => w.splash > m ? w.splash : m);
+    final heaviest =
+        arsenal.fold<double>(0, (m, w) => w.damage > m ? w.damage : m);
+    final options = optionsFor(widestSplash);
+    final chosenIndex = ai.chooseTarget(
+      options,
+      weaponDamage: heaviest,
+      splashRadius: widestSplash,
+      roll: roll,
+    );
+    final chosen = options.firstWhere((o) => o.index == chosenIndex);
+    final chosenWeapon = ai.chooseWeapon(arsenal, chosen, roll: roll);
+    final targetPos = targetRaft.crewPos(chosenIndex);
+    lastAiAim = targetPos;
+    lastAiTarget = chosenIndex;
     _bossShots[currentPlayer] = (_bossShots[currentPlayer] ?? 0) + 1;
     if (boss != null) {
       // The boss talks, in its own speech bubble over its own head. The
@@ -770,16 +1083,37 @@ class GameController extends ChangeNotifier {
         'weapon': boss.signatureWeaponId,
       });
     }
-    final shot = AiController(p.aiDifficulty).plan(
+    final shot = ai.plan(
       // Planning origin: the muzzle for whichever arc the planner settles
-      // on. The muzzle swings out along the aim line (see [Raft.muzzle]), so
-      // a plan built at a nominal 45 degrees and then fired at a different
-      // elevation solves from an origin the shot never actually leaves.
-      from: me.muzzle(),
-      muzzleAt: (angleDeg) => me.muzzle(aimAngleDeg: angleDeg),
+      // on, HOLDING THE ROUND IT IS ABOUT TO FIRE. The muzzle swings out
+      // along the aim line and its reach depends on the weapon in the
+      // crew's hands (see [Raft.muzzle]), so a plan built at a nominal 45
+      // degrees, or with the round from the last turn still equipped,
+      // solves from an origin the shot never actually leaves.
+      //
+      // Passing the weapon is what makes the second half of that true. The
+      // fire path spawns the ball at `muzzle(angle, weapon: chosen)`; the
+      // planner used to ask for `muzzle(angle)`, which falls back to
+      // whatever the crew was LAST holding — and `equipInstant` below then
+      // swapped it to the chosen round a line before firing. The two
+      // origins differed by the length of one weapon, and because the
+      // solver calibrates power against the origin it is given, that
+      // difference came out the far end as a systematic overshoot.
+      //
+      // It only showed with a full crew, which is why it read as the AI
+      // being a poor shot early and a good one late: a lone survivor has
+      // fired every turn, so their equipped round already matched and the
+      // two muzzles agreed. Rotating crew means a shooter holding last
+      // turn's weapon, or nothing at all.
+      from: me.muzzle(weapon: chosenWeapon),
+      muzzleAt: (angleDeg) =>
+          me.muzzle(aimAngleDeg: angleDeg, weapon: chosenWeapon),
       targetPos: targetPos,
       facing: me.facing,
-      arsenal: arsenal.isEmpty ? [Weapons.starter] : arsenal,
+      // Exactly the round already chosen for this target, so the planner
+      // solves the arc for what it will actually fire rather than picking
+      // again for itself.
+      arsenal: [chosenWeapon],
       // Dazed costs the player their trajectory arc. An AI has no arc to
       // lose — it solves the ballistics internally — so without this the
       // same status would be a real cost to a human and free to a computer,
@@ -1014,6 +1348,8 @@ class GameController extends ChangeNotifier {
   // ---------------------------------------------------------------------------
 
   bool get canHumanAct {
+    // Nothing is fired while the raft is still being laid out.
+    if (buildPhase) return false;
     if (phase != GamePhase.aiming || _shotCommitted) return false;
     if (currentPlayer < 0 || currentPlayer >= players.length) return false;
     if (players[currentPlayer].isAi) return false;
@@ -1097,6 +1433,10 @@ class GameController extends ChangeNotifier {
   }
 
   void humanFire() {
+    // Firing cancels the opening sweep rather than being refused by it: the
+    // sweep is a camera move, not a gate on play, and a player who has
+    // already decided what to do should never be told to wait for it.
+    if (inIntro) skipIntro();
     if (!canHumanAct) return;
     if (!hasAmmoFor(_hudSeat, weaponOf(_hudSeat))) return;
     final w = selectedWeapon;
@@ -1164,6 +1504,9 @@ class GameController extends ChangeNotifier {
 
     _shotCommitted = true;
     phase = GamePhase.firing;
+    // The shot is away: the shooter is no longer taking aim and may react
+    // to having fired.
+    world.aimingPlayer = -1;
     _accum = 0;
     _fireHold = fireHoldTime;
     aimAngle = safeAngle;

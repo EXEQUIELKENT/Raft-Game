@@ -269,6 +269,9 @@ class AiController {
 
   /// Enemies mostly lob the basic shot; higher difficulties reach for heavier
   /// ordnance when they have it.
+  /// The old choice: the starter, or a random heavy on a coin flip. Still
+  /// what easy uses, and the fallback when there is no target to score
+  /// against.
   WeaponDef _pickWeapon(List<WeaponDef> arsenal) {
     if (arsenal.isEmpty) return Weapons.starter;
     if (difficulty == AiDifficulty.easy) return arsenal.first;
@@ -291,4 +294,161 @@ class _Solution {
   final double power;
   final double score;
   const _Solution({required this.angle, required this.power, required this.score});
+}
+
+/// One crew member the AI could shoot at, reduced to the things that make
+/// one worth more than another.
+///
+/// A plain value object rather than a [Crew] so the choice can be tested
+/// without building a world, and so the planner cannot reach into the
+/// simulation for anything it has not been told about.
+class AiTarget {
+  /// Index into the raft's crew list.
+  final int index;
+
+  /// HP remaining, and the fraction of their maximum that is.
+  final double hp;
+  final double hpFrac;
+
+  /// How many OTHER living crew members would be inside the splash of a
+  /// round landing on this one.
+  final int splashNeighbours;
+
+  /// How close this crew member is to going over the side, in world units.
+  /// A body knocked off the deck drowns, which is worth far more than the
+  /// damage that knocked it.
+  final double railGap;
+
+  const AiTarget({
+    required this.index,
+    required this.hp,
+    required this.hpFrac,
+    this.splashNeighbours = 0,
+    this.railGap = 999,
+  });
+}
+
+/// How the AI decides what to shoot at and with what.
+///
+/// Split out from the ballistics on purpose: the aim was never the problem.
+/// Measured against a stationary crew member the solver already lands within
+/// a unit at every range and on every hull, so "the AI is bad at aiming" was
+/// never going to be fixed by making it aim harder. What it did badly was
+/// CHOOSE — it shot at a crew member picked with `nextInt`, and reached for
+/// a heavy weapon on a coin flip — so a hard opponent spread its fire evenly
+/// over a full-health deck and never finished anybody.
+extension AiChoices on AiController {
+  /// Picks which crew member to shoot at.
+  ///
+  /// [roll] supplies randomness and must come from the world's shared RNG,
+  /// so the choice stays reproducible.
+  int chooseTarget(
+    List<AiTarget> options, {
+    required double weaponDamage,
+    required double splashRadius,
+    required double Function() roll,
+  }) {
+    if (options.isEmpty) return 0;
+    if (options.length == 1) return options.first.index;
+
+    // Easy still picks at random. The point of a difficulty ladder is that
+    // the bottom of it plays badly, and "shoots whoever" is the most
+    // readable way to play badly — much better than an opponent that aims
+    // well and then misses on purpose.
+    if (difficulty == AiDifficulty.easy) {
+      return options[(roll() * options.length).floor().clamp(0, options.length - 1)]
+          .index;
+    }
+
+    var bestScore = double.negativeInfinity;
+    var best = options.first.index;
+    for (final o in options) {
+      final score = _score(o, weaponDamage, splashRadius) +
+          // A little noise so a deck of identical targets is not always
+          // answered in list order, which reads as a machine working down a
+          // list rather than as somebody choosing.
+          roll() * _choiceNoise;
+      if (score > bestScore) {
+        bestScore = score;
+        best = o.index;
+      }
+    }
+    return best;
+  }
+
+  /// How much randomness is allowed to move the decision, per difficulty.
+  /// Normal is meant to make the obvious choice most of the time and the
+  /// wrong one often enough to be beatable.
+  double get _choiceNoise => switch (difficulty) {
+        AiDifficulty.easy => 0,
+        AiDifficulty.normal => 55,
+        AiDifficulty.hard => 18,
+        AiDifficulty.expert => 5,
+      };
+
+  double _score(AiTarget t, double weaponDamage, double splashRadius) {
+    var score = 0.0;
+
+    // Finishing somebody is worth far more than damaging two people. A crew
+    // member removed stops shooting back, and the raft is defeated when its
+    // crew are gone — spreading damage evenly across a full deck is the
+    // single least effective thing a shooter can do, and it is exactly what
+    // picking at random produces.
+    if (weaponDamage >= t.hp) {
+      score += 120;
+    } else {
+      // Otherwise prefer the one nearest to being finished: it is the one
+      // this shot moves closest to removed.
+      score += (1 - t.hpFrac) * 45;
+    }
+
+    // Splash catches neighbours. Worth real weight, but never more than a
+    // kill — two wounded crew is not better than one gone.
+    if (splashRadius > 0) score += t.splashNeighbours * 34;
+
+    // Somebody standing near the rail can be knocked into the sea, which
+    // removes them whatever their HP. The closer to the edge, the better.
+    if (t.railGap < 60) score += (60 - t.railGap) * 0.55;
+
+    return score;
+  }
+
+  /// Picks the weapon for a shot at [target].
+  ///
+  /// It used to be a coin flip between the starter and a random heavy, which
+  /// threw the heavy rounds away on full-health crew and then had nothing
+  /// left worth firing at a wounded one.
+  WeaponDef chooseWeapon(
+    List<WeaponDef> arsenal,
+    AiTarget? target, {
+    required double Function() roll,
+  }) {
+    if (arsenal.isEmpty) return Weapons.starter;
+    if (difficulty == AiDifficulty.easy || target == null) {
+      return _pickWeapon(arsenal);
+    }
+
+    var bestScore = double.negativeInfinity;
+    var best = arsenal.first;
+    for (final w in arsenal) {
+      var score = 0.0;
+      // Enough to finish them — the whole point of carrying a heavy round.
+      if (w.damage >= target.hp) {
+        score += 100;
+        // Among the rounds that WILL finish them, prefer the lightest: the
+        // heavy one is worth keeping for somebody this one cannot reach.
+        score -= w.damage * 0.25;
+      } else {
+        score += w.damage * 0.9;
+      }
+      // Splash is worth carrying only when there is somebody else to catch.
+      if (w.splash > 0) score += target.splashNeighbours * 26;
+      score += roll() * _choiceNoise;
+      if (score > bestScore) {
+        bestScore = score;
+        best = w;
+      }
+    }
+    return best;
+  }
 }

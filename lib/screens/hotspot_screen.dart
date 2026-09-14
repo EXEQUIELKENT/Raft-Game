@@ -8,6 +8,7 @@ import '../game/match_store.dart';
 import '../game/net.dart';
 import '../game/raft.dart';
 import '../theme.dart';
+import '../widgets/lobby.dart';
 import 'net_match.dart';
 
 /// Hotspot multiplayer: host or join over the same Wi-Fi / mobile hotspot.
@@ -295,74 +296,6 @@ class _HotspotScreenState extends State<HotspotScreen> {
   }
 
 
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      body: Container(
-        decoration: const BoxDecoration(gradient: RT.sunset),
-        child: SafeArea(
-          child: Column(
-            children: [
-              Padding(
-                padding: const EdgeInsets.all(10),
-                child: Row(
-                  children: [
-                    GestureDetector(
-                      onTap: () {
-                        _net.close();
-                        Navigator.pop(context);
-                      },
-                      child: Container(
-                        padding: const EdgeInsets.all(8),
-                        decoration: RT.card(color: Colors.white, radius: 12, border: 3),
-                        child: const Icon(Icons.arrow_back, color: RT.ink),
-                      ),
-                    ),
-                    const SizedBox(width: 10),
-                    Text('HOTSPOT BATTLE', style: RT.chunky(size: 24, outline: 3)),
-                  ],
-                ),
-              ),
-              Expanded(
-                child: SingleChildScrollView(
-                  padding: const EdgeInsets.all(14),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.stretch,
-                    children: [
-                      if (_resumable != null) ...[
-                        _resumeCard(_resumable!),
-                        const SizedBox(height: 14),
-                      ],
-                      _infoCard(),
-                      const SizedBox(height: 14),
-                      _hostCard(),
-                      const SizedBox(height: 14),
-                      _scanCard(),
-                      const SizedBox(height: 14),
-                      _ipCard(),
-                      const SizedBox(height: 16),
-                      if (_status.isNotEmpty)
-                        Container(
-                          width: double.infinity,
-                          padding: const EdgeInsets.all(14),
-                          decoration: RT.card(color: RT.ink.withOpacity(0.8), border: 0),
-                          child: Text(
-                            _status,
-                            style: RT.chunky(size: 13, color: Colors.white),
-                            textAlign: TextAlign.center,
-                          ),
-                        ),
-                    ],
-                  ),
-                ),
-              ),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-
   /// Offers the interrupted battle back, rather than dropping the player
   /// straight into it. Someone who closed the app to get out of a losing
   /// match should not be dragged back in by opening the lobby.
@@ -419,242 +352,428 @@ class _HotspotScreenState extends State<HotspotScreen> {
     );
   }
 
-  Widget _infoCard() {
-    return Container(
-      padding: const EdgeInsets.all(14),
-      decoration: RT.card(),
-      child: Column(
-        children: [
-          Text('📡 SAME WI-FI / HOTSPOT', style: RT.chunky(size: 16, color: RT.ink)),
-          const SizedBox(height: 6),
-          Text(
-            'Both devices must be on the same Wi-Fi network or mobile hotspot. '
-            'One player HOSTs; the other taps SCAN FOR GAMES and picks the room.',
-            style: RT.chunky(
-                size: 11,
-                color: RT.ink.withOpacity(0.7),
-                weight: FontWeight.w600,
-                letterSpacing: 0.4),
-            textAlign: TextAlign.center,
-          ),
-        ],
-      ),
-    );
+  /// Joins whatever is in the field: a four-letter room code, or a dotted
+  /// IP typed straight in.
+  ///
+  /// A code is not an address, so it has to be resolved to one — the UDP
+  /// beacon that SCAN listens to is what carries the mapping. If the code is
+  /// not already in hand from a previous sweep this runs one, which is what
+  /// makes "type the code your friend just read out" work as the first thing
+  /// on the page rather than something you can only do after scanning.
+  Future<void> _joinByCodeOrIp() async {
+    final text = _ipController.text.trim();
+    if (text.isEmpty) return;
+
+    if (_looksLikeIp(text)) {
+      await _joinByIp();
+      return;
+    }
+
+    final code = text.toUpperCase();
+    setState(() {
+      _busy = true;
+      _status = 'Looking for room $code…';
+    });
+    AudioService.instance.sfx('click');
+
+    RoomInfo? match = _findRoom(code);
+    if (match == null) {
+      // The beacon sweep is what carries the code-to-address mapping, so a
+      // code typed cold needs one before it can be resolved. scanRooms
+      // returns as soon as the socket is up and the window fills
+      // foundRooms in the background, hence the wait.
+      await _net.scanRooms();
+      await Future<void>.delayed(const Duration(milliseconds: 6500));
+      if (!mounted) return;
+      match = _findRoom(code);
+    }
+    if (!mounted) return;
+
+    if (match == null) {
+      setState(() {
+        _busy = false;
+        _status = 'No room called $code on this Wi-Fi. Check the code, or '
+            'join by IP.';
+      });
+      return;
+    }
+    setState(() => _status = 'Joining $code…');
+    await _net.join(match.host, playerName: myName());
+    if (!mounted) return;
+    setState(() {
+      _busy = false;
+      _status = _net.status;
+    });
   }
 
-  Widget _hostCard() {
-    return Container(
-      padding: const EdgeInsets.all(14),
-      decoration: RT.card(),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [
-          ChunkyButton(
-            label: 'HOST GAME',
-            icon: Icons.wifi_tethering,
-            color: RT.blue,
-            width: double.infinity,
-            fontSize: 17,
-            onPressed: _busy ? null : _host,
-          ),
-          // Everything the joiner needs to know, shown straight away — the
-          // room code for scanning, and EVERY address this device has, since
-          // a hotspot phone also holds a mobile-data address that is useless
-          // to a device sitting on its hotspot.
-          if (_net.isHost && _net.roomCode.isNotEmpty) ...[
-            const SizedBox(height: 12),
-            Container(
-              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-              decoration: RT.card(color: RT.yellow, radius: 14, border: 3),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text('ROOM CODE',
-                      style: RT.body(size: 9, color: const Color(0xFF6B4A00),
-                          weight: FontWeight.w800, letterSpacing: 1.6)),
-                  const SizedBox(height: 2),
-                  Text(_net.roomCode,
-                      style: RT.chunky(size: 30, color: const Color(0xFF6B4A00))),
-                ],
+  RoomInfo? _findRoom(String code) {
+    for (final r in _net.foundRooms) {
+      if (r.code.toUpperCase() == code) return r;
+    }
+    return null;
+  }
+
+  /// A dotted quad, as opposed to a room code. Codes never contain a dot,
+  /// so one is enough to tell them apart.
+  static bool _looksLikeIp(String s) => s.contains('.');
+
+  Future<void> _closeRoom() async {
+    AudioService.instance.sfx('click');
+    await _net.close();
+    if (!mounted) return;
+    setState(() => _status = '');
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      body: Container(
+        decoration: const BoxDecoration(gradient: RT.sunset),
+        child: SafeArea(
+          child: Column(
+            children: [
+              LobbyHeader(
+                title: 'HOTSPOT BATTLE',
+                busy: _busy,
+                onBack: () {
+                  _net.close();
+                  Navigator.pop(context);
+                },
               ),
-            ),
-            if (_net.localIps.isNotEmpty) ...[
-              const SizedBox(height: 10),
-              Text('OR JOIN BY IP',
-                  style: RT.body(size: 9, color: RT.ink.withOpacity(0.55),
-                      weight: FontWeight.w800, letterSpacing: 1.6)),
-              const SizedBox(height: 4),
-              for (final ip in _net.localIps)
-                Padding(
-                  padding: const EdgeInsets.only(bottom: 4),
-                  child: Row(
-                    children: [
-                      Expanded(
-                        child: Text(ip,
-                            style: RT.body(size: 14, color: RT.ink, weight: FontWeight.w800)),
-                      ),
-                      GestureDetector(
-                        onTap: () async {
-                          await Clipboard.setData(ClipboardData(text: ip));
-                          if (!mounted) return;
-                          setState(() => _status = 'Copied $ip — paste it on the other device.');
-                        },
-                        child: Container(
-                          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-                          decoration: RT.pill(radius: 10),
-                          child: const Icon(Icons.copy, size: 16, color: RT.ink),
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
+              Expanded(child: _body()),
             ],
-            const SizedBox(height: 10),
-            Text('HOST SETTINGS',
-                style: RT.body(size: 9, color: RT.ink.withOpacity(0.55),
-                    weight: FontWeight.w800, letterSpacing: 1.6)),
-            const SizedBox(height: 6),
-            Wrap(
-              spacing: 8,
-              runSpacing: 8,
-              children: GameMaps.all
-                  .take(3)
-                  .map((m) => GestureDetector(
-                        onTap: () => setState(() => _map = m),
-                        child: Container(
-                          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-                          decoration: RT.card(
-                            color: _map.id == m.id ? RT.yellow : Colors.white,
-                            radius: 12,
-                            border: 3,
-                          ),
-                          child: Text(m.name, style: RT.chunky(size: 11, color: RT.ink)),
-                        ),
-                      ))
-                  .toList(),
-            ),
-            const SizedBox(height: 12),
-            ChunkyButton(
-              label: _net.handshakeDone ? 'START MATCH!' : 'WAITING FOR OPPONENT…',
-              icon: Icons.play_arrow,
-              color: RT.red,
-              width: double.infinity,
-              height: 60,
-              fontSize: 22,
-              // Handshake first: pressing START the instant a TCP connection
-              // existed used to fire the match setup at a guest whose game
-              // had not attached its listener yet, so only the host played.
-              onPressed: _net.handshakeDone ? _hostStart : null,
-            ),
-          ],
-        ],
-      ),
-    );
-  }
-
-  Widget _scanCard() {
-    return Container(
-      padding: const EdgeInsets.all(14),
-      decoration: RT.card(),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [
-          ChunkyButton(
-            label: _net.isSearching ? 'SCANNING…' : 'SCAN FOR GAMES',
-            icon: Icons.wifi_find,
-            color: RT.green,
-            width: double.infinity,
-            fontSize: 17,
-            onPressed: _busy || _net.isSearching ? null : _scan,
           ),
-          if (_net.foundRooms.isNotEmpty) ...[
-            const SizedBox(height: 10),
-            for (final room in _net.foundRooms)
-              Padding(
-                padding: const EdgeInsets.only(bottom: 8),
-                child: GestureDetector(
-                  onTap: _busy ? null : () => _joinRoom(room),
-                  child: Container(
-                    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-                    decoration: RT.card(color: Colors.white, radius: 14, border: 3),
-                    child: Row(
-                      children: [
-                        Container(
-                          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-                          decoration: RT.card(color: RT.yellow, radius: 10, border: 2),
-                          child: Text(room.code,
-                              style: RT.chunky(size: 16, color: const Color(0xFF6B4A00))),
-                        ),
-                        const SizedBox(width: 12),
-                        Expanded(
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              Text(room.playerName,
-                                  style: RT.body(size: 13, color: RT.ink, weight: FontWeight.w800)),
-                              Text(room.host,
-                                  style: RT.body(size: 10, color: RT.ink.withOpacity(0.6),
-                                      weight: FontWeight.w700)),
-                            ],
-                          ),
-                        ),
-                        const Icon(Icons.login, color: RT.green),
-                      ],
-                    ),
-                  ),
+        ),
+      ),
+    );
+  }
+
+  /// Ordered by what somebody actually arrives here to do, most common
+  /// first: type the code a friend has just read out, open a room of your
+  /// own, or sweep the Wi-Fi to see who is already listening.
+  ///
+  /// It used to be four equal cards — info, host, scan, IP — which reads as
+  /// a settings page rather than a lobby: everything the same size, nothing
+  /// saying where to start. While a room IS open that block takes over the
+  /// top of the page, because at that point it is the thing to hold up to
+  /// the other player and everything else is noise.
+  Widget _body() {
+    final roomOpen = _net.isHost && _net.roomCode.isNotEmpty;
+    final pop = PopSequence();
+    return ListView(
+      padding: const EdgeInsets.fromLTRB(16, 16, 16, 28),
+      children: [
+        if (_resumable != null) ...[
+          pop.wrap(_resumeCard(_resumable!)),
+          const SizedBox(height: 14),
+        ],
+        // Opening a room swaps the controls for the room panel. Done as a
+        // cross-fade rather than a straight rebuild so it reads as "this
+        // became that" instead of "that is gone, here is something else" —
+        // each side is keyed so the switcher treats them as genuinely
+        // different subtrees rather than trying to tween between unrelated
+        // widget trees.
+        AnimatedSwitcher(
+          duration: const Duration(milliseconds: 380),
+          switchInCurve: Curves.easeOutCubic,
+          switchOutCurve: Curves.easeIn,
+          transitionBuilder: (child, animation) => FadeTransition(
+            opacity: animation,
+            child: SlideTransition(
+              position: Tween<Offset>(
+                begin: const Offset(0, 0.05),
+                end: Offset.zero,
+              ).animate(animation),
+              child: child,
+            ),
+          ),
+          child: roomOpen
+              ? Column(
+                  key: const ValueKey('room-open'),
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    _openRoomPanel(),
+                    const SizedBox(height: 14),
+                  ],
+                )
+              : Column(
+                  key: const ValueKey('room-closed'),
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    pop.wrap(_joinCard()),
+                    const SizedBox(height: 14),
+                    pop.wrap(_hostButton()),
+                    const SizedBox(height: 14),
+                  ],
                 ),
+        ),
+        pop.wrap(_scanCard()),
+        if (_status.isNotEmpty) ...[
+          const SizedBox(height: 16),
+          Container(
+            width: double.infinity,
+            padding: const EdgeInsets.all(14),
+            decoration: RT.card(color: RT.ink.withOpacity(0.8), border: 0),
+            child: Text(
+              _status,
+              style: RT.chunky(size: 13, color: Colors.white),
+              textAlign: TextAlign.center,
+            ),
+          ),
+        ],
+      ],
+    );
+  }
+
+  /// The room this device is hosting, as the thing to physically show the
+  /// other player: the code big enough to read across a table, every address
+  /// underneath as the fallback when a code will not go through, and a live
+  /// line for what the room is doing.
+  Widget _openRoomPanel() {
+    final waiting = _net.handshakeDone
+        ? '${_net.peerName} is aboard — press START'
+        : 'Waiting for somebody to join…';
+    return Container(
+      padding: const EdgeInsets.fromLTRB(18, 18, 18, 16),
+      decoration: RT.card(color: RT.ink, radius: 20, border: 0),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Center(
+            child: Text('ROOM IS OPEN',
+                style: RT.chunky(size: 18, color: RT.cream)),
+          ),
+          const SizedBox(height: 14),
+          CodeTiles(code: _net.roomCode),
+          const SizedBox(height: 12),
+          if (_net.localIps.isNotEmpty)
+            Center(
+              child: Text(
+                'OR BY IP — ${_net.localIps.first}  ·  WORKS IF THE CODE FAILS',
+                textAlign: TextAlign.center,
+                style: RT.body(
+                    size: 8.5,
+                    color: RT.cream.withOpacity(0.7),
+                    weight: FontWeight.w800),
               ),
+            ),
+          if (_net.localIps.length > 1) ...[
+            const SizedBox(height: 4),
+            Center(
+              child: Text(
+                'ALSO AT ${_net.localIps.skip(1).join(" · ")}',
+                textAlign: TextAlign.center,
+                style: RT.body(
+                    size: 8,
+                    color: RT.cream.withOpacity(0.55),
+                    weight: FontWeight.w800),
+              ),
+            ),
           ],
+          const SizedBox(height: 16),
+          LobbyWaiting(waiting),
+          const SizedBox(height: 14),
+          Text('MAP',
+              style: RT.body(
+                      size: 9,
+                      color: RT.cream.withOpacity(0.6),
+                      weight: FontWeight.w800)
+                  .copyWith(letterSpacing: 1.6)),
+          const SizedBox(height: 6),
+          Wrap(
+            spacing: 8,
+            runSpacing: 8,
+            children: GameMaps.all
+                .take(3)
+                .map((m) => GestureDetector(
+                      onTap: () => setState(() => _map = m),
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(
+                            horizontal: 10, vertical: 6),
+                        decoration: RT.card(
+                          color: _map.id == m.id ? RT.yellow : Colors.white,
+                          radius: 12,
+                          border: 3,
+                        ),
+                        child: Text(m.name,
+                            style: RT.chunky(size: 11, color: RT.ink)),
+                      ),
+                    ))
+                .toList(),
+          ),
+          const SizedBox(height: 14),
+          ChunkyButton(
+            label: _net.handshakeDone ? 'START MATCH!' : 'WAITING FOR OPPONENT…',
+            icon: Icons.play_arrow,
+            color: RT.red,
+            width: double.infinity,
+            height: 58,
+            fontSize: 20,
+            // Handshake first: pressing START the instant a TCP connection
+            // existed used to fire the match setup at a guest whose game had
+            // not attached its listener yet, so only the host played.
+            onPressed: _net.handshakeDone ? _hostStart : null,
+          ),
+          const SizedBox(height: 10),
+          ChunkyButton(
+            label: 'CLOSE ROOM',
+            icon: Icons.close,
+            color: RT.red,
+            width: double.infinity,
+            height: 46,
+            fontSize: 15,
+            onPressed: _closeRoom,
+          ),
         ],
       ),
     );
   }
 
-  Widget _ipCard() {
-    return Container(
-      padding: const EdgeInsets.all(12),
-      decoration: RT.card(),
+  Widget _joinCard() {
+    return LobbyCard(
+      title: 'JOIN BY ROOM CODE',
+      icon: Icons.vpn_key,
+      color: RT.green,
+      subtitle: 'Ask the host for their four-letter code — or read an IP off '
+          'their screen and type that instead.',
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          Text('OR JOIN BY IP',
-              style: RT.body(size: 9, color: RT.ink.withOpacity(0.55),
-                  weight: FontWeight.w800, letterSpacing: 1.6)),
-          const SizedBox(height: 8),
           Row(
             children: [
               Expanded(
                 child: TextField(
                   controller: _ipController,
-                  // A plain numeric keypad hides the "." key on most phones,
-                  // making it painful to type a dotted IPv4 address. Requesting
-                  // the decimal-enabled numeric keyboard keeps digits front and
-                  // center while still exposing a period key, and the input
-                  // formatter below blocks anything that isn't a digit or dot.
-                  keyboardType: const TextInputType.numberWithOptions(decimal: true),
+                  textCapitalization: TextCapitalization.characters,
+                  // Room codes use letters; a dotted IP is accepted as the
+                  // fallback, so digits and dots are allowed through too.
                   inputFormatters: [
-                    FilteringTextInputFormatter.allow(RegExp(r'[0-9.]')),
+                    FilteringTextInputFormatter.allow(RegExp(r'[A-Za-z0-9.]')),
+                    LengthLimitingTextInputFormatter(15),
+                    TextInputFormatter.withFunction(
+                      (oldValue, newValue) => newValue.copyWith(
+                        text: newValue.text.toUpperCase(),
+                      ),
+                    ),
                   ],
-                  decoration: const InputDecoration(
-                    hintText: 'Host IP, e.g. 192.168.1.5',
-                    border: OutlineInputBorder(),
-                    isDense: true,
-                  ),
+                  style: RT.chunky(size: 20, color: RT.ink)
+                      .copyWith(letterSpacing: 6),
+                  textAlign: TextAlign.center,
+                  onSubmitted: (_) => _busy ? null : _joinByCodeOrIp(),
+                  decoration: lobbyInput('K7QX'),
                 ),
               ),
               const SizedBox(width: 10),
               ChunkyButton(
-                label: 'JOIN',
-                icon: Icons.login,
+                label: _busy ? '…' : 'JOIN',
                 color: RT.green,
-                width: 110,
+                width: 96,
                 height: 52,
                 fontSize: 16,
-                onPressed: _busy ? null : _joinByIp,
+                onPressed: _busy ? null : _joinByCodeOrIp,
               ),
             ],
           ),
+          const SizedBox(height: 8),
+          const LobbyHint(
+            'A CODE IS LOOKED UP OVER THE WI-FI  ·  A DOTTED IP JOINS DIRECTLY',
+            align: TextAlign.center,
+          ),
         ],
+      ),
+    );
+  }
+
+  /// Hosting is one tap, so it is one button rather than a card wrapped
+  /// around one — the explanation it used to carry now lives on the room
+  /// panel it opens, where it is actually needed.
+  Widget _hostButton() {
+    return ChunkyButton(
+      label: _busy ? 'OPENING A ROOM…' : 'HOST A ROOM',
+      icon: Icons.wifi_tethering,
+      color: RT.orange,
+      width: double.infinity,
+      height: 58,
+      fontSize: 19,
+      onPressed: _busy ? null : _host,
+    );
+  }
+
+  Widget _scanCard() {
+    final rooms = _net.foundRooms;
+    final headline = _net.isSearching
+        ? 'Sweeping the Wi-Fi…'
+        : rooms.isEmpty
+            ? 'Nobody listening yet'
+            : '${rooms.length} room${rooms.length == 1 ? '' : 's'} nearby';
+    return LobbyCard(
+      title: 'FIND A ROOM NEARBY',
+      icon: Icons.wifi_find,
+      color: RT.blue,
+      subtitle: headline,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          ChunkyButton(
+            label: _net.isSearching ? 'SCANNING…' : 'SCAN',
+            icon: Icons.radar,
+            color: RT.blue,
+            width: double.infinity,
+            height: 48,
+            fontSize: 16,
+            onPressed: _busy || _net.isSearching ? null : _scan,
+          ),
+          if (rooms.isNotEmpty) ...[
+            const SizedBox(height: 12),
+            for (int i = 0; i < rooms.length; i++)
+              PopIn(
+                key: ValueKey('room-${rooms[i].code}'),
+                delay: Duration(milliseconds: 70 * i.clamp(0, 6)),
+                child: Padding(
+                  padding: const EdgeInsets.only(bottom: 8),
+                  child: _roomRow(rooms[i]),
+                ),
+              ),
+          ] else if (!_net.isSearching) ...[
+            const SizedBox(height: 10),
+            const LobbyHint(
+              'THE HOST HAS TO OPEN A ROOM FIRST  ·  BOTH DEVICES ON THE SAME WI-FI',
+              align: TextAlign.center,
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+
+  Widget _roomRow(RoomInfo room) {
+    return GestureDetector(
+      onTap: _busy ? null : () => _joinRoom(room),
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+        decoration: RT.card(color: Colors.white, radius: 14, border: 3),
+        child: Row(
+          children: [
+            CodePill(code: room.code, color: RT.yellow),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(room.playerName,
+                      style: RT.body(
+                          size: 13, color: RT.ink, weight: FontWeight.w800)),
+                  Text(room.host,
+                      style: RT.body(
+                          size: 10,
+                          color: RT.ink.withOpacity(0.6),
+                          weight: FontWeight.w700)),
+                ],
+              ),
+            ),
+            const Icon(Icons.login, color: RT.green),
+          ],
+        ),
       ),
     );
   }

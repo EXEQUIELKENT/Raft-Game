@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 
 import '../theme.dart';
 import 'battle.dart';
+import 'build.dart';
 import 'character_art.dart';
 import 'characters.dart';
 import 'maps.dart';
@@ -51,7 +52,9 @@ class WorldRenderer {
     bool isAiming = false,
     double aimAngleDeg = 45,
     WeaponDef? weapon,
+    Raft? buildTarget,
   }) {
+    _buildTarget = buildTarget;
     final scale = size.height / BattleConst.worldH;
     world.viewWidth = size.width / scale;
     if (!_decorBuilt) _buildDecor();
@@ -101,7 +104,10 @@ class WorldRenderer {
     final reserved = <double>[BattleConst.playerX, ...BattleConst.enemySlots];
     bool clear(double x) => reserved.every((r) => (x - r).abs() > 170);
 
-    for (int i = 0; i < 7; i++) {
+    // A scene may legitimately have nothing on its horizon — the open blue
+    // is empty by definition, and that is the point of it. Clouds still go
+    // in below; it is only the shoreline props that are skipped.
+    for (int i = 0; map.props.isNotEmpty && i < 7; i++) {
       final kind = map.props[rng.nextInt(map.props.length)];
       double x = 0;
       for (int tries = 0; tries < 12; tries++) {
@@ -414,7 +420,7 @@ class WorldRenderer {
     // The falls themselves, before the surface foam so the foam caps them.
     for (final step in world.water.steps) {
       if (step.right < startX - 40 || step.left > endX + 40) continue;
-      _falls(canvas, step, time);
+      _waterStep(canvas, step, time);
     }
 
     // Two offset wave lines along the surface for a bit of motion. They
@@ -443,48 +449,65 @@ class WorldRenderer {
     }
   }
 
-  /// A waterfall joining two terraces.
+  /// Whatever joins two terraces, drawn to suit its kind.
   ///
-  /// The surface itself is a slope, because that is what the simulation
-  /// uses — everything that touches the water reads the same
+  /// The surface itself is always a slope, because that is what the
+  /// simulation uses — everything that touches the water reads the same
   /// [BattleWorld.waterAt], and a drawn sheer drop over a simulated ramp
-  /// would be a lie about where the water is. So this is drawn as a chute:
-  /// aerated water in the channel, a band of white water hugging the slope,
-  /// streaks running down it, and churn where it lands.
-  ///
-  /// Which way the streaks run is the useful part. It tells you at a glance
-  /// which side is the high one, and that is the single most important thing
-  /// about the map — every shot in the match has to account for it.
-  void _falls(Canvas canvas, WaterStep step, double time) {
+  /// would be a lie about where the water is. What changes per kind is the
+  /// material laid over that slope, and how wide the slope is in the first
+  /// place (see `stepWidthScale`), which is what makes a weir feel abrupt
+  /// and a shoal feel like a long wade.
+  void _waterStep(Canvas canvas, WaterStep step, double time) {
     final leftY = world.waterAt(step.left - 1);
     final rightY = world.waterAt(step.right + 1);
-    // Smaller y is higher water.
     if ((leftY - rightY).abs() < 1) return;
     final downhillRight = leftY < rightY;
     final botY = max(leftY, rightY);
 
-    /// The surface across the falls, as a path.
-    Path slopePath() {
-      final p = Path()..moveTo(step.left, world.waterAt(step.left));
-      for (double x = step.left; x <= step.right; x += 3) {
-        p.lineTo(x, world.waterAt(x));
-      }
-      return p;
+    switch (step.kind) {
+      case WaterStepKind.falls:
+        _stepWhiteWater(canvas, step, time, downhillRight, botY,
+            band: 9, bright: 0.72, streaks: 9, foam: 7);
+      case WaterStepKind.rapids:
+        _stepRapids(canvas, step, time, downhillRight, botY);
+      case WaterStepKind.weir:
+        _stepWeir(canvas, step, time, downhillRight, botY);
+      case WaterStepKind.ledge:
+        _stepLedge(canvas, step, time, downhillRight, botY);
+      case WaterStepKind.shoal:
+        _stepShoal(canvas, step, time, downhillRight, botY);
+      case WaterStepKind.iceShelf:
+        _stepIce(canvas, step, time, downhillRight, botY);
     }
+  }
 
-    // The chute is NOT filled with a pale wash. That was the obvious thing
-    // to try and it looked wrong: a flat translucent white over the whole
-    // drop is a large uniform area with hard vertical edges where it meets
-    // the ordinary water, so it read as a pane of glass laid over the sea
-    // rather than as moving water. The band, the streaks and the churn below
-    // carry it on their own, and the water beneath them is just water.
+  /// The surface across a step, as a path.
+  Path _stepSurface(WaterStep step) {
+    final p = Path()..moveTo(step.left, world.waterAt(step.left));
+    for (double x = step.left; x <= step.right; x += 3) {
+      p.lineTo(x, world.waterAt(x));
+    }
+    return p;
+  }
 
-    // 2. The white water itself: a soft band riding the slope. Two passes,
-    //    a wide faint one under a narrow bright one, so it has an edge
-    //    without a hard outline.
-    for (final (width, alpha) in [(9.0, 0.30), (4.5, 0.72)]) {
+  /// The shared white-water treatment: a band riding the slope, streaks
+  /// running downhill, and churn at the foot. Every kind uses some of this;
+  /// the parameters are what separate a cascade from a gentle run.
+  void _stepWhiteWater(
+    Canvas canvas,
+    WaterStep step,
+    double time,
+    bool downhillRight,
+    double botY, {
+    required double band,
+    required double bright,
+    required int streaks,
+    required int foam,
+  }) {
+    for (final (width, alpha) in [(band, bright * 0.42), (band * 0.5, bright)]) {
       canvas.drawPath(
-        slopePath(),
+        _stepSurface(step),
         Paint()
           ..style = PaintingStyle.stroke
           ..strokeWidth = width
@@ -494,16 +517,11 @@ class WorldRenderer {
       );
     }
 
-    // 3. Streaks running DOWNHILL, scrolling, fading out as they go. Short
-    //    tangent segments rather than vertical ticks: vertical ones read as
-    //    a fence across the water.
-    const n = 9;
-    for (int i = 0; i < n; i++) {
-      final u = ((i / n) + time * 0.45) % 1.0;
+    for (int i = 0; i < streaks; i++) {
+      final u = ((i / streaks) + time * 0.45) % 1.0;
       final along = downhillRight ? u : 1 - u;
       final x = step.left + step.width * along;
       final y = world.waterAt(x);
-      // Tangent to the surface here, pointing downhill.
       final ahead = downhillRight ? 7.0 : -7.0;
       final y2 = world.waterAt(x + ahead);
       final fade = sin(pi * u);
@@ -517,25 +535,20 @@ class WorldRenderer {
       );
     }
 
-    // 4. Churn at the foot: soft blobs on the lower terrace, drifting away
-    //    from the base of the chute and fading.
     final footX = downhillRight ? step.right : step.left;
     final drift = downhillRight ? 1.0 : -1.0;
-    for (int i = 0; i < 7; i++) {
-      final u = ((time * 0.5) + i / 7) % 1.0;
+    for (int i = 0; i < foam; i++) {
+      final u = ((time * 0.5) + i / foam) % 1.0;
       final fade = (1 - u) * (1 - u);
       canvas.drawCircle(
-        Offset(
-          footX + drift * u * 52,
-          botY + 2.5 + sin(time * 3.4 + i * 1.7) * 1.8,
-        ),
+        Offset(footX + drift * u * 52,
+            botY + 2.5 + sin(time * 3.4 + i * 1.7) * 1.8),
         (2.0 + (i % 3) * 1.4) * (0.4 + fade),
         Paint()..color = Colors.white.withOpacity(0.5 * fade + 0.08),
       );
     }
 
-    // 5. The lip: a bright line right at the top of the drop, which is what
-    //    makes the edge read as an edge rather than as a gradient.
+    // The lip: the bright line that makes an edge read as an edge.
     final lipX = downhillRight ? step.left : step.right;
     canvas.drawLine(
       Offset(lipX - 10, world.waterAt(lipX) + 1),
@@ -545,6 +558,205 @@ class WorldRenderer {
         ..strokeWidth = 2.6
         ..strokeCap = StrokeCap.round,
     );
+  }
+
+  /// A long shallow run of broken water: no lip, no plunge, just chop all
+  /// the way down. Wide and busy rather than tall and loud.
+  void _stepRapids(Canvas canvas, WaterStep step, double time,
+      bool downhillRight, double botY) {
+    canvas.drawPath(
+      _stepSurface(step),
+      Paint()
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 3.5
+        ..strokeCap = StrokeCap.round
+        ..color = Colors.white.withOpacity(0.32),
+    );
+    // Standing waves: short crests pinned to the slope, each bobbing on its
+    // own beat so the whole run seethes instead of scrolling as one sheet.
+    const crests = 14;
+    for (int i = 0; i < crests; i++) {
+      final x = step.left + step.width * ((i + 0.5) / crests);
+      final y = world.waterAt(x);
+      final bob = sin(time * 5.5 + i * 1.9);
+      final w = 5.0 + (i % 3) * 2.5;
+      canvas.drawArc(
+        Rect.fromCenter(
+            center: Offset(x, y + 2 + bob * 1.2), width: w * 2, height: 7),
+        pi,
+        pi,
+        false,
+        Paint()
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = 2.0
+          ..strokeCap = StrokeCap.round
+          ..color = Colors.white.withOpacity(0.3 + (bob + 1) * 0.2),
+      );
+    }
+  }
+
+  /// Built, not grown: a straight concrete sill with a smooth glassy curtain
+  /// folding over it and a hard churn in the pool below.
+  void _stepWeir(Canvas canvas, WaterStep step, double time,
+      bool downhillRight, double botY) {
+    final lipX = downhillRight ? step.left : step.right;
+    final lipY = world.waterAt(lipX);
+
+    // The sill itself — the one transition that is a structure.
+    final sill = Rect.fromLTRB(
+      min(lipX, lipX + (downhillRight ? 7.0 : -7.0)),
+      lipY - 3,
+      max(lipX, lipX + (downhillRight ? 7.0 : -7.0)),
+      botY + 6,
+    );
+    canvas.drawRect(sill, Paint()..color = map.stoneShade);
+    canvas.drawRect(
+      Rect.fromLTRB(sill.left, sill.top, sill.right, sill.top + 3.5),
+      Paint()..color = map.stone,
+    );
+
+    // The curtain: smooth and glassy at the top, breaking up further down.
+    canvas.drawPath(
+      _stepSurface(step),
+      Paint()
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 7
+        ..strokeCap = StrokeCap.round
+        ..color = Colors.white.withOpacity(0.5),
+    );
+    // Hard churn in the plunge pool — a weir's pool is the violent part.
+    final footX = downhillRight ? step.right : step.left;
+    final drift = downhillRight ? 1.0 : -1.0;
+    for (int i = 0; i < 10; i++) {
+      final u = ((time * 0.75) + i / 10) % 1.0;
+      final fade = (1 - u);
+      canvas.drawCircle(
+        Offset(footX + drift * u * 40,
+            botY + 3 + sin(time * 6 + i * 2.1) * 3.0),
+        (2.4 + (i % 4) * 1.2) * (0.5 + fade * 0.8),
+        Paint()..color = Colors.white.withOpacity(0.62 * fade + 0.12),
+      );
+    }
+  }
+
+  /// A rock shelf stepping down in strata — the water is incidental, the
+  /// rock is the feature.
+  void _stepLedge(Canvas canvas, WaterStep step, double time,
+      bool downhillRight, double botY) {
+    final topY = min(world.waterAt(step.left - 1), world.waterAt(step.right + 1));
+    const bands = 4;
+    for (int i = 0; i < bands; i++) {
+      final u = (i + 1) / bands;
+      final y = topY + (botY - topY) * u;
+      final inset = step.width * 0.5 * (downhillRight ? u : 1 - u);
+      final l = downhillRight ? step.left : step.left + inset;
+      final r = downhillRight ? step.right - inset : step.right;
+      canvas.drawRect(
+        Rect.fromLTRB(min(l, r), y - (botY - topY) / bands, max(l, r), y + 2),
+        Paint()..color = i.isEven ? map.stone : map.stoneShade,
+      );
+    }
+    // A thin skin of water running over it.
+    canvas.drawPath(
+      _stepSurface(step),
+      Paint()
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 4
+        ..strokeCap = StrokeCap.round
+        ..color = Colors.white.withOpacity(0.42),
+    );
+    for (int i = 0; i < 5; i++) {
+      final u = ((i / 5) + time * 0.35) % 1.0;
+      final along = downhillRight ? u : 1 - u;
+      final x = step.left + step.width * along;
+      canvas.drawLine(
+        Offset(x, world.waterAt(x) + 1),
+        Offset(x, world.waterAt(x) + 7),
+        Paint()
+          ..color = Colors.white.withOpacity(0.4 * sin(pi * u))
+          ..strokeWidth = 1.6
+          ..strokeCap = StrokeCap.round,
+      );
+    }
+  }
+
+  /// A shoal: a long pale ramp of sand or shingle showing through shallow
+  /// water. The gentlest transition, and the one that reads as ground.
+  void _stepShoal(Canvas canvas, WaterStep step, double time,
+      bool downhillRight, double botY) {
+    // The bar itself, under the water, fading out into the deeper side.
+    final bar = _stepSurface(step)
+      ..lineTo(step.right, botY + 20)
+      ..lineTo(step.left, botY + 20)
+      ..close();
+    canvas.drawPath(bar, Paint()..color = map.shore.withOpacity(0.55));
+    // The waterline over it: a soft bright edge, no drop.
+    canvas.drawPath(
+      _stepSurface(step),
+      Paint()
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 3
+        ..strokeCap = StrokeCap.round
+        ..color = Colors.white.withOpacity(0.4),
+    );
+    // Wash running up and back down the ramp.
+    final phase = (sin(time * 1.1) + 1) / 2;
+    for (int i = 0; i < 3; i++) {
+      final u = ((phase + i / 3) % 1.0);
+      final along = downhillRight ? 1 - u : u;
+      final x = step.left + step.width * along;
+      canvas.drawCircle(
+        Offset(x, world.waterAt(x) + 3),
+        3.5 * sin(pi * u),
+        Paint()..color = Colors.white.withOpacity(0.35 * sin(pi * u)),
+      );
+    }
+  }
+
+  /// A calving ice edge: blocky, pale blue, with meltwater running off it.
+  void _stepIce(Canvas canvas, WaterStep step, double time,
+      bool downhillRight, double botY) {
+    final topY = min(world.waterAt(step.left - 1), world.waterAt(step.right + 1));
+    const ice = Color(0xFFDFF1F7);
+    const iceShade = Color(0xFFA9CEDD);
+
+    // The shelf: a squared-off block with a broken face, rather than a
+    // smooth ramp — ice does not pour, it breaks.
+    final face = Path()..moveTo(step.left, world.waterAt(step.left));
+    for (double x = step.left; x <= step.right; x += step.width / 5) {
+      // Stepped rather than smooth, so the edge reads as fractured.
+      final y = world.waterAt(x);
+      face.lineTo(x, y);
+      face.lineTo(x + step.width / 10, y + (botY - topY) / 8);
+    }
+    face
+      ..lineTo(step.right, botY + 16)
+      ..lineTo(step.left, botY + 16)
+      ..close();
+    canvas.drawPath(face, Paint()..color = iceShade);
+
+    canvas.drawPath(
+      _stepSurface(step),
+      Paint()
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 6
+        ..strokeCap = StrokeCap.round
+        ..color = ice,
+    );
+    // Meltwater: thin, cold, sparse.
+    for (int i = 0; i < 4; i++) {
+      final u = ((i / 4) + time * 0.3) % 1.0;
+      final along = downhillRight ? u : 1 - u;
+      final x = step.left + step.width * along;
+      canvas.drawLine(
+        Offset(x, world.waterAt(x) + 2),
+        Offset(x, world.waterAt(x) + 11),
+        Paint()
+          ..color = Colors.white.withOpacity(0.5 * sin(pi * u))
+          ..strokeWidth = 1.4
+          ..strokeCap = StrokeCap.round,
+      );
+    }
   }
 
   void _drawProps(Canvas canvas, double time) {
@@ -739,10 +951,18 @@ class WorldRenderer {
       canvas.save();
       canvas.translate(raft.x, bob);
 
-      _ripple(canvas, raft, time);
-      if (raft.loadout.hull.hasMast) _mast(canvas, raft);
-      _hull(canvas, raft);
+      // Land does not leave a wake.
+      if (raft.place.floats) _ripple(canvas, raft, time);
+      if (raft.emplacement == Emplacement.raft) {
+        if (raft.loadout.hull.hasMast) _mast(canvas, raft);
+        _hull(canvas, raft);
+      } else {
+        _emplacementBase(canvas, raft, time);
+      }
       _platforms(canvas, raft);
+      _deckStructures(canvas, raft);
+      _builtStructure(canvas, raft, time);
+      if (identical(raft, _buildTarget)) _buildGhosts(canvas, raft);
       // Everything a working raft accumulates: fenders over the side, a
       // lantern, a flag, coiled rope, stowed oars. Drawn after the deck so
       // it sits on top of the planks, and before the crew so nobody is
@@ -805,18 +1025,38 @@ class WorldRenderer {
           weapon: weapon,
         );
         if (!c.alive) {
-          // Killing-blow flash: a beat of pure white over the whole body,
-          // blended onto what was just drawn. srcATop needs the layer to
-          // clip it to the body, so it only draws when one was taken.
+          // Killing blow: a flare at the wound with embers coming off it,
+          // rather than a beat of pure white over the whole figure.
+          //
+          // The old version was a full-body overlay at 0.85 alpha on a
+          // 0.16s timer — a strobe, and it fired on the same frame the body
+          // switched from its standing drawing to a ragdoll. Two
+          // discontinuities landing together read as the character being
+          // swapped out rather than killed. Pulling the eye to the point of
+          // impact instead lets the body hand over underneath it, which is
+          // what makes the change of drawing pass unnoticed.
+          //
+          // It is drawn AFTER the body and inside the same layer, so the
+          // flare sits over the wound wherever the tumble has carried it.
           if (c.deathFlash > 0 && fading) {
-            final f = (c.deathFlash / BattleConst.deathFlashTime).clamp(0.0, 1.0);
-            canvas.drawRect(
-              bodyBounds.inflate(30),
+            final u = 1 - (c.deathFlash / BattleConst.deathFlashTime).clamp(0.0, 1.0);
+            // Up fast, down slow — a flare, not a square pulse.
+            final f = u < 0.22 ? u / 0.22 : 1 - ((u - 0.22) / 0.78);
+            final wound = _deathWoundPos(c);
+            canvas.drawCircle(
+              wound,
+              14 + 26 * u,
               Paint()
-                ..color = Colors.white.withOpacity(f * 0.85)
-                ..blendMode = BlendMode.srcATop,
+                ..color = Colors.white.withOpacity(f * 0.55)
+                ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 7),
+            );
+            canvas.drawCircle(
+              wound,
+              5 + 9 * u,
+              Paint()..color = Colors.white.withOpacity(f * 0.8),
             );
           }
+          _deathSparks(canvas, c, time);
           _deathFx(canvas, c, time);
           if (fading) canvas.restore();
         } else if (c.hpBarT > 0) {
@@ -862,6 +1102,55 @@ class WorldRenderer {
 
   /// Bubbles and the pale wisp that lift away while a crew member slips
   /// under — the tail end of the death sequence.
+
+  /// Where the killing blow landed, in the same space the body is drawn in.
+  ///
+  /// Carried along the SPINE rather than held at a fixed offset from the
+  /// hip. The wound is recorded in the crew member's own upright frame, so
+  /// on a body that is tumbling — which is every dead body here — a fixed
+  /// world offset leaves the flare hanging above the corpse instead of
+  /// staying on the part that was hit. Measuring it as a fraction of the
+  /// hip-to-neck line means it rotates with the body for free.
+  Offset _deathWoundPos(Crew c) {
+    final pose = c.pose;
+    if (pose == null) return c.deathWound;
+    // How far up the standing spine the wound sat. The pose's origin is the
+    // feet, its hip sits 15 above that, and the spine runs 27 further to the
+    // neck — so a head shot at -48 comes out a little past the neck.
+    const hipUp = 15.0;
+    const spineLen = 27.0;
+    final along = (-c.deathWound.dy - hipUp) / spineLen;
+    return pose.hip.pos + (pose.neck.pos - pose.hip.pos) * along;
+  }
+
+  /// Embers thrown off a fresh kill.
+  ///
+  /// Deliberately drawn straight rather than pushed through the world's [Fx]
+  /// list: these belong to a body that is moving, and an fx is a fixed world
+  /// position, so spawned ones would be left hanging in the air behind a
+  /// tumbling corpse. Drawing them relative to the wound keeps them with it.
+  void _deathSparks(Canvas canvas, Crew c, double time) {
+    if (c.deathSpark <= 0) return;
+    final u = 1 - (c.deathSpark / BattleConst.deathSparkTime).clamp(0.0, 1.0);
+    final wound = _deathWoundPos(c);
+    const count = 9;
+    for (int k = 0; k < count; k++) {
+      // A fixed fan per crew member, so the same death always throws the
+      // same sparks — no per-frame randomness to shimmer.
+      final a = pi * 2 * (k / count) + c.bobPhase * 2.3;
+      // Thrown out fast, then slowing, with a little gravity on them.
+      final reach = 34 * (1 - (1 - u) * (1 - u));
+      final p = wound +
+          Offset(cos(a) * reach, sin(a) * reach * 0.7 + u * u * 20);
+      canvas.drawCircle(
+        p,
+        (2.4 - u * 1.7).clamp(0.5, 2.4),
+        Paint()
+          ..color = Color.lerp(const Color(0xFFFFE9A8), const Color(0xFFE8743A), u)!
+              .withOpacity((1 - u) * 0.9),
+      );
+    }
+  }
   void _deathFx(Canvas canvas, Crew c, double time) {
     if (c.sinkT > BattleConst.sinkFloatFrac) {
       for (int k = 0; k < 3; k++) {
@@ -1247,6 +1536,145 @@ class WorldRenderer {
         break;
     }
     return p;
+  }
+  /// The base an emplacement stands on, in place of a raft's hull.
+  ///
+  /// Only the BASE differs — the floors above it are the shared deck-profile
+  /// drawing, because they are the shared deck profile. What changes is what
+  /// the thing is made of and how it meets the water: a beach shelves into
+  /// it, a ledge drops sheer into it, lashed hulls sit in it separately.
+  void _emplacementBase(Canvas canvas, Raft raft, double time) {
+    final w = raft.hullHalf * 2;
+    final waterY = raft.waterLine;
+    final map = this.map;
+
+    switch (raft.emplacement) {
+      case Emplacement.raft:
+        return; // drawn by _hull
+
+      case Emplacement.island:
+        // A sand mound: shelving beaches either side of a broad crown, with
+        // the waterline cutting across it rather than it sitting on top.
+        final crown = raft.deckY;
+        final body = Path()
+          ..moveTo(-w / 2 - 40, waterY + 16)
+          ..quadraticBezierTo(-w / 2 + 20, crown + 6, -w * 0.24, crown)
+          ..lineTo(w * 0.24, crown)
+          ..quadraticBezierTo(w / 2 - 20, crown + 6, w / 2 + 40, waterY + 16)
+          ..close();
+        canvas.drawPath(body, Paint()..color = map.shore);
+        // Wet sand where the water washes it — the line that makes it read
+        // as land IN water rather than a shape floating on it.
+        canvas.save();
+        canvas.clipPath(body);
+        canvas.drawRect(
+          Rect.fromLTRB(-w, waterY - 5, w, waterY + 30),
+          Paint()..color = Color.lerp(map.shore, map.waterDeep, 0.35)!,
+        );
+        canvas.restore();
+        // A little scrub on the crown so it is not a bare dune.
+        for (final gx in [-w * 0.16, w * 0.12]) {
+          canvas.drawCircle(
+            Offset(gx, crown - 3),
+            7,
+            Paint()..color = const Color(0xFF4E8C46),
+          );
+        }
+
+      case Emplacement.ledge:
+        // A rock shelf: sheer face, flat top, undercut at the waterline so
+        // it reads as standing out of the sea rather than resting on it.
+        final top = raft.deckY;
+        final face = Path()
+          ..moveTo(-w / 2, top)
+          ..lineTo(w / 2, top)
+          ..lineTo(w / 2 - 6, waterY + 34)
+          ..lineTo(-w / 2 + 10, waterY + 34)
+          ..close();
+        canvas.drawPath(face, Paint()..color = map.stone);
+        // Shaded right flank and strata across the face.
+        canvas.save();
+        canvas.clipPath(face);
+        canvas.drawRect(
+          Rect.fromLTRB(w * 0.18, top - 4, w, waterY + 40),
+          Paint()..color = map.stoneShade,
+        );
+        final strata = Paint()
+          ..color = map.stoneShade.withOpacity(0.55)
+          ..strokeWidth = 2.5;
+        for (double y = top + 12; y < waterY + 30; y += 13) {
+          canvas.drawLine(Offset(-w, y), Offset(w, y + 2), strata);
+        }
+        canvas.restore();
+
+      case Emplacement.flotilla:
+        // Three hulls, each sitting a little differently in the water, with
+        // rope between them. The gaps are real — they are the low tiers in
+        // the plan — so the rope is spanning something.
+        const parts = 3;
+        for (int i = 0; i < parts; i++) {
+          final cx = (-w / 2) + w * ((i + 0.5) / parts);
+          final pw = w / parts * 0.86;
+          final sit = [0.0, -5.0, 3.0][i];
+          final rect = RRect.fromRectAndRadius(
+            Rect.fromLTRB(
+                cx - pw / 2, raft.deckY + sit, cx + pw / 2, waterY + 20 + sit),
+            const Radius.circular(9),
+          );
+          canvas.drawRRect(rect, Paint()..color = raft.loadout.color);
+          canvas.drawRRect(
+            rect,
+            Paint()
+              ..color = Colors.black.withOpacity(0.18)
+              ..strokeWidth = 2
+              ..style = PaintingStyle.stroke,
+          );
+          // Lashing across to the next hull.
+          if (i < parts - 1) {
+            final nx = (-w / 2) + w * ((i + 1.5) / parts);
+            final rope = Paint()
+              ..color = const Color(0xFFCBB187)
+              ..strokeWidth = 3
+              ..strokeCap = StrokeCap.round;
+            for (final dy in [4.0, 11.0]) {
+              canvas.drawLine(
+                Offset(cx + pw / 2, raft.deckY + sit + dy),
+                Offset(nx - pw / 2, raft.deckY + dy),
+                rope,
+              );
+            }
+          }
+        }
+
+      case Emplacement.bay:
+        // A cove: rock headlands at both ends with a sheltered floor between
+        // them. Drawn as one mass so the walls read as part of the same
+        // landform rather than two separate rocks.
+        final floor = raft.deckY;
+        final body = Path()
+          ..moveTo(-w / 2 - 18, waterY + 26)
+          ..lineTo(-w / 2 - 4, floor - 62)
+          ..lineTo(-w * 0.28, floor - 62)
+          ..lineTo(-w * 0.22, floor)
+          ..lineTo(w * 0.22, floor)
+          ..lineTo(w * 0.28, floor - 62)
+          ..lineTo(w / 2 + 4, floor - 62)
+          ..lineTo(w / 2 + 18, waterY + 26)
+          ..close();
+        canvas.drawPath(body, Paint()..color = map.stone);
+        canvas.save();
+        canvas.clipPath(body);
+        // Shadow inside the cove, which is what sells it as sheltered.
+        canvas.drawRect(
+          Rect.fromLTRB(-w * 0.3, floor - 62, w * 0.3, floor + 8),
+          Paint()..color = map.stoneShade.withOpacity(0.5),
+        );
+        canvas.drawRect(
+          Rect.fromLTRB(-w, waterY - 4, w, waterY + 30),
+          Paint()..color = Color.lerp(map.stone, map.waterDeep, 0.4)!,
+        );
+        canvas.restore();
+    }
   }
   void _hull(Canvas canvas, Raft raft) {
     final lo = raft.loadout;
@@ -1698,10 +2126,326 @@ class WorldRenderer {
   /// physics collides against — blocks render as solid slabs with a lit top
   /// and a shaded front wall, ramps as wedges. Coordinates are hull-local,
   /// rises measured up from the main deck plane (y-down, so negative).
+  /// Walls and roofs: the built structures that sit ON a deck rather than
+  /// being part of its shape.
+  ///
+  /// The hulls already differ in outline and in tier layout, but above the
+  /// planks they were bare — every raft was an open platform, so the only
+  /// thing between two crews was distance. A bulkhead to stand behind and a
+  /// canopy overhead give a deck an interior to read.
+  ///
+  /// Deliberately drawn rather than built into [DeckProfile]. The profile is
+  /// a height-field — one surface height per x — which can express a floor
+  /// but not a wall or an overhang, so anything vertical here is scenery. It
+  /// is placed against the real tiers and the real berths, so it never floats
+  /// and never lands on somebody's head, but a shot passes through it.
+  ///
+  /// Chosen from the raft's own identity rather than rolled per frame: a
+  /// deck that rearranged itself between frames would be worse than a bare
+  /// one, and the same raft must look the same on both devices in a hotspot
+  /// match.
+  /// What the player built, block by block.
+  ///
+  /// Drawn from the live grid rather than from the plan they submitted, so a
+  /// block that has been shot off is simply not there — the structure on
+  /// screen is always the structure the physics is using.
+  /// The raft currently being laid out, if any. See [_buildGhosts].
+  Raft? _buildTarget;
+
+  /// The empty cells a block could go in, drawn on the raft during the
+  /// build phase.
+  ///
+  /// This replaces the floating grid panel the build screen used to put in
+  /// the middle of the water. A diagram of the raft, drawn somewhere other
+  /// than where the raft is, makes the player translate between two pictures
+  /// to answer the only question that matters — is this wall tall enough to
+  /// stand behind? Marking the real cells on the real deck, at the size the
+  /// battle is fought at and with the crew standing right there, answers it
+  /// by looking.
+  ///
+  /// Only empty, legal cells are marked. A filled cell already shows what is
+  /// in it, and a column hanging off the end of a short hull is not somewhere
+  /// a block can go at all (see [Raft.buildColumnOnDeck]) — outlining it
+  /// would be an invitation to tap something that does nothing.
+  void _buildGhosts(Canvas canvas, Raft raft) {
+    final plan = raft.build;
+    if (plan == null) return;
+    final deckTop = raft.waterLine - raft.loadout.deckRise;
+
+    final fill = Paint()..color = Colors.white.withOpacity(0.10);
+    final edge = Paint()
+      ..color = Colors.white.withOpacity(0.38)
+      ..strokeWidth = 1.2
+      ..style = PaintingStyle.stroke;
+
+    for (int col = 0; col < BuildPlan.cols; col++) {
+      if (!raft.buildColumnOnDeck(col)) continue;
+      for (int row = 0; row < BuildPlan.rows; row++) {
+        if (plan.at(col, row) != null) continue;
+        final box = Rect.fromLTWH(
+          BuildPlan.columnX(col) - BuildPlan.cellW / 2 + 1,
+          deckTop - (row + 1) * BuildPlan.cellH + 1,
+          BuildPlan.cellW - 2,
+          BuildPlan.cellH - 2,
+        );
+        final rr = RRect.fromRectAndRadius(box, const Radius.circular(3));
+        canvas.drawRRect(rr, fill);
+        canvas.drawRRect(rr, edge);
+      }
+    }
+  }
+
+  void _builtStructure(Canvas canvas, Raft raft, double time) {
+    final plan = raft.build;
+    if (plan == null) return;
+    final deckTop = raft.waterLine - raft.loadout.deckRise;
+
+    for (final (col, row, cell) in plan.standing) {
+      if (!raft.buildColumnOnDeck(col)) continue;
+      final def = cell.def;
+      final cx = BuildPlan.columnX(col);
+      final top = deckTop - (row + 1) * BuildPlan.cellH;
+      final box = Rect.fromLTWH(
+        cx - BuildPlan.cellW / 2,
+        top,
+        BuildPlan.cellW,
+        BuildPlan.cellH,
+      );
+
+      canvas.save();
+      // Being hit shakes the block. A block can be struck several times
+      // before it goes, so this is a shudder rather than a white flash — at
+      // that rate a full-box strobe reads as flicker, not impact.
+      if (cell.flash > 0) {
+        final k = (cell.flash / BattleConst.obstacleStruckTime).clamp(0.0, 1.0);
+        canvas.translate(sin(cell.flash * 90) * 2.4 * k, 0);
+      }
+
+      // The block itself: face, a lit top edge, and a shaded right flank so
+      // it reads as solid rather than as a flat tile.
+      canvas.drawRect(box, Paint()..color = def.color);
+      canvas.drawRect(
+        Rect.fromLTRB(box.right - 5, box.top, box.right, box.bottom),
+        Paint()..color = def.shade,
+      );
+      canvas.drawRect(
+        Rect.fromLTRB(box.left, box.top, box.right, box.top + 3),
+        Paint()..color = Color.lerp(def.color, Colors.white, 0.35)!,
+      );
+
+      // Material grain — what tells the five apart at a glance, without
+      // needing to read a legend.
+      final grain = Paint()
+        ..color = def.shade.withOpacity(0.75)
+        ..strokeWidth = 1.6
+        ..strokeCap = StrokeCap.round;
+      switch (cell.material) {
+        case BuildMaterial.thatch:
+          // Loose vertical stalks.
+          for (double gx = box.left + 3; gx < box.right - 2; gx += 4) {
+            canvas.drawLine(
+              Offset(gx, box.top + 3),
+              Offset(gx + 1.2, box.bottom - 2),
+              grain,
+            );
+          }
+        case BuildMaterial.driftwood:
+          // A couple of long uneven boards.
+          for (int i = 1; i <= 2; i++) {
+            final gy = box.top + box.height * i / 3;
+            canvas.drawLine(
+              Offset(box.left + 2, gy),
+              Offset(box.right - 4, gy + (i.isEven ? 1.5 : -1.5)),
+              grain,
+            );
+          }
+        case BuildMaterial.plank:
+          // Neat sawn boards, evenly spaced.
+          for (int i = 1; i < 3; i++) {
+            final gy = box.top + box.height * i / 3;
+            canvas.drawLine(
+                Offset(box.left + 2, gy), Offset(box.right - 4, gy), grain);
+          }
+        case BuildMaterial.barrel:
+          // Hoops around a curved body.
+          canvas.drawOval(box.deflate(2.5), grain..style = PaintingStyle.stroke);
+          for (int i = 1; i < 3; i++) {
+            final gy = box.top + box.height * i / 3;
+            canvas.drawLine(
+                Offset(box.left + 3, gy), Offset(box.right - 5, gy), grain);
+          }
+          grain.style = PaintingStyle.fill;
+        case BuildMaterial.iron:
+          // Riveted plate.
+          final rivet = Paint()..color = def.shade;
+          for (final rx in [box.left + 4.5, box.right - 7.5]) {
+            for (final ry in [box.top + 4.5, box.bottom - 4.5]) {
+              canvas.drawCircle(Offset(rx, ry), 1.6, rivet);
+            }
+          }
+      }
+
+      // Damage: cracks open across the face as it takes hits, so how much
+      // more it will stand is readable before it goes.
+      if (cell.wear > 0.05) {
+        final crack = Paint()
+          ..color = const Color(0xFF241C14).withOpacity(0.2 + cell.wear * 0.55)
+          ..strokeWidth = 1.2 + cell.wear * 1.8
+          ..style = PaintingStyle.stroke;
+        final steps = 1 + (cell.wear * 3).round();
+        for (int i = 0; i < steps; i++) {
+          final gy = box.top + box.height * (i + 1) / (steps + 1);
+          canvas.drawLine(
+            Offset(box.left + 1, gy),
+            Offset(box.right - 1, gy + (i.isEven ? 2.5 : -2.5)),
+            crack,
+          );
+        }
+      }
+
+      // Outline last, so neither the grain nor the cracks bleed over it.
+      canvas.drawRect(
+        box,
+        Paint()
+          ..color = const Color(0xFF2A2018).withOpacity(0.55)
+          ..strokeWidth = 1.6
+          ..style = PaintingStyle.stroke,
+      );
+      canvas.restore();
+    }
+  }
+  void _deckStructures(Canvas canvas, Raft raft) {
+    final lo = raft.loadout;
+    final deckTop = raft.waterLine - lo.deckRise;
+    final profile = raft.profile;
+
+    var h = lo.hull.id.hashCode ^ (raft.playerIndex * 0x9E3779B1);
+    h ^= (raft.x * 7.0).round();
+    int roll(int n) {
+      h ^= h >>> 13;
+      h = (h * 0x85EBCA6B) & 0x7FFFFFFF;
+      h ^= h >>> 11;
+      return h % n;
+    }
+
+    /// True if a crew berth sits within [pad] of [x] — somewhere a wall
+    /// would be standing in a person.
+    bool clearOfBerths(double x, double pad) {
+      for (final st in profile.stations) {
+        if ((st.x - x).abs() < pad) return false;
+      }
+      return true;
+    }
+
+    // Built from whatever the emplacement is made of, so a hut on a rock
+    // ledge is not painted in the raft fleet own colours.
+    final base = _deckMaterial(raft);
+    final timber = Color.lerp(base, const Color(0xFF3A2A1C), 0.42)!;
+    final timberLit = Color.lerp(base, Colors.white, 0.20)!;
+    final post = Color.lerp(base, const Color(0xFF23262B), 0.55)!;
+
+    for (final s in profile.segments) {
+      if (!s.isFlat) continue;
+      final top = deckTop - s.rise0;
+      final width = s.x1 - s.x0;
+      if (width < 34) continue;
+
+      switch (roll(4)) {
+        case 0:
+          // A ROOF: a canopy on corner posts, high enough to stand under.
+          // Anything lower would slice through the crew beneath it, which is
+          // exactly the sort of thing that looks like a rendering fault
+          // rather than a building.
+          const clear = 76.0;
+          final eaves = top - clear;
+          for (final px in [s.x0 + 4, s.x1 - 4]) {
+            canvas.drawRect(
+              Rect.fromLTRB(px - 2.5, eaves, px + 2.5, top),
+              Paint()..color = post,
+            );
+          }
+          // A shallow pitch, overhanging the posts a little at each end.
+          final roof = Path()
+            ..moveTo(s.x0 - 7, eaves)
+            ..lineTo((s.x0 + s.x1) / 2, eaves - 13)
+            ..lineTo(s.x1 + 7, eaves)
+            ..close();
+          canvas.drawPath(roof, Paint()..color = timber);
+          canvas.drawLine(
+            Offset(s.x0 - 7, eaves),
+            Offset(s.x1 + 7, eaves),
+            Paint()
+              ..color = timberLit
+              ..strokeWidth = 3.5,
+          );
+        case 1:
+          // A WALL: a bulkhead across one end of the tier, kept off the
+          // berths so nobody is standing inside it.
+          final atLeft = roll(2) == 0;
+          final wx = atLeft ? s.x0 + 6 : s.x1 - 6;
+          if (!clearOfBerths(wx, 16)) break;
+          const hgt = 34.0;
+          canvas.drawRect(
+            Rect.fromLTRB(wx - 4, top - hgt, wx + 4, top),
+            Paint()..color = timber,
+          );
+          // Plank seams, so it reads as boards rather than a slab.
+          for (int i = 1; i < 3; i++) {
+            final y = top - hgt * i / 3;
+            canvas.drawLine(
+              Offset(wx - 4, y),
+              Offset(wx + 4, y),
+              Paint()
+                ..color = Colors.black.withOpacity(0.18)
+                ..strokeWidth = 1.2,
+            );
+          }
+          // Capping rail along the top.
+          canvas.drawRect(
+            Rect.fromLTRB(wx - 6, top - hgt - 3, wx + 6, top - hgt),
+            Paint()..color = timberLit,
+          );
+        case 2:
+          // A BULWARK: a low solid wall running the length of the tier —
+          // the thing a crew member ducks behind. Kept short so it never
+          // hides a head.
+          const hgt = 17.0;
+          canvas.drawRect(
+            Rect.fromLTRB(s.x0 + 2, top - hgt, s.x1 - 2, top - hgt + 4),
+            Paint()..color = timberLit,
+          );
+          for (double px = s.x0 + 6; px < s.x1 - 4; px += 13) {
+            canvas.drawRect(
+              Rect.fromLTRB(px - 1.6, top - hgt, px + 1.6, top),
+              Paint()..color = post,
+            );
+          }
+        default:
+          // Nothing on this tier. A deck with something on every level is as
+          // uniform as a deck with nothing on any of them.
+          break;
+      }
+    }
+  }
+
+  /// What an emplacement's walkable tiers are made of.
+  ///
+  /// The tier drawing is shared — the floors ARE the shared deck profile —
+  /// but the material is not: an island wearing a raft's painted planks
+  /// reads as a raft with sand round it rather than as land.
+  Color _deckMaterial(Raft raft) => switch (raft.emplacement) {
+        Emplacement.raft || Emplacement.flotilla => raft.loadout.color,
+        Emplacement.island => map.shore,
+        Emplacement.ledge || Emplacement.bay => map.stone,
+      };
   void _platforms(Canvas canvas, Raft raft) {
     final lo = raft.loadout;
     final deckTop = raft.waterLine - lo.deckRise;
-    final w = lo.width;
+    // The emplacement own width, not the hull: an island is half again as
+    // wide as the hull standing in for it, and its floors are laid out
+    // across the width they actually occupy.
+    final w = raft.hullHalf * 2;
+    final surface = _deckMaterial(raft);
 
     for (final s in raft.profile.segments) {
       final isRamp = !s.isFlat;
@@ -1718,7 +2462,8 @@ class WorldRenderer {
         ..close();
 
       final shade = Colors.black.withOpacity(isRamp ? 0.04 : 0.10);
-      final planks = isRamp ? lo.color : Color.lerp(lo.color, Colors.white, 0.14)!;
+      final planks =
+          isRamp ? surface : Color.lerp(surface, Colors.white, 0.14)!;
 
       canvas.drawPath(path, Paint()..color = planks);
       // Lit walking surface along the top edge.
@@ -2415,11 +3160,14 @@ class WorldRenderer {
     // wound instead — the lean above already doubles the body over it.
     if (grabbing) {
       suppHand = Offset(-gunSide * 3.5, shoulderY + torsoH * 0.66);
-    } else if (bx.armRaise > 0 && !aiming) {
+    } else if (bx.armRaise > 0 && (!aiming || Crew.fireFlourishes.contains(crew.idle))) {
       // The free arm goes up: a fist punched overhead for a gloat, a big
       // overhead reach for a stretch, a hand to the temple for a scratch.
       // Only while NOT aiming — a raised arm mid-shot would fight the grip
-      // IK for the same limb and read as a broken pose.
+      // IK for the same limb and read as a broken pose — with the firing
+      // flourish excepted, since it plays AFTER the trigger and the aim gate
+      // coming back for the next turn would otherwise chop the arm down
+      // mid-gesture.
       //
       // Height AND reach, because height alone put every one of them in the
       // same place: with two dozen activities in the pool, a wave, a salute
@@ -3466,17 +4214,17 @@ class WorldRenderer {
     final pain = dead ? 0.0 : (crew.hitReactT / BattleConst.hitReactTime).clamp(0.0, 1.0);
     final gloat = dead || pain > 0 ? 0.0 : (crew.gloatT / BattleConst.gloatTime).clamp(0.0, 1.0);
     final lowHp = !dead && pain <= 0 && gloat <= 0 && crew.hpFrac < BattleConst.lowHpFace;
-    // Idle fidgets only surface when nothing more urgent is on the face —
-    // and the active shooter keeps a straight face while AIMING (the world
-    // also stops picking new activities for them then).
+    // Idle fidgets only surface when nothing more urgent is on the face.
     //
-    // A firing flourish is the exception: it exists precisely for the beat
-    // after the trigger, when the shot is away and the shooter is free to
-    // gloat about it, so it has to survive the `firing` gate that suppresses
-    // everything else.
+    // A firing flourish is the exception to both gates: it exists precisely
+    // for the beat after the trigger, when the shot is away and the shooter
+    // is free to gloat about it. It has to survive `firing` (which is the
+    // recoil window, and overlaps the start of every flourish) and `aiming`
+    // (which comes back the moment the next turn opens, and would otherwise
+    // cut the pose off halfway through).
     final flourishing = Crew.fireFlourishes.contains(crew.idle);
     final idleAct =
-        (!dead && pain <= 0 && gloat <= 0 && !aiming && (!firing || flourishing))
+        (!dead && pain <= 0 && gloat <= 0 && (flourishing || (!aiming && !firing)))
             ? crew.idle
             : CrewIdle.none;
     // 0..1 progress through the current activity, so expressions can ease
