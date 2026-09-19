@@ -126,8 +126,8 @@ class _MenuMascotState extends State<MenuMascot>
   @override
   Widget build(BuildContext context) {
     return SizedBox(
-      width: 168,
-      height: 158,
+      width: 200,
+      height: 186,
       child: CustomPaint(
         painter: _MascotPainter(_renderer, _world, _time, widget.shownWidth),
       ),
@@ -148,8 +148,8 @@ class _MascotPainter extends CustomPainter {
     if (size.isEmpty) return;
     final raft = world.rafts.first;
 
-    // The renderer scales the world's full height to whatever height it is
-    // handed, so handing it exactly [BattleConst.worldH] makes its internal
+    // The renderer scales [BattleConst.viewH] of world height to whatever
+    // height it is handed, so handing it exactly that makes its internal
     // scale 1 and leaves it drawing in world units. The framing is then
     // done out here, where it is one zoom and one offset rather than a
     // second coordinate system inside the renderer.
@@ -159,12 +159,18 @@ class _MascotPainter extends CustomPainter {
     canvas.save();
     canvas.clipRect(Offset.zero & size);
     // Sit the waterline just below the bottom edge, so the hull is cut off
-    // by the frame the way it is cut off by the sea.
-    canvas.translate(0, size.height * 0.97 - BattleConst.waterY * zoom);
+    // by the frame the way it is cut off by the sea. The renderer applies
+    // the world's vertical camera itself, so the offset is measured from
+    // where the water actually is under the raft, not from the flat-water
+    // line.
+    canvas.translate(
+      0,
+      size.height * 0.97 - (world.waterAt(raft.x) - world.camY) * zoom,
+    );
     canvas.scale(zoom);
     renderer.render(
       canvas,
-      Size(shownWidth, BattleConst.worldH),
+      Size(shownWidth, BattleConst.viewH),
       time,
       // Not the current shooter: an aiming pose is a character concentrating
       // on something off-screen, which is the wrong thing for a menu.

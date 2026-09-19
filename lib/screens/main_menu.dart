@@ -89,16 +89,20 @@ class _MainMenuScreenState extends State<MainMenuScreen> with TickerProviderStat
               ),
               Padding(
                 padding: const EdgeInsets.symmetric(horizontal: 26, vertical: 10),
-                child: LayoutBuilder(
-                  builder: (context, constraints) {
-                    return SingleChildScrollView(
-                      child: ConstrainedBox(
-                        constraints: BoxConstraints(minHeight: constraints.maxHeight),
-                        child: IntrinsicHeight(
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            mainAxisAlignment: MainAxisAlignment.center,
-                            children: [
+                // The whole menu scales to fit whatever it is shown on. A
+                // phone in landscape is short, and the old fixed-size column
+                // ran past its bottom edge — the row of category chips was
+                // cut in half by the screen border. FittedBox shrinks the
+                // column just enough that every one of its rows is on screen
+                // (and lets it grow on bigger windows), which keeps the
+                // layout's proportions instead of reflowing it per device.
+                child: Center(
+                  child: FittedBox(
+                    fit: BoxFit.scaleDown,
+                    alignment: Alignment.centerLeft,
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
                               Text('PHYSICS ARTILLERY · HIGH SEAS',
                                   style: RT.body(size: 11, color: RT.ink.withOpacity(0.55), weight: FontWeight.w800, letterSpacing: 3)),
                               const SizedBox(height: 4),
@@ -149,12 +153,9 @@ class _MainMenuScreenState extends State<MainMenuScreen> with TickerProviderStat
                                   _iconChip('SETTINGS', Icons.settings, const Color(0xFF5C7A85), () => _tap(() => Navigator.push(context, MaterialPageRoute(builder: (_) => const SettingsScreen())))),
                                 ],
                               ),
-                            ],
-                          ),
-                        ),
-                      ),
-                    );
-                  },
+                      ],
+                    ),
+                  ),
                 ),
               ),
             ],

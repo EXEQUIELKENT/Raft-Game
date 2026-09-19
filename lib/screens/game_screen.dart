@@ -298,8 +298,8 @@ class _GameScreenState extends State<GameScreen> {
   /// player edit the raft by touching the raft, rather than by touching a
   /// diagram of it somewhere else on the screen.
   Offset _worldAt(Offset local, Size size) {
-    final scale = size.height / BattleConst.worldH;
-    return Offset(local.dx / scale + ctrl.world.cam, local.dy / scale);
+    final scale = size.height / BattleConst.viewH;
+    return Offset(local.dx / scale + ctrl.world.cam, local.dy / scale + ctrl.world.camY);
   }
 
   /// Places or clears a block from a tap on the raft itself.
@@ -407,8 +407,8 @@ class _GameScreenState extends State<GameScreen> {
   /// it scales the world to the viewport and slides it by the camera.
   Offset _worldFromLocal(Offset local) {
     final screen = MediaQuery.sizeOf(context);
-    final scale = screen.height / BattleConst.worldH;
-    return Offset(local.dx / scale + ctrl.world.cam, local.dy / scale);
+    final scale = screen.height / BattleConst.viewH;
+    return Offset(local.dx / scale + ctrl.world.cam, local.dy / scale + ctrl.world.camY);
   }
 
   /// A gesture the OS interrupts mid-drag must not fire — reset cleanly.
@@ -659,6 +659,17 @@ class _GameScreenState extends State<GameScreen> {
     );
   }
 
+  /// How much the HUD shrinks on a short screen.
+  ///
+  /// A phone held in landscape is 360–400 logical pixels tall, and the HUD
+  /// was drawn at desktop sizes: the fire button alone ate a sixth of the
+  /// screen's height, and the walk pads, weapon chips and readouts squeezed
+  /// the world into a sliver between them. Everything structural below
+  /// scales by this factor — a phone lands around 0.8, tablets and desktop
+  /// windows at 1.0 — so the controls stay thumb-sized without crowding the
+  /// crews off the water.
+  double get _ui => (MediaQuery.sizeOf(context).height / 470).clamp(0.78, 1.0);
+
   Widget _topBar() {
     final save = SaveService.instance.data;
     final me = ctrl.world.raftOf(ctrl.localPlayerIndex);
@@ -668,7 +679,7 @@ class _GameScreenState extends State<GameScreen> {
       child: Row(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          _roundBtn(() => Navigator.pop(context), icon: Icons.arrow_back_ios_new, size: 40),
+          _roundBtn(() => Navigator.pop(context), icon: Icons.arrow_back_ios_new, size: 40 * _ui),
           const SizedBox(width: 10),
           // Player health, at a fixed width and claiming no share of the
           // free space.
@@ -680,7 +691,7 @@ class _GameScreenState extends State<GameScreen> {
           // had nowhere to go but left. The overflow it was guarding against
           // came from the chips anyway, and they scroll now.
           SizedBox(
-            width: 210,
+            width: 210 * _ui,
             child: Container(
             padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
             decoration: RT.pill(opacity: 0.8, radius: 14),
@@ -737,7 +748,7 @@ class _GameScreenState extends State<GameScreen> {
                   const SizedBox(width: 8),
                   Container(
                     padding:
-                        const EdgeInsets.symmetric(horizontal: 12, vertical: 9),
+                        EdgeInsets.symmetric(horizontal: 12 * _ui, vertical: 9 * _ui),
                     decoration: RT.pill(color: RT.yellow, opacity: 1, radius: 13),
                     child: Row(
                       mainAxisSize: MainAxisSize.min,
@@ -747,7 +758,7 @@ class _GameScreenState extends State<GameScreen> {
                         const SizedBox(width: 4),
                         Text('${save.doubloons}',
                             style: RT.body(
-                                size: 12,
+                                size: 12 * _ui,
                                 color: const Color(0xFF6B4A00),
                                 weight: FontWeight.w800)),
                       ],
@@ -768,14 +779,14 @@ class _GameScreenState extends State<GameScreen> {
   }
 
   Widget _infoChip(String text) => Container(
-        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 9),
+        padding: EdgeInsets.symmetric(horizontal: 12 * _ui, vertical: 9 * _ui),
         decoration: RT.pill(opacity: 0.82, radius: 13),
-        child: Text(text, style: RT.body(size: 12, color: RT.ink, weight: FontWeight.w800)),
+        child: Text(text, style: RT.body(size: 12 * _ui, color: RT.ink, weight: FontWeight.w800)),
       );
 
   Widget _bottomBar() {
     return Padding(
-      padding: const EdgeInsets.fromLTRB(16, 0, 16, 14),
+      padding: EdgeInsets.fromLTRB(16, 0, 16, 14 * _ui),
       child: Row(
         crossAxisAlignment: CrossAxisAlignment.end,
         children: [
@@ -854,7 +865,7 @@ class _GameScreenState extends State<GameScreen> {
       child: Opacity(
         opacity: enabled ? 1 : 0.45,
         child: Container(
-          padding: const EdgeInsets.symmetric(horizontal: 13, vertical: 9),
+          padding: EdgeInsets.symmetric(horizontal: 13 * _ui, vertical: 9 * _ui),
           decoration: selected
               ? RT.card(color: RT.orange, radius: 16, border: 0)
               : RT.pill(opacity: 0.9, radius: 16),
@@ -862,8 +873,8 @@ class _GameScreenState extends State<GameScreen> {
             mainAxisSize: MainAxisSize.min,
             children: [
               Container(
-                width: 22,
-                height: 22,
+                width: 22 * _ui,
+                height: 22 * _ui,
                 decoration: BoxDecoration(color: w.color, shape: BoxShape.circle),
               ),
               const SizedBox(width: 8),
@@ -905,11 +916,11 @@ class _GameScreenState extends State<GameScreen> {
         _roundBtn(() => ctrl.nudgePower(1), icon: Icons.add),
         const SizedBox(width: 10),
         Container(
-          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 11),
+          padding: EdgeInsets.symmetric(horizontal: 16, vertical: 11 * _ui),
           decoration: RT.pill(color: RT.ink, opacity: 0.58, radius: 16),
           child: Text(
             ctrl.statusMessage.isEmpty ? 'Pull back and release' : ctrl.statusMessage,
-            style: RT.body(size: 13, color: Colors.white, weight: FontWeight.w800),
+            style: RT.body(size: 13 * _ui, color: Colors.white, weight: FontWeight.w800),
           ),
         ),
       ],
@@ -939,8 +950,8 @@ class _GameScreenState extends State<GameScreen> {
           },
           child: Container(
             key: dir < 0 ? _walkBarKey : null,
-            width: 52,
-            height: 46,
+            width: 52 * _ui,
+            height: 46 * _ui,
             alignment: Alignment.center,
             decoration: RT.pill(
               color: ctrl.walkDir == dir ? RT.orange : RT.ink,
@@ -948,7 +959,7 @@ class _GameScreenState extends State<GameScreen> {
               radius: 14,
             ),
             child: Text(glyph,
-                style: RT.chunky(size: 22, color: Colors.white)),
+                style: RT.chunky(size: 22 * _ui, color: Colors.white)),
           ),
         );
 
@@ -1006,8 +1017,8 @@ class _GameScreenState extends State<GameScreen> {
       },
       child: Container(
         key: _fireBtnKey,
-        width: 96,
-        height: 64,
+        width: 96 * _ui,
+        height: 64 * _ui,
         alignment: Alignment.center,
         decoration: RT.pill(
           color: live ? RT.orange : RT.ink,
@@ -1017,7 +1028,7 @@ class _GameScreenState extends State<GameScreen> {
         child: Text(
           'FIRE',
           style: RT.chunky(
-            size: 21,
+            size: 21 * _ui,
             color: live ? Colors.white : Colors.white.withOpacity(0.5),
           ),
         ),
@@ -1049,14 +1060,14 @@ class _GameScreenState extends State<GameScreen> {
         setState(() {});
       },
       child: Container(
-        width: size,
-        height: size,
+        width: size * _ui,
+        height: size * _ui,
         alignment: Alignment.center,
         decoration: RT.pill(opacity: 0.85, radius: 12),
         child: icon != null
-            ? Icon(icon, size: size * 0.62, color: RT.ink)
+            ? Icon(icon, size: size * _ui * 0.62, color: RT.ink)
             : Text(glyph!,
-                style: RT.chunky(size: size * 0.42, color: RT.ink)),
+                style: RT.chunky(size: size * _ui * 0.42, color: RT.ink)),
       ),
     );
   }
@@ -1070,8 +1081,9 @@ class _GameScreenState extends State<GameScreen> {
   Widget _pullReadout() {
     final raft = ctrl.currentRaft;
     final screen = MediaQuery.sizeOf(context);
-    final scale = screen.height / BattleConst.worldH;
+    final scale = screen.height / BattleConst.viewH;
     final cam = ctrl.world.cam;
+    final camY = ctrl.world.camY;
     // Anchor on the shooter's head — a little above-and-left of the crew
     // member currently taking the turn.
     double worldX = 0, worldY = 0;
@@ -1081,11 +1093,11 @@ class _GameScreenState extends State<GameScreen> {
       worldY = head.dy;
     }
     final sx = (worldX - cam) * scale;
-    final sy = worldY * scale;
+    final sy = (worldY - camY) * scale;
     // Compact card — it floats over the action, so it stays small and never
     // covers the shooter or the pull gesture.
-    final cardW = 152.0;
-    final cardH = 50.0;
+    final cardW = 152.0 * _ui;
+    final cardH = 50.0 * _ui;
     final left = (sx - cardW + 8).clamp(8.0, (screen.width - cardW - 8).clamp(8.0, screen.width));
     final top = (sy - cardH - 10).clamp(8.0, screen.height - cardH - 8);
     return Positioned(

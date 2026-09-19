@@ -40,6 +40,15 @@ class BattleConst {
   static const double worldH = 422;
   static const double waterY = 300;
 
+  /// Height of the visible window, in world units.
+  ///
+  /// The renderer does not fit the whole [worldH] to the screen any more: the
+  /// top of the world is dead sky that nothing occupies, and fitting it
+  /// shrank every character on the screen. The camera frames this band
+  /// instead — which draws the crews and rafts about a fifth larger — and
+  /// [BattleWorld.camY] slides the band to keep the action in it.
+  static const double viewH = 350;
+
   /// Design-space gravity and velocity scale, per 60Hz frame.
   ///
   /// [velScale] is set so the nearest enemy slot is comfortably in reach at
@@ -2817,8 +2826,25 @@ class BattleWorld {
   double cam = 0;
 
   /// Width of the visible window in world units. Set by the renderer/screen
-  /// from the device aspect ratio so the 422 world height always fits.
+  /// from the device aspect ratio so [BattleConst.viewH] of world height
+  /// always fits.
   double viewWidth = 870;
+
+  /// Vertical camera offset — the world-y sitting at the top of the visible
+  /// window.
+  ///
+  /// The horizontal camera pans in x only, but the sea is terraced: with the
+  /// window pinned to the world's absolute coordinates, a raft on a raised
+  /// terrace rode up the screen toward the HUD and dropped back down as the
+  /// camera came home — the whole view seeming to climb and sink with the
+  /// map. This offset does deliberately what that did accidentally: it eases
+  /// so the camera anchor's own waterline holds a steady place on screen,
+  /// which keeps the crews framed at the same height whatever terrace they
+  /// stand on, and the elevation is then read from the water beside them
+  /// rather than from everything drifting. Eased, not snapped, so crossing a
+  /// falls reads as a gentle tilt of the view. See [_easeCamY].
+  double camY = 0;
+  bool _camYSet = false;
 
   /// Whose raft the camera is locked to. Shots are lobbed blind, so the view
   /// belongs to whoever is firing — never to their target.
@@ -4317,6 +4343,7 @@ class BattleWorld {
       effects.removeRange(0, effects.length - 60);
     }
     shake = max(0, shake - dt * BattleConst.shakeDecay);
+    _easeCamY(dt);
     _stepObstacles(dt);
 
     _bodyAccum += dt;
@@ -4332,6 +4359,65 @@ class BattleWorld {
       _bodySlams();
       _stepBodies();
     }
+  }
+
+  /// Eases the vertical camera so the view keeps the crews framed on a
+  /// terraced sea.
+  ///
+  /// Two wants, resolved in this order:
+  ///
+  ///  1. The camera anchor's own waterline sits about two thirds of the way
+  ///     down the window, so their deck and crew have sky to work in and the
+  ///     shooter never slides up behind the top HUD just because the map put
+  ///     them on a high terrace.
+  ///  2. The lowest water in frame stays visible: when the anchor is up high
+  ///     and the window reaches across a falls, the sea below would otherwise
+  ///     slide off the bottom edge, and the impact of a shot lobbed down onto
+  ///     it would happen off-screen.
+  ///
+  /// When the two wants conflict — a tall drop across a narrow window cannot
+  /// have both — the second wins by taking whichever target sits LOWER (the
+  /// larger offset), which shows more of the drop and leaves the anchor a
+  /// little above its ideal line rather than hiding the water it is firing
+  /// into. The window may lean a little way past either world edge: above the
+  /// top is empty sky (the gradient clamps), below the bottom is deep water.
+  ///
+  /// The first call snaps rather than eases, so a match that opens on a
+  /// raised terrace does not start with a visible slide into place.
+  void _easeCamY(double dt) {
+    ensureCamY();
+    final target = _camYTarget();
+    camY += (target - camY) * (dt * 2.5).clamp(0.0, 1.0);
+  }
+
+  /// Places the vertical camera on its target if it has never been placed.
+  ///
+  /// Called by the renderer before it paints, not only by the tick: the very
+  /// first painted frame — and any frame in a layout-only environment where
+  /// the tick never runs with a non-zero dt — must already frame the action,
+  /// or everything drawn (and every tap inverse-mapped back to the world)
+  /// sits 70-odd units too low, straight into the build bar.
+  void ensureCamY() {
+    if (_camYSet) return;
+    _camYSet = true;
+    camY = _camYTarget();
+  }
+
+  /// Where the vertical camera wants to be right now. See [_easeCamY] for
+  /// how the two wants inside it are weighed.
+  double _camYTarget() {
+    final anchor = raftOf(camAnchor);
+    final centreX = anchor?.x ?? (cam + viewWidth / 2);
+    final focus = waterAt(centreX);
+    var target = focus - BattleConst.viewH * 0.62;
+
+    var lowest = focus;
+    for (double x = cam; x <= cam + viewWidth + 60; x += 120) {
+      final y = waterAt(x);
+      if (y > lowest) lowest = y;
+    }
+    target = max(target, lowest - BattleConst.viewH * 0.94);
+    return target.clamp(-60.0, BattleConst.worldH - BattleConst.viewH);
   }
 
   /// One 60Hz tick of every crew body on the water.

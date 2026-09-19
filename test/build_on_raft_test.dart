@@ -71,14 +71,15 @@ void main() {
   /// The screen point that sits on cell [col]/[row] of [raft], inverting the
   /// painter's transform exactly as the game screen does.
   Offset screenFor(GameController ctrl, Raft raft, int col, int row) {
-    final scale = phone.height / BattleConst.worldH;
+    final scale = phone.height / BattleConst.viewH;
     final deckTop = raft.waterLine - raft.loadout.deckRise;
     final wx = raft.x + BuildPlan.columnX(col);
     final wy = deckTop -
         row * BuildPlan.cellH -
         BuildPlan.cellH / 2 +
         ctrl.world.bobOf(raft);
-    return Offset((wx - ctrl.world.cam) * scale, wy * scale);
+    return Offset(
+        (wx - ctrl.world.cam) * scale, (wy - ctrl.world.camY) * scale);
   }
 
   group('The raft is the editor', () {

@@ -19,9 +19,12 @@ import 'weapon_views.dart';
 /// big-headed crew sitting on their rafts.
 ///
 /// The world is [BattleConst.worldW] x [BattleConst.worldH] in design units.
-/// The canvas is scaled so the full world height always fits the screen, and
-/// panned horizontally by the camera — which is why the visible width varies
-/// with device aspect and is fed back into the world as `viewWidth`.
+/// The canvas is scaled so [BattleConst.viewH] of that height fills the
+/// screen — the dead sky above the band is cropped, which is what keeps the
+/// crews a decent size on a short screen — and the view is panned by the
+/// camera in x (fed back into the world as `viewWidth`, so the visible width
+/// varies with device aspect) and in y ([BattleWorld.camY], which holds the
+/// camera anchor's waterline steady on terraced seas).
 /// ---------------------------------------------------------------------------
 
 /// How a drawn fist closes on the part it holds — see [_gripFist].
@@ -68,13 +71,16 @@ class WorldRenderer {
     // route transition, or while a parent is between measurements. Skipping
     // that frame costs nothing and cannot corrupt anything.
     if (size.width <= 0 || size.height <= 0) return;
-    final scale = size.height / BattleConst.worldH;
+    // The vertical camera must be on its target before anything is mapped:
+    // see [BattleWorld.ensureCamY].
+    world.ensureCamY();
+    final scale = size.height / BattleConst.viewH;
     world.viewWidth = size.width / scale;
     if (!_decorBuilt) _buildDecor();
 
     canvas.save();
     canvas.scale(scale);
-    canvas.translate(-world.cam, 0);
+    canvas.translate(-world.cam, -world.camY);
 
     // Screen shake: whole-scene jitter from impacts, while the world's
     // shake energy decays. Two detuned sines read as a camera rattle rather
@@ -197,7 +203,13 @@ class WorldRenderer {
   }
 
   void _drawSky(Canvas canvas, double time) {
-    final rect = Rect.fromLTWH(world.cam - 40, 0, world.viewWidth + 80, BattleConst.waterY + 4);
+    // The window can lean above the world's top edge when the camera anchor
+    // stands on a high terrace, and the gradient clamps there, so the sky is
+    // drawn from wherever the view actually starts rather than from the
+    // world's own top.
+    final top = min(0.0, world.camY) - 40;
+    final rect = Rect.fromLTWH(
+        world.cam - 40, top, world.viewWidth + 80, BattleConst.waterY + 4 - top);
     canvas.drawRect(
       rect,
       _bandPaint(_skyPaint, 0, BattleConst.waterY + 4, map.sky,
@@ -210,20 +222,25 @@ class WorldRenderer {
       // Slow horizontal drift, wrapped so clouds never run out.
       final x = (c.x + time * c.speed) % (BattleConst.worldW + 400) - 200;
       if (!_visible(x + c.w * 0.5, c.w)) continue;
+      // The clouds ride the vertical camera as well: the window slides up
+      // and down over terraced seas, and decor pinned to the world's own
+      // coordinates would be cropped away by the very move that keeps the
+      // crews framed.
+      final y = world.camY + c.y * 0.8;
       final paint = Paint()..color = Colors.white.withOpacity(c.opacity);
       final h = c.w * 0.34;
       canvas.drawRRect(
-        RRect.fromRectAndRadius(Rect.fromLTWH(x, c.y, c.w * 0.62, h), Radius.circular(h)),
+        RRect.fromRectAndRadius(Rect.fromLTWH(x, y, c.w * 0.62, h), Radius.circular(h)),
         paint,
       );
       canvas.drawRRect(
         RRect.fromRectAndRadius(
-            Rect.fromLTWH(x + c.w * 0.3, c.y - h * 0.34, c.w * 0.5, h * 0.9), Radius.circular(h)),
+            Rect.fromLTWH(x + c.w * 0.3, y - h * 0.34, c.w * 0.5, h * 0.9), Radius.circular(h)),
         paint,
       );
       canvas.drawRRect(
         RRect.fromRectAndRadius(
-            Rect.fromLTWH(x + c.w * 0.6, c.y - h * 0.1, c.w * 0.42, h * 0.75), Radius.circular(h)),
+            Rect.fromLTWH(x + c.w * 0.6, y - h * 0.1, c.w * 0.42, h * 0.75), Radius.circular(h)),
         paint,
       );
     }
@@ -4909,10 +4926,10 @@ class WorldRenderer {
   /// pass so they sit above the rafts.
   void drawTrajectory(Canvas canvas, Size size, List<TrajectoryDot> dots, {required bool charging}) {
     if (dots.isEmpty) return;
-    final scale = size.height / BattleConst.worldH;
+    final scale = size.height / BattleConst.viewH;
     canvas.save();
     canvas.scale(scale);
-    canvas.translate(-world.cam, 0);
+    canvas.translate(-world.cam, -world.camY);
     for (final d in dots) {
       canvas.drawCircle(
         d.pos,
