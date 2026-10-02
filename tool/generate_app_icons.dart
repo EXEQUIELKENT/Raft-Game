@@ -1,4 +1,5 @@
 import 'dart:io';
+import 'dart:typed_data';
 import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
@@ -52,6 +53,47 @@ void main() {
     print('wrote $path (${size}px, ${bytes.lengthInBytes ~/ 1024}kb)');
   }
 
+  // Writes a single-image .ico: a 6-byte directory header, one 16-byte
+  // directory entry, then a PNG. Windows has embedded PNGs in .ico files
+  // since Vista and scales them down for the smaller window and taskbar
+  // sizes, so one crisp 256px entry is all the runner manifest needs.
+  Future<void> writeIco(
+    String path,
+    int size,
+    void Function(Canvas, double) paint,
+  ) async {
+    final rec = ui.PictureRecorder();
+    paint(Canvas(rec), size.toDouble());
+    final img = await rec.endRecording().toImage(size, size);
+    final bytes = await img.toByteData(format: ui.ImageByteFormat.png);
+    final png = bytes!.buffer.asUint8List();
+
+    final out = BytesBuilder();
+    out.add((ByteData(6)
+          ..setUint16(0, 0, Endian.little) // reserved
+          ..setUint16(2, 1, Endian.little) // type: icon
+          ..setUint16(4, 1, Endian.little)) // one image
+        .buffer
+        .asUint8List());
+    out.add((ByteData(16)
+          ..setUint8(0, size == 256 ? 0 : size) // width, 0 means 256
+          ..setUint8(1, size == 256 ? 0 : size) // height
+          ..setUint8(2, 0) // palette size: none
+          ..setUint8(3, 0) // reserved
+          ..setUint16(4, 1, Endian.little) // colour planes
+          ..setUint16(6, 32, Endian.little) // bits per pixel
+          ..setUint32(8, png.length, Endian.little) // image bytes
+          ..setUint32(12, 22, Endian.little)) // image offset
+        .buffer
+        .asUint8List());
+    out.add(png);
+    final file = File(path);
+    await file.create(recursive: true);
+    await file.writeAsBytes(out.takeBytes());
+    // ignore: avoid_print
+    print('wrote $path (${size}px PNG-in-ICO)');
+  }
+
   test('generate', () async {
     const res = 'android/app/src/main/res';
 
@@ -68,7 +110,7 @@ void main() {
 
     // The adaptive icon descriptors, and the background colour they point at.
     const bg = AppIcon.adaptiveBackground;
-    final hex = bg.value.toRadixString(16).padLeft(8, '0').toUpperCase();
+    final hex = bg.toARGB32().toRadixString(16).padLeft(8, '0').toUpperCase();
     File('$res/values/ic_launcher_background.xml')
       ..createSync(recursive: true)
       ..writeAsStringSync('<?xml version="1.0" encoding="utf-8"?>\n'
@@ -87,6 +129,25 @@ void main() {
         ..createSync(recursive: true)
         ..writeAsStringSync(xml);
     }
+    // The in-repo reference icon, the Windows runner icon and the web
+    // favicon all come from the same painter, so no platform can drift
+    // into looking like a different game.
+    await write(
+      'assets/icon/app_icon.png',
+      512,
+      (c, s) => AppIcon.paintLegacy(c, s),
+    );
+    await write(
+      'web/favicon.png',
+      64,
+      (c, s) => AppIcon.paintLegacy(c, s),
+    );
+    await writeIco(
+      'windows/runner/resources/app_icon.ico',
+      256,
+      (c, s) => AppIcon.paintLegacy(c, s),
+    );
+
     // ignore: avoid_print
     print('wrote adaptive-icon descriptors');
   });
