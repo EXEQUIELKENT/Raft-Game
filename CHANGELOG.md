@@ -1,5 +1,15 @@
 # Changelog
 
+## [1.1.2](https://github.com/EXEQUIELKENT/Raft-Game/compare/raft_rumble-v1.1.1...raft_rumble-v1.1.2) (2026-10-05)
+
+
+### Bug Fixes
+
+* Add terraced camera and responsive battle HUD ([218cbca](https://github.com/EXEQUIELKENT/Raft-Game/commit/218cbca61a39376457abac938a61f48eb11d7010))
+* Refresh game app icon set ([a43a2bc](https://github.com/EXEQUIELKENT/Raft-Game/commit/a43a2bc256d20be8ee38bba9f5c8f27a733952d8))
+* Refresh game app icon set ([3c5ed6a](https://github.com/EXEQUIELKENT/Raft-Game/commit/3c5ed6a348d1153fc2f72f2ac182cd8e3d6d2b37))
+* Update app_icon.dart ([60db087](https://github.com/EXEQUIELKENT/Raft-Game/commit/60db087a14d6dc243614e69e055661837ad4fcd5))
+
 ## [1.1.1](https://github.com/EXEQUIELKENT/Raft-Game/compare/raft_rumble-v1.1.0...raft_rumble-v1.1.1) (2026-09-19)
 
 
