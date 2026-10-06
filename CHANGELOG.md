@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.1.3](https://github.com/EXEQUIELKENT/Raft-Game/compare/raft_rumble-v1.1.2...raft_rumble-v1.1.3) (2026-10-06)
+
+
+### Bug Fixes
+
+* Refresh game app icon set ([c8c2d2c](https://github.com/EXEQUIELKENT/Raft-Game/commit/c8c2d2caaf026b88332e105d1b54d3105f6e8dc7))
+* Update app_icon.dart ([b76eeae](https://github.com/EXEQUIELKENT/Raft-Game/commit/b76eeae4ff0ed65c12c0c498a9e5841141154cef))
+
 ## [1.1.2](https://github.com/EXEQUIELKENT/Raft-Game/compare/raft_rumble-v1.1.1...raft_rumble-v1.1.2) (2026-10-05)
 
 
