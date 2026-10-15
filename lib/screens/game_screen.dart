@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
@@ -9,6 +11,7 @@ import '../game/controller.dart';
 import '../game/models.dart';
 import '../game/renderer.dart';
 import '../game/save.dart';
+import '../game/tutorial.dart';
 import '../theme.dart';
 import '../widgets/build_overlay.dart';
 
@@ -95,6 +98,14 @@ class _GameScreenState extends State<GameScreen> {
   int? _campaignStars;
   int? _campaignReward;
 
+  /// First-run lesson state. Present only when this match was launched as a
+  /// tutorial ([MatchSettings.tutorial]): the script the card shows, the
+  /// solved hint for the final step, and the first-completion reward once
+  /// the practice raft goes down.
+  TutorialProgress? _tutorial;
+  ({double angle, double power})? _tutorialHint;
+  int _tutorialReward = 0;
+
   /// How many battle screens are currently alive.
   ///
   /// Advancing to the next campaign level is a [Navigator.pushReplacement],
@@ -123,6 +134,12 @@ class _GameScreenState extends State<GameScreen> {
         );
     renderer = WorldRenderer(ctrl.world, map: ctrl.settings.map);
     ctrl.addListener(_onUpdate);
+    if (widget.settings.tutorial) {
+      _tutorial = TutorialProgress();
+      // Solved from the live match, so the hint matches the player's own
+      // hull and the fixed tutorial seed makes it the same numbers always.
+      _tutorialHint = solveTutorialShot(ctrl);
+    }
   }
 
   @override
@@ -222,6 +239,9 @@ class _GameScreenState extends State<GameScreen> {
     final power = ctrl.aimPower.round();
     final enteringGameOver = _lastPhase != GamePhase.gameOver && ctrl.phase == GamePhase.gameOver;
 
+    var tutorialDirty = false;
+    if (_tutorial != null && !_tutorial!.completed) tutorialDirty = _trackTutorial();
+
     final dirty = _lastPhase != ctrl.phase ||
         _lastPlayer != ctrl.currentPlayer ||
         _lastTurnSec != turnSec ||
@@ -231,7 +251,8 @@ class _GameScreenState extends State<GameScreen> {
         _lastPower != power ||
         _lastWeapon != ctrl.selectedWeaponId ||
         _charging ||
-        hpChanged;
+        hpChanged ||
+        tutorialDirty;
 
     if (dirty) {
       _lastPhase = ctrl.phase;
@@ -248,19 +269,68 @@ class _GameScreenState extends State<GameScreen> {
     if (enteringGameOver && widget.campaignLevel != null) _recordCampaignResult();
   }
 
+  /// Feeds the tutorial script from the running match. Every fired shot is
+  /// accounted for in order (the aim readout still holds the fired values
+  /// when the update runs), the sinking step trips when the practice raft
+  /// goes down, and a player victory completes the lesson whatever step is
+  /// showing. Returns true when the card needs repainting.
+  bool _trackTutorial() {
+    final t = _tutorial!;
+    var changed = false;
+    while (t.shotsSeen < ctrl.shotsFired) {
+      t.shotsSeen++;
+      if (t.noteShotFired(ctrl.aimPower)) changed = true;
+    }
+    if (t.step == TutorialStep.sink && !(ctrl.world.raftOf(1)?.alive ?? true)) {
+      if (t.noteTargetSunk()) changed = true;
+    }
+    if (ctrl.phase == GamePhase.gameOver && ctrl.winner == 0) {
+      if (t.noteVictory()) {
+        changed = true;
+        unawaited(_completeTutorial());
+      }
+    }
+    return changed;
+  }
+
+  Future<void> _completeTutorial() async {
+    _tutorialReward = await Tutorial.complete();
+    if (mounted) setState(() {});
+  }
+
   void _recordCampaignResult() {
     final level = widget.campaignLevel;
     if (level == null || ctrl.winner != 0) return; // only victories earn stars
     final me = ctrl.world.raftOf(0);
-    final frac = me?.hpFrac ?? 0.0;
-    final stars = Campaign.starsForHpFraction(frac);
-    final reward = SaveService.instance.recordCampaignLevel(level: level, stars: stars);
+    final breakTotal = ctrl.world.breakablesTotal;
+    final result = Campaign.starsForResult(
+      level,
+      rounds: ctrl.round,
+      weaponsFired: ctrl.humanWeaponsUsed,
+      flawless: me != null && me.living.length == me.crew.length,
+      breakFraction:
+          breakTotal == 0 ? 0 : ctrl.world.breakablesBroken / breakTotal,
+    );
+    final reward =
+        SaveService.instance.recordCampaignLevel(level: level, stars: result.stars);
     if (!mounted) return;
     setState(() {
-      _campaignStars = stars;
+      _campaignStars = result.stars;
       _campaignReward = reward;
+      _starRoundsMet = result.roundsMet;
+      _starRounds = ctrl.round;
+      _starRoundTarget = level.star2Rounds;
+      _starObjectiveMet = result.objectiveMet;
+      _starObjectiveLabel = level.star3.title;
     });
   }
+
+  // Per-objective breakdown for the result panel's star rows.
+  bool _starRoundsMet = false;
+  int _starRounds = 0;
+  int _starRoundTarget = 0;
+  bool _starObjectiveMet = false;
+  String _starObjectiveLabel = '';
 
   // ---------------------------------------------------------------------------
   // Input
@@ -499,6 +569,10 @@ class _GameScreenState extends State<GameScreen> {
               // build screen unreadable and let a stray tap drive the match
               // instead of the raft.
               if (!_building) SafeArea(child: _buildHud()),
+              if (_tutorial != null &&
+                  !_tutorial!.completed &&
+                  ctrl.phase != GamePhase.gameOver)
+                _buildTutorialCard(),
               if (ctrl.net?.isNetworked ?? false) _chatOverlay(),
               if (ctrl.phase == GamePhase.aiming && ctrl.canHumanAct)
                 _pullReadout(),
@@ -623,6 +697,85 @@ class _GameScreenState extends State<GameScreen> {
     'Ouch!',
     'My turn',
   ];
+  // ---------------------------------------------------------------------------
+  // Tutorial script card
+  // ---------------------------------------------------------------------------
+
+  /// The lesson card for a tutorial match: which step is showing, what to do,
+  /// and the solved hint on the final step. Sits top-centre, clear of the
+  /// health bar (left) and the foe marker (right).
+  Widget _buildTutorialCard() {
+    final t = _tutorial!;
+    final stepIndex = TutorialStep.values.indexOf(t.step);
+    final hint = _tutorialHint;
+    final String body;
+    switch (t.step) {
+      case TutorialStep.shoot:
+        body = 'Pull back on the water, then release — fire your first shot anywhere.';
+      case TutorialStep.power:
+        body =
+            'Power is range. Pull further back and fire a shot over ${TutorialConfig.powerThreshold.round()}% power.';
+      case TutorialStep.sink:
+        body = hint == null
+            ? 'Lob over the rock and sink the practice raft.'
+            : 'Lob over the rock and sink the practice raft. Try about ${hint.angle.round()}° and ${hint.power.round()}% power.';
+    }
+    return Positioned(
+      top: 74,
+      left: 0,
+      right: 0,
+      child: Center(
+        child: Container(
+          constraints: const BoxConstraints(maxWidth: 430),
+          margin: const EdgeInsets.symmetric(horizontal: 90),
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+          decoration: RT.pill(color: RT.ink, opacity: 0.78, radius: 16),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text('LEARN THE ROPES',
+                      style: RT.body(
+                          size: 10,
+                          color: RT.yellow,
+                          weight: FontWeight.w800,
+                          letterSpacing: 2)),
+                  const SizedBox(width: 10),
+                  for (int i = 0; i < TutorialStep.values.length; i++)
+                    Padding(
+                      padding: const EdgeInsets.only(left: 4),
+                      child: Icon(
+                        i < stepIndex
+                            ? Icons.check_circle
+                            : (i == stepIndex
+                                ? Icons.radio_button_checked
+                                : Icons.radio_button_unchecked),
+                        size: 13,
+                        color: i <= stepIndex ? RT.yellow : Colors.white.withOpacity(0.45),
+                      ),
+                    ),
+                  const SizedBox(width: 10),
+                  Text('STEP ${stepIndex + 1} OF ${TutorialStep.values.length}',
+                      style: RT.body(
+                          size: 10,
+                          color: Colors.white.withOpacity(0.7),
+                          weight: FontWeight.w800,
+                          letterSpacing: 1.2)),
+                ],
+              ),
+              const SizedBox(height: 4),
+              Text(body,
+                  textAlign: TextAlign.center,
+                  style: RT.body(size: 12, color: Colors.white, weight: FontWeight.w700)),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
   Widget _buildHud() {
     return Column(
       children: [
@@ -744,7 +897,14 @@ class _GameScreenState extends State<GameScreen> {
                   _infoChip(
                       'ANGLE ${ctrl.aimAngle.round()}° · PWR ${ctrl.aimPower.round()}%'),
                   const SizedBox(width: 8),
+                  _windChip(),
+                  const SizedBox(width: 8),
                   _infoChip('${_levelLabel()} · ${ctrl.foesLeft} CREW LEFT'),
+                  if (ctrl.settings.roundLimit > 0) ...[
+                    const SizedBox(width: 8),
+                    _infoChip(
+                        'SURVIVE ${ctrl.round}/${ctrl.settings.roundLimit}'),
+                  ],
                   const SizedBox(width: 8),
                   Container(
                     padding:
@@ -783,6 +943,40 @@ class _GameScreenState extends State<GameScreen> {
         decoration: RT.pill(opacity: 0.82, radius: 13),
         child: Text(text, style: RT.body(size: 12 * _ui, color: RT.ink, weight: FontWeight.w800)),
       );
+
+  /// This turn's wind: an arrow for the direction and a 1–5 strength number.
+  /// Positive wind blows seaward (+x, downrange for the player); negative
+  /// blows back landward. Calm air shows no arrow at all — just the word.
+  /// A storm flies its own icon: the gusts run past the ordinary cap, so
+  /// the number alone would undersell it.
+  Widget _windChip() {
+    final w = ctrl.world.wind;
+    final calm = Wind.calm(w);
+    final storm = ctrl.world.storm;
+    return Container(
+      padding: EdgeInsets.symmetric(horizontal: 12 * _ui, vertical: 9 * _ui),
+      decoration: RT.pill(
+          color: calm && !storm ? Colors.white : RT.sea2,
+          opacity: 0.85,
+          radius: 13),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          if (storm)
+            Icon(Icons.thunderstorm, size: 14 * _ui, color: Colors.white)
+          else if (!calm)
+            Icon(w > 0 ? Icons.arrow_forward : Icons.arrow_back,
+                size: 14 * _ui, color: Colors.white),
+          if (!calm || storm) SizedBox(width: 4 * _ui),
+          Text(calm && !storm ? 'CALM' : '${storm ? 'STORM ' : 'WIND '}${Wind.pips(w)}',
+              style: RT.body(
+                  size: 12 * _ui,
+                  color: calm && !storm ? RT.ink : Colors.white,
+                  weight: FontWeight.w800)),
+        ],
+      ),
+    );
+  }
 
   Widget _bottomBar() {
     return Padding(
@@ -1151,13 +1345,19 @@ class _GameScreenState extends State<GameScreen> {
     final seat = ctrl.localPlayerIndex;
     final won = ctrl.winner == seat && !ctrl.players[seat].isAi;
     final level = widget.campaignLevel;
-    final kicker = level != null
-        ? (won ? 'BATTLE ${level.indexInWorld + 1} CLEARED' : 'RAFT SUNK')
-        : (won ? 'VICTORY' : 'DEFEAT');
-    final title = level != null
-        ? (won ? '${level.captainName} defeated!' : 'Sunk by ${level.captainName}')
-        : (won ? 'You rule the water' : 'Bail out and retry');
+    final isTutorial = widget.settings.tutorial;
+    final kicker = isTutorial
+        ? (won ? 'TRAINING COMPLETE' : 'TARGET STILL FLOATING')
+        : level != null
+            ? (won ? 'BATTLE ${level.indexInWorld + 1} CLEARED' : 'RAFT SUNK')
+            : (won ? 'VICTORY' : 'DEFEAT');
+    final title = isTutorial
+        ? (won ? 'You sunk the practice raft!' : 'Give it another go')
+        : level != null
+            ? (won ? '${level.captainName} defeated!' : 'Sunk by ${level.captainName}')
+            : (won ? 'You rule the water' : 'Bail out and retry');
     final showReward = level != null && won && _campaignReward != null;
+    final showTutorialReward = isTutorial && won && _tutorialReward > 0;
 
     return Container(
       color: Colors.black.withOpacity(0.72),
@@ -1186,6 +1386,13 @@ class _GameScreenState extends State<GameScreen> {
                           color: RT.yellow, size: 28),
                   ],
                 ),
+                const SizedBox(height: 8),
+                _objectiveRow(
+                  'WIN IN $_starRoundTarget ROUNDS ($_starRounds)',
+                  _starRoundsMet,
+                ),
+                const SizedBox(height: 4),
+                _objectiveRow(_starObjectiveLabel, _starObjectiveMet),
               ],
               const SizedBox(height: 16),
               Row(
@@ -1197,12 +1404,18 @@ class _GameScreenState extends State<GameScreen> {
                     const SizedBox(width: 10),
                     Expanded(child: _statTile('+$_campaignReward', 'COINS', gold: true)),
                   ],
+                  if (showTutorialReward) ...[
+                    const SizedBox(width: 10),
+                    Expanded(child: _statTile('+$_tutorialReward', 'COINS', gold: true)),
+                  ],
                 ],
               ),
               const SizedBox(height: 14),
               _xpPanel(),
               const SizedBox(height: 14),
-              if (level != null) ..._campaignButtons(level, won) else ..._quickButtons(),
+              if (isTutorial) ..._tutorialButtons(won)
+              else if (level != null) ..._campaignButtons(level, won)
+              else ..._quickButtons(),
             ],
           ),
         ),
@@ -1292,6 +1505,25 @@ class _GameScreenState extends State<GameScreen> {
     );
   }
 
+  /// One star-objective line on the result panel: what the star wanted and
+  /// whether this victory earned it.
+  Widget _objectiveRow(String label, bool met) {
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Icon(met ? Icons.check_circle : Icons.cancel,
+            size: 15, color: met ? RT.green : RT.ink.withOpacity(0.35)),
+        const SizedBox(width: 6),
+        Text(label,
+            style: RT.body(
+                size: 10,
+                color: met ? RT.ink : RT.ink.withOpacity(0.5),
+                weight: FontWeight.w800,
+                letterSpacing: 0.8)),
+      ],
+    );
+  }
+
   Widget _statTile(String value, String label, {bool gold = false}) {
     return Container(
       padding: const EdgeInsets.symmetric(vertical: 12),
@@ -1314,8 +1546,43 @@ class _GameScreenState extends State<GameScreen> {
     );
   }
 
-  List<Widget> _quickButtons() => [
+  /// The lesson is over: replay it, or head out. No campaign navigation —
+  /// a tutorial has no next level — and no rematch negotiation either,
+  /// because there is nobody on the other end of the wire.
+  List<Widget> _tutorialButtons(bool won) => [
         ChunkyButton(
+          label: won ? 'PLAY AGAIN' : 'TRY AGAIN',
+          icon: Icons.refresh,
+          color: RT.orange,
+          width: 240,
+          height: 52,
+          fontSize: 18,
+          onPressed: () {
+            AudioService.instance.sfx('click');
+            final (settings, players) = Tutorial.match();
+            Navigator.pushReplacement(
+              context,
+              MaterialPageRoute(
+                builder: (_) => GameScreen(
+                    settings: settings,
+                    players: players,
+                    mode: GameMode.vsAi,
+                    seed: TutorialConfig.seed),
+              ),
+            );
+          },
+        ),
+        const SizedBox(height: 10),
+        ChunkyButton(
+          label: 'MAIN MENU', icon: Icons.home, color: RT.blue, width: 240, height: 48, fontSize: 16,
+          onPressed: () {
+            AudioService.instance.sfx('click');
+            Navigator.pop(context);
+          },
+        ),
+      ];
+
+  List<Widget> _quickButtons() => [        ChunkyButton(
           label: 'REMATCH', icon: Icons.refresh, color: RT.orange, width: 240, height: 52, fontSize: 18,
           onPressed: _rematch,
         ),

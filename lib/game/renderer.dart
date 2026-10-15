@@ -109,6 +109,7 @@ class WorldRenderer {
     }
     if (!skipLayers.contains('shot')) _drawShot(canvas);
     if (!skipLayers.contains('effects')) _drawEffects(canvas);
+    if (world.storm && !skipLayers.contains('effects')) _drawRain(canvas, time);
 
     canvas.restore();
   }
@@ -126,6 +127,29 @@ class WorldRenderer {
   ///
   /// Empty for an ordinary battle frame.
   Set<String> skipLayers = const {};
+
+  /// Driving rain for a storm match: slanted streaks falling across the
+  /// visible window, leaning with the turn's wind. Positions are a pure
+  /// function of the drop index and time — no RNG, no shimmer — drawn over
+  /// everything so the weather reads even mid-flight.
+  void _drawRain(Canvas canvas, double time) {
+    final paint = Paint()
+      ..color = const Color(0xFFBFD9E8).withOpacity(0.5)
+      ..strokeWidth = 2
+      ..strokeCap = StrokeCap.round;
+    final left = world.cam - 20;
+    final span = world.viewWidth + 40;
+    final top = world.camY - 20;
+    const bandH = 470.0;
+    final lean = (world.wind * 220).clamp(-26.0, 26.0);
+    for (int i = 0; i < 70; i++) {
+      final fx = ((i * 137.5) % span + span) % span;
+      final fall = (time * (300 + (i % 5) * 40) + i * 61.0) % bandH;
+      final x = left + fx;
+      final y = top + fall;
+      canvas.drawLine(Offset(x, y), Offset(x + lean, y + 22), paint);
+    }
+  }
 
   // ---------------------------------------------------------------------------
   // Decoration
@@ -1042,6 +1066,11 @@ class WorldRenderer {
         // while still airborne on the deck — the sink only starts once the
         // body is actually in the water (see BattleWorld's body stepper).
         // The fade layer covers the whole body in whatever pose it died.
+        //
+        // The sink drop applies only to bodies in the water. At sinkT == 0
+        // the drop is a full buoyancy lift, so applying it to a fresh
+        // corpse on the deck teleported them a head-height upward on the
+        // kill frame — the pop that made deaths read as a disappearance.
         Rect bodyBounds = const Rect.fromLTWH(-130, -150, 260, 230);
         // A layer is only needed while the body is actually translucent, or
         // while the killing-blow flash is compositing over it — both of which
@@ -1054,7 +1083,7 @@ class WorldRenderer {
         final fading = _sinkOpacity(c.sinkT) < 0.995 || c.deathFlash > 0;
         if (!c.alive) {
           if (pose != null) bodyBounds = pose.drawBounds;
-          canvas.translate(0, _sinkDrop(c));
+          if (c.drowned) canvas.translate(0, _sinkDrop(c));
           if (fading) {
             bodyLayers++;
             canvas.saveLayer(
@@ -1105,9 +1134,12 @@ class WorldRenderer {
           _deathSparks(canvas, c, time);
           _deathFx(canvas, c, time);
           if (fading) canvas.restore();
-        } else if (c.hpBarT > 0) {
-          // Dynamic health bar: hidden by default, summoned by damage, and
-          // gone again once its animation finishes.
+        }
+        // Dynamic health bar: hidden by default, summoned by damage, and
+        // gone again once its animation finishes. Shown for the dying too:
+        // a killing blow drains the bar to zero while the body is falling,
+        // so the death carries its own HP readout.
+        if (c.hpBarT > 0) {
           _crewHealthBar(canvas, raft, c, pose);
         }
         // A boss status stays visible for as long as it is costing the
@@ -1115,6 +1147,10 @@ class WorldRenderer {
         // an effect you cannot see is an effect that reads as the game
         // misbehaving when your shot lands short.
         if (c.alive && c.afflicted) _statusMark(canvas, raft, c, pose, time);
+        // Burning reads the same way: a flame riding over the head for as
+        // long as the fire has turns left. Sits above the status badge when
+        // both are showing, so they never overlap.
+        if (c.alive && c.burnTurns > 0) _burnMark(canvas, raft, c, pose, time);
         if (c.alive && c.talking) _speechBubble(canvas, raft, c, pose);
         canvas.restore();
       }
@@ -1226,6 +1262,38 @@ class WorldRenderer {
         Paint()..color = Colors.white.withOpacity(opacity * 0.35),
       );
     }
+  }
+
+  /// A flame riding over a burning crew member's head, for as long as the
+  /// fire has turns left. Flickers with time so it reads as live fire, not
+  /// a sticker — and bobs with the same phase the head does.
+  void _burnMark(
+      Canvas canvas, Raft raft, Crew c, RagdollPose? pose, double time) {
+    final cx = pose != null ? pose.head.pos.dx : 0.0;
+    // Above the status badge when both show, and above the health bar while
+    // it is up — an ignite always lands with damage, so the bar is up too.
+    final headTop =
+        pose != null ? pose.head.pos.dy : raft.deckY - BattleConst.bodyHeight;
+    final topY =
+        headTop - (c.afflicted ? 58 : (c.hpBarT > 0 ? 48 : 26));
+    final flick = 1 + sin(time * 13 + c.bobPhase * 3) * 0.16;
+    final o = Offset(cx, topY);
+    // Outer flame, then the hot core.
+    canvas.drawPath(
+      Path()
+        ..moveTo(o.dx - 5.5 * flick, o.dy + 4)
+        ..quadraticBezierTo(o.dx - 6.5 * flick, o.dy - 5 * flick,
+            o.dx, o.dy - 8.5 * flick)
+        ..quadraticBezierTo(o.dx + 6.5 * flick, o.dy - 5 * flick,
+            o.dx + 5.5 * flick, o.dy + 4)
+        ..close(),
+      Paint()..color = const Color(0xFFE2541E).withOpacity(0.92),
+    );
+    canvas.drawCircle(
+      o + Offset(0, 1.5),
+      2.6 * flick,
+      Paint()..color = const Color(0xFFFFC966),
+    );
   }
 
   /// The per-crew dynamic health bar, drawn just above the character's head
@@ -1467,6 +1535,30 @@ class WorldRenderer {
         ..style = PaintingStyle.stroke
         ..strokeWidth = 1.2,
     );
+
+    // The numbers: current/max HP under the bar, and the damage still left
+    // in the ghost drain floating above it. Both ride the same fade as the
+    // bar, so the whole readout arrives and leaves as one piece — and both
+    // keep working on a corpse, where the bar is draining to zero.
+    final cur = c.hp.round().clamp(0, c.maxHp.round());
+    final label = _text(
+      '$cur/${c.maxHp.round()}',
+      size: 8,
+      color: RT.ink,
+      alpha: alpha * 0.9,
+      letterSpacing: 0.4,
+    );
+    label.paint(canvas, Offset(cx - label.width / 2, rect.bottom + 2));
+    final delta = ((c.hpDisplay - c.hpFrac) * c.maxHp).round();
+    if (delta > 0) {
+      final dmg = _text(
+        '-$delta',
+        size: 10,
+        color: RT.red,
+        alpha: alpha,
+      );
+      dmg.paint(canvas, Offset(cx - dmg.width / 2, rect.top - dmg.height - 1));
+    }
   }
 
   void _ripple(Canvas canvas, Raft raft, double time) {
@@ -3024,12 +3116,15 @@ class WorldRenderer {
 
     final footY = deck;
     // Recoil crouches the body — scaled by the caliber's kick, so a tennis
-    // ball barely moves the stance and an anchor shot drives the heels in.
+    // ball rocks the stance and an anchor shot drives the heels in. The
+    // whole-body terms are deliberately large: the kick used to move the
+    // hips a unit or two, which is sub-pixel at raft scale, and firing
+    // read as nothing happening to the shooter at all.
     // The expression's own crouch rides on top: negative values (a stretch)
     // lift the hips and put them up on their toes.
     final hipY = footY -
         legLen * (1 - bx.crouch * 0.42) +
-        recoil * wv.kick * 0.4 +
+        recoil * wv.kick * 0.9 +
         bx.bounce;
     final shoulderY = hipY - torsoH * (1 - bx.slump * 0.14);
     final headC = Offset(
@@ -3046,7 +3141,7 @@ class WorldRenderer {
     // A survived torso hit gets a clutch: they stay on their feet, hunch
     // over the wound and press it with the free hand while the wince plays.
     final grabbing = crew.grabT > 0 && crew.alive;
-    final leanBack = recoil * 0.16;
+    final leanBack = recoil * 0.30;
     // The upper-body block's common lean: recoil rocks the torso back about
     // the hips, walking adds a slight forward hunch, and a fresh torso hit
     // doubles them over the wound. Arms, torso, weapon and head all draw
@@ -3062,7 +3157,7 @@ class WorldRenderer {
     // ---- Legs ----
     // A wide, planted stance while aiming or absorbing recoil; a swing while
     // walking back to station; a relaxed idle otherwise.
-    final stance = 8.0 + (aiming ? 2.0 : 0.0) + recoil * 4.0;
+    final stance = 8.0 + (aiming ? 2.0 : 0.0) + recoil * 7.0;
     final swing = sin(crew.walkPhase * pi * 2) * 7.0 * crew.walkAmp;
     final liftL = crew.walkAmp > 0
         ? max(0.0, sin(crew.walkPhase * pi * 2)) * 5.0 * crew.walkAmp
@@ -3147,10 +3242,17 @@ class WorldRenderer {
     } else {
       // Low ready: grip at the hip, muzzle angled down-and-forward, with a
       // walk-cycle sway. Mid-swap the weapon drops toward the other hip.
+      //
+      // Long barrels are carried muzzle-up at the trail instead: at the old
+      // flat carry the anchor's 44-unit barrel stabbed a dozen units into
+      // the deck. Rotating the rest angle up with weapon length keeps every
+      // muzzle clear of the planks while short guns keep their relaxed
+      // forward carry.
       final lowered = 1 - lift;
       gripBody = gunShoulder +
           Offset(gunSide * 6, 16 + lowered * 8 + sway * 0.2);
-      final restA = 0.9 - crew.walkAmp * 0.12 * sin(crew.walkPhase * pi * 2) + lowered * 0.5;
+      final carryUp = (wv.muzzleX - 26).clamp(0.0, 20.0) * 0.055;
+      final restA = 0.9 - carryUp - crew.walkAmp * 0.12 * sin(crew.walkPhase * pi * 2) + lowered * 0.5;
       bodyAng = gunSide > 0 ? restA : pi - restA;
     }
 
@@ -3340,8 +3442,14 @@ class WorldRenderer {
       // reads a touch bigger than one on the pop pistol.
       final handScale = (wv.bore / (2 * WeaponView.ballR)).clamp(1.0, 1.3);
       final tubeHalf = wv.barrelThickness / 2;
-      final isTube = wv.supportStyle == GripStyle.foregrip;
-      final isTop = wv.supportStyle == GripStyle.topHandle;
+      // Tube holds wrap the barrel: the foregrip clamp, the muzzle cup and
+      // the over-the-top press. Top holds mirror the finger bands; the
+      // thumb hook stays exclusive to the foregrip clamp.
+      final isTube = wv.supportStyle == GripStyle.foregrip ||
+          wv.supportStyle == GripStyle.cupMuzzle ||
+          wv.supportStyle == GripStyle.overTop;
+      final isTop = wv.supportStyle == GripStyle.topHandle ||
+          wv.supportStyle == GripStyle.overTop;
       // Support hand (far side) closes first — its palm centre is where
       // the IK wrist landed — then the firing hand sits over its grip on
       // the near side. Layering both over the model is what reads as
@@ -3356,7 +3464,7 @@ class WorldRenderer {
           tubeHalf: tubeHalf,
           tubeCenterDy: isTube || isTop ? wv.supportPalmY.abs() : 0,
           gripTopY: wv.stubTopY,
-          foregrip: isTube,
+          foregrip: wv.supportStyle == GripStyle.foregrip,
           over: isTop,
           scale: handScale,
         );
@@ -3427,7 +3535,9 @@ class WorldRenderer {
     );
 
     // ---- Head ----
-    final headC2 = headC + Offset(-recoil * 2.5 * gunSide, recoil * 2.6);
+    // The head lags the kick: it tips back and up as the torso rocks, which
+    // is half of what makes a shot feel fired rather than merely flashed.
+    final headC2 = headC + Offset(-recoil * 4.0 * gunSide, recoil * 4.0);
     canvas.drawCircle(headC2, headR, Paint()..color = skin);
     canvas.drawArc(
       Rect.fromCircle(center: headC2, radius: headR),

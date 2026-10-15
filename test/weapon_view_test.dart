@@ -124,6 +124,11 @@ void main() {
       expect(WeaponView.forId('grenade').pumpTravel, 0);
       // The starter has no slide to work either.
       expect(WeaponView.forId('tennis').pumpTravel, 0);
+      // The utility shelf each holds its gun its own way: pressed from
+      // above, cupped at the muzzle, braced from behind.
+      expect(WeaponView.forId('gust').supportStyle, GripStyle.overTop);
+      expect(WeaponView.forId('cinder').supportStyle, GripStyle.cupMuzzle);
+      expect(WeaponView.forId('wrecker').supportStyle, GripStyle.rearBrace);
     });
 
     test('No two calibers are held the same way', () {
@@ -171,6 +176,10 @@ void main() {
             v.crankR > 0,
             v.scopeLen > 0,
             v.bipodX > 0,
+            v.drumR > 0,
+            v.magLen > 0,
+            v.prongLen > 0,
+            v.handleX > 0,
           ].where((f) => f).length;
 
       expect(WeaponView.forId('grenade').woodFurniture, true,

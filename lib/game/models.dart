@@ -111,6 +111,25 @@ class WeaponDef {
   /// How many of the victim's turns the status lasts.
   final int statusTurns;
 
+  /// Knockback multiplier on top of what the damage and weight already buy.
+  /// 1.0 hits like its numbers say; a crowd-control round runs hot here and
+  /// cold on damage, so it moves bodies without deleting them.
+  final double shove;
+
+  /// Extra upward launch on a direct hit, in fractions of the shove (added
+  /// to the base lift, see [Crew.knock]). Lobs bodies up and over the rail
+  /// instead of sliding them along the deck.
+  final double lift;
+
+  /// Damage-over-time: turns of burning, and HP lost at the start of each
+  /// of the victim's own turns. 0 means no fire.
+  final int burnTurns;
+  final double burnDamage;
+
+  /// Damage multiplier against built blocks. Cover-crackers run hot here
+  /// and cold on crew damage, so they strip fortifications instead of crews.
+  final double breach;
+
   /// Projectile look: 'ball' (the default round), 'shard', 'blob', 'net',
   /// 'ember' or 'disc'. Purely visual, but it is what tells the player which
   /// boss round is inbound while it is still in the air — which is the only
@@ -138,6 +157,11 @@ class WeaponDef {
     this.levelLock = 1,
     this.status,
     this.statusTurns = 1,
+    this.shove = 1.0,
+    this.lift = 0,
+    this.burnTurns = 0,
+    this.burnDamage = 0,
+    this.breach = 1.0,
     this.projectile = 'ball',
     this.bossOnly = false,
   });
@@ -179,6 +203,27 @@ class Weapons {
       icon: Icons.anchor, color: Color(0xFF5D6D7E),
       damage: 74, speed: 0.78, splash: 60, weight: 1.6,
       startAmmo: 0, packSize: 1, packCost: 420, levelLock: 6,
+    ),
+    WeaponDef(
+      id: 'gust', name: 'Gale', desc: 'Shoves the whole deck toward the rails. Barely scratches paint.',
+      icon: Icons.air, color: Color(0xFF9FD8E8),
+      damage: 12, speed: 1.05, splash: 50, weight: 1.0,
+      shove: 3.0, lift: 0.5,
+      startAmmo: 2, packSize: 2, packCost: 220, levelLock: 3,
+    ),
+    WeaponDef(
+      id: 'cinder', name: 'Cinder', desc: 'Sets the crew burning for three of their turns.',
+      icon: Icons.whatshot, color: Color(0xFFE2541E),
+      damage: 10, speed: 0.95, splash: 60, weight: 1.1,
+      burnTurns: 3, burnDamage: 7,
+      startAmmo: 1, packSize: 2, packCost: 320, levelLock: 5, projectile: 'ember',
+    ),
+    WeaponDef(
+      id: 'wrecker', name: 'Wrecker', desc: 'Cracks fortifications. Kind to crew, cruel to cover.',
+      icon: Icons.hardware, color: Color(0xFF8A6A3C),
+      damage: 16, speed: 0.85, splash: 0, weight: 1.4,
+      breach: 3.0,
+      startAmmo: 1, packSize: 1, packCost: 380, levelLock: 7, projectile: 'shard',
     ),
   ];
 

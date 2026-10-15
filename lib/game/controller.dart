@@ -1,5 +1,6 @@
 import 'dart:async';
-import 'dart:ui' show Offset;
+import 'dart:math';
+import 'dart:ui' show Color, Offset;
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/scheduler.dart';
@@ -54,6 +55,12 @@ class PlayerConfig {
   /// something any enemy might suddenly do.
   final BossDef? boss;
 
+  /// Set on a practice target. A passive seat holds its turn for a beat and
+  /// then hands it straight over without ever firing — the tutorial's dummy
+  /// raft. Local lessons only: nothing on the wire may depend on a seat that
+  /// unilaterally passes.
+  final bool passive;
+
   PlayerConfig({
     required this.name,
     required this.loadout,
@@ -64,6 +71,7 @@ class PlayerConfig {
     this.powerMultiplier = 1.0,
     this.aimJitter = 10,
     this.boss,
+    this.passive = false,
   });
 }
 
@@ -93,6 +101,33 @@ class MatchSettings {
   /// not a replacement for it — a match is set up one way or the other.
   bool buildYourRaft;
 
+  /// True for the first-run lesson. A tutorial is an ordinary local match
+  /// with a passive target; the flag only marks it so the ending is not
+  /// recorded as a played match (no wins, XP or history entries for a
+  /// lesson) and the UI can show the script instead of the normal HUD.
+  bool tutorial;
+
+  /// Thin air: multiplies gravity on shots in flight (0.55 = floaty moon
+  /// shots). 1.0 is ordinary physics.
+  double gravityScale;
+
+  /// Stormy air: multiplies the rolled wind past its ordinary cap. 1.0 is
+  /// ordinary weather; storms run it past double.
+  double windScale;
+
+  /// A storm is blowing through: rain streaks in the renderer, tripled
+  /// gusts in the physics (via [windScale]).
+  bool storm;
+
+  /// The match ends after this many rounds with the healthier side winning
+  /// (ties go to the survivor — player 0). 0 means a normal fight to the
+  /// sinking. Only survival levels set it.
+  int roundLimit;
+
+  /// Demolition objectives need a shootable field: guarantees this many
+  /// breakable obstacles at layout time.
+  int minBreakables;
+
   MatchSettings({
     MapDef? map,
     this.startHp = 100,
@@ -103,6 +138,12 @@ class MatchSettings {
     this.difficultyTier = 0,
     this.isBoss = false,
     this.buildYourRaft = false,
+    this.tutorial = false,
+    this.gravityScale = 1.0,
+    this.windScale = 1.0,
+    this.storm = false,
+    this.roundLimit = 0,
+    this.minBreakables = 0,
   })  : map = map ?? GameMaps.all.first,
         enabledWeapons = enabledWeapons ?? Weapons.all.map((w) => w.id).toList();
 
@@ -197,6 +238,11 @@ class GameController extends ChangeNotifier {
   int shotsFired = 0;
   int shotsHit = 0;
 
+  /// Every weapon id the local human seat (player 0) has fired this match.
+  /// Feeds the tennis-only star objective: the AI's rounds must never
+  /// pollute it, so only seat 0's own shots are recorded.
+  final Set<String> humanWeaponsUsed = {};
+
   double _accum = 0;
   bool _disposed = false;
   bool _gameEnded = false;
@@ -261,7 +307,14 @@ class GameController extends ChangeNotifier {
   // ---------------------------------------------------------------------------
 
   void _setup(int seed) {
-    world = BattleWorld(map: settings.map, seed: seed);
+    world = BattleWorld(
+      map: settings.map,
+      seed: seed,
+      minBreakables: settings.minBreakables,
+    );
+    world.gravityScale = settings.gravityScale;
+    world.windScale = settings.windScale;
+    world.storm = settings.storm;
     // Crew voices — grunts, yelps, gloats and idle blips — route through
     // the shared audio service at a slightly softer level than SFX.
     world.onVoice =
@@ -782,6 +835,9 @@ class GameController extends ChangeNotifier {
     _impactHold = 0;
     _crewWait = 0;
     _turnSeq++;
+    // Fresh air every turn, derived from the match seed — both devices of a
+    // networked match roll the identical value with no traffic.
+    world.rollWind(_turnSeq);
     // A new turn always starts with the helm released.
     _walkDir = 0;
     for (final r in world.rafts) {
@@ -791,6 +847,10 @@ class GameController extends ChangeNotifier {
     }
 
     final raft = world.raftOf(player);
+    // Burning crew take their damage as their own turn starts — same rule
+    // as statuses, for the same reason. A body the fire finishes goes down
+    // keeling toward the rail like any other death.
+    if (raft != null) _tickBurns(raft);
     raft?.ensureActiveReady();
     raft?.ensureActiveAlive();
 
@@ -843,6 +903,34 @@ class GameController extends ChangeNotifier {
 
     if (players[player].isAi) {
       _aiThinkTime = 0.9 + world.rng.range(0, 0.9);
+    }
+  }
+
+  /// Burns a turn of fire off everyone aboard [raft] who is burning. Runs at
+  /// the start of the seat's own turns, so both devices of a networked match
+  /// — which play out the same turn sequence — deal identical damage with no
+  /// fire traffic on the wire.
+  void _tickBurns(Raft raft) {
+    for (int i = 0; i < raft.crew.length; i++) {
+      final c = raft.crew[i];
+      if (c.burnTurns <= 0 || !c.alive) continue;
+      final before = c.hp;
+      c.hp = max(0, c.hp - c.burnDps);
+      c.burnTurns--;
+      if (c.hp < before) c.showHpBar(before / c.maxHp);
+      world.effects.add(Fx(
+        pos: raft.crewPos(i),
+        kind: 'fire',
+        color: const Color(0xFFE2541E),
+        size: 44,
+        life: 0.5,
+      ));
+      AudioService.instance.sfx('burn');
+      if (!c.alive) {
+        final dir = raft.railDir(i);
+        c.startDeath(Offset(dir, -0.6), 3.0, railDir: dir);
+        AudioService.instance.sfx('eliminate');
+      }
     }
   }
 
@@ -1008,6 +1096,16 @@ class GameController extends ChangeNotifier {
 
     final p = players[currentPlayer];
     if (!p.isAi || _aiShotQueued) return;
+
+    if (p.passive) {
+      // A practice target never shoots back: hold a beat so the pass reads
+      // as a turn, then hand it straight over. The clock is left alone — a
+      // dummy with nothing to decide has nothing to time out.
+      statusMessage = '${p.name} holds still…';
+      _aiThinkTime -= dt;
+      if (_aiThinkTime <= 0) _endTurn();
+      return;
+    }
 
     _aiThinkTime -= dt;
     if (_aiThinkTime > 0) return;
@@ -1179,6 +1277,12 @@ class GameController extends ChangeNotifier {
       // The AI solves against the power it will actually get, so a chilled
       // enemy misses short exactly like a chilled player would.
       powerMultiplier: p.powerMultiplier * (me.activeCrew?.statusPowerScale ?? 1.0),
+      // ...and against the air it will actually fly through, so it
+      // compensates for the wind exactly like the trajectory preview does.
+      wind: world.wind,
+      // ...and under the gravity it will actually fall through, so thin
+      // air does not turn it into a range-guessing machine.
+      gravityScale: world.gravityScale,
     );
 
     _aiShotQueued = true;
@@ -1361,13 +1465,52 @@ class GameController extends ChangeNotifier {
     for (int i = 0; i < players.length; i++) {
       if (world.raftOf(i)?.alive ?? false) alive.add(i);
     }
-    if (alive.length > 1 || players.length <= 1) return false;
+    if (alive.length > 1 || players.length <= 1) {
+      // Survival levels: outlasting the round limit decides it — the
+      // healthier side at the bell wins, ties going to the survivor. Sinking
+      // the enemy first still ends it early through the normal path below.
+      if (alive.length > 1 &&
+          settings.roundLimit > 0 &&
+          round > settings.roundLimit) {
+        return _finishSurvival(alive);
+      }
+      return false;
+    }
 
     _gameEnded = true;
     winner = alive.isEmpty ? -1 : alive.first;
     phase = GamePhase.gameOver;
     statusMessage = winner == -1 ? 'DRAW!' : '${players[winner!].name} WINS!';
+    _awardGameOver();
+    return true;
+  }
 
+  /// Judges a survival level once its round limit is outlasted.
+  bool _finishSurvival(List<int> alive) {
+    _gameEnded = true;
+    final me = world.raftOf(0)?.hpFrac ?? 0;
+    var bestFoe = -1;
+    var bestFrac = -1.0;
+    for (final i in alive) {
+      if (i == 0) continue;
+      final f = world.raftOf(i)?.hpFrac ?? 0;
+      if (f > bestFrac) {
+        bestFrac = f;
+        bestFoe = i;
+      }
+    }
+    // Level on health against the strongest rival still afloat counts as
+    // holding them off: the survivor takes the decision.
+    winner = me >= bestFrac ? 0 : bestFoe;
+    phase = GamePhase.gameOver;
+    statusMessage = winner == 0 ? 'SURVIVED!' : '${players[winner!].name} WINS!';
+    _awardGameOver();
+    return true;
+  }
+
+  /// Victory/defeat fanfare plus match recording, shared by a sinking and a
+  /// survival decision so the two endings can never drift apart.
+  void _awardGameOver() {
     // In hot-seat local play both seats share this device's single account, so
     // a win for either human seat counts for the account. Other modes key off
     // player 0 specifically, since that's the local player.
@@ -1375,9 +1518,10 @@ class GameController extends ChangeNotifier {
     final humanWon = mode == GameMode.local ? winnerIsHuman : (winner == 0 && !players[0].isAi);
     AudioService.instance.sfx(humanWon ? 'victory' : 'defeat');
 
-    final shouldRecord = mode == GameMode.local
-        ? players.any((p) => !p.isAi)
-        : !players[0].isAi;
+    final shouldRecord = !settings.tutorial &&
+        (mode == GameMode.local
+            ? players.any((p) => !p.isAi)
+            : !players[0].isAi);
     if (shouldRecord) {
       SaveService.instance.recordMatch(
         won: humanWon,
@@ -1396,7 +1540,6 @@ class GameController extends ChangeNotifier {
         isBoss: settings.isBoss,
       );
     }
-    return true;
   }
 
   // ---------------------------------------------------------------------------
@@ -1593,6 +1736,9 @@ class GameController extends ChangeNotifier {
     );
 
     shotsFired++;
+    if (currentPlayer == 0 && !players[0].isAi) {
+      humanWeaponsUsed.add(safeWeapon.id);
+    }
     SaveService.instance.data.shotsFired++;
     AudioService.instance.sfx('fire');
     statusMessage = players[currentPlayer].isAi ? 'Return fire!' : 'Shot away!';
@@ -1643,6 +1789,7 @@ class GameController extends ChangeNotifier {
     damageDealtByHuman = 0;
     shotsFired = 0;
     shotsHit = 0;
+    humanWeaponsUsed.clear();
     _shotCommitted = false;
     _aiShotQueued = false;
     _turnSeq = 0;
@@ -1793,6 +1940,11 @@ class GameController extends ChangeNotifier {
     _beginTurn(alive ? resumeAt : _nextAlivePlayer(), initial: true);
     // _beginTurn bumps the sequence; keep the restored value authoritative.
     _turnSeq = (snap['turnSeq'] as num?)?.toInt() ?? _turnSeq;
+    // ...and re-roll the wind the restored turn was playing under. The
+    // begin above rolled for the bumped sequence, which would otherwise
+    // repeat one wind value and — worse — disagree with the other device
+    // about which turn's air this is.
+    world.rollWind(_turnSeq);
     notifyListeners();
   }
   @override

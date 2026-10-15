@@ -2,12 +2,16 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import '../game/audio.dart';
+import '../game/campaign.dart';
+import '../game/controller.dart';
 import '../game/save.dart';
+import '../game/tutorial.dart';
 import '../theme.dart';
 import '../widgets/menu_mascot.dart';
 import 'armory_screen.dart';
 import 'campaign_screen.dart';
 import 'characters_screen.dart';
+import 'game_screen.dart';
 import 'maps_screen.dart';
 import 'match_setup_screen.dart';
 import 'hotspot_screen.dart';
@@ -45,6 +49,29 @@ class _MainMenuScreenState extends State<MainMenuScreen> with TickerProviderStat
     AudioService.instance.sfx('click');
     if (SaveService.instance.data.vibration) HapticFeedback.lightImpact();
     go();
+  }
+
+  /// A brand-new captain: no lesson done, nothing won, no stars anywhere.
+  /// They get a banner pointing at the tutorial instead of having to find
+  /// it; everyone else just gets the button.
+  bool get _fresh {
+    final save = SaveService.instance.data;
+    return !save.tutorialDone && save.wins == 0 && Campaign.totalStars(save) == 0;
+  }
+
+  void _openTutorial() {
+    final (settings, players) = Tutorial.match();
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => GameScreen(
+          settings: settings,
+          players: players,
+          mode: GameMode.vsAi,
+          seed: TutorialConfig.seed,
+        ),
+      ),
+    );
   }
 
   @override
@@ -113,6 +140,36 @@ class _MainMenuScreenState extends State<MainMenuScreen> with TickerProviderStat
                               ),
                               const SizedBox(height: 10),
                               _statBadge(save),
+                              if (_fresh) ...[
+                                const SizedBox(height: 12),
+                                GestureDetector(
+                                  onTap: () => _tap(_openTutorial),
+                                  child: Container(
+                                    padding: const EdgeInsets.symmetric(
+                                        horizontal: 18, vertical: 12),
+                                    decoration: BoxDecoration(
+                                      color: RT.yellow,
+                                      borderRadius: BorderRadius.circular(16),
+                                      boxShadow: const [
+                                        BoxShadow(
+                                            color: Color(0x33000000),
+                                            offset: Offset(0, 4))
+                                      ],
+                                    ),
+                                    child: Row(
+                                      mainAxisSize: MainAxisSize.min,
+                                      children: [
+                                        const Icon(Icons.school,
+                                            color: RT.ink, size: 20),
+                                        const SizedBox(width: 10),
+                                        Text('NEW CAPTAIN? LEARN TO PLAY',
+                                            style: RT.chunky(
+                                                size: 15, color: RT.ink)),
+                                      ],
+                                    ),
+                                  ),
+                                ),
+                              ],
                               const SizedBox(height: 20),
                               Row(
                                 crossAxisAlignment: CrossAxisAlignment.center,
@@ -131,6 +188,8 @@ class _MainMenuScreenState extends State<MainMenuScreen> with TickerProviderStat
                                 spacing: 10,
                                 runSpacing: 10,
                                 children: [
+                                  _secondaryBtn('LEARN', Icons.school,
+                                      () => _tap(_openTutorial)),
                                   _secondaryBtn('PLAY VS AI', Icons.smart_toy,
                                       () => _tap(() => Navigator.push(context, MaterialPageRoute(builder: (_) => const MatchSetupScreen(mode: 'ai'))))),
                                   _secondaryBtn('LOCAL 2P', Icons.people,

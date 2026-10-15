@@ -122,6 +122,11 @@ class MapDef {
   /// How lively the water surface is (wave amplitude multiplier).
   final double chop;
 
+  /// The map's prevailing wind, added to every turn's roll (see [Wind]) —
+  /// positive blows seaward, negative landward. Gales in the mountains,
+  /// still air in the sheltered harbour, and a hot breath off the dunes.
+  final double windBias;
+
   /// Which solid obstacles this scene drops into the channel between the
   /// rafts. Themed per map so the hazard belongs to the place: icebergs in
   /// the frozen swell, crates and masts in the harbour.
@@ -163,6 +168,7 @@ class MapDef {
     required this.shore,
     this.props = const [SceneProp.palm, SceneProp.rock],
     this.chop = 1.0,
+    this.windBias = 0,
     this.obstacles = const [ObstacleKind.rock, ObstacleKind.buoy],
     this.waterSteps = const [
       WaterStepKind.falls,
@@ -195,8 +201,7 @@ class GameMaps {
       chop: 1.0,
     ),
     MapDef(
-      id: 'island', name: 'Coconut Cove', tagline: 'Turquoise shallows and palm huts',
-      icon: Icons.beach_access,
+      id: 'island', name: 'Coconut Cove', tagline: 'Turquoise shallows and palm huts',      icon: Icons.beach_access,
       sky: [Color(0xFF6FD3E8), Color(0xFFCFF0F5), Color(0xFFF2E3B4), Color(0xFFEBD9A2)],
       water: Color(0xFF34B3AE), waterDeep: Color(0xFF16787C), shore: Color(0xFFF2E3B4),
       props: [SceneProp.palm, SceneProp.hut, SceneProp.rock],
@@ -206,6 +211,8 @@ class GameMaps {
       stone: Color(0xFFC9A87C), stoneShade: Color(0xFF9C7B52),
       timber: Color(0xFFC08A4A), timberShade: Color(0xFF8A5C28),
       chop: 0.75,
+      // A light sea breeze, mostly with the player.
+      windBias: 0.004,
     ),
     MapDef(
       id: 'mountains', name: 'Frosty Peaks', tagline: 'Icebergs adrift in a cold swell',
@@ -216,9 +223,10 @@ class GameMaps {
       obstacles: [ObstacleKind.iceberg, ObstacleKind.rock, ObstacleKind.iceberg],
       // Wet dark slate against pale blue ice.
       waterSteps: [WaterStepKind.iceShelf, WaterStepKind.ledge, WaterStepKind.falls],
-      stone: Color(0xFF6E7B85), stoneShade: Color(0xFF4A555F),
-      timber: Color(0xFF7A6A5C), timberShade: Color(0xFF52463C),
+      stone: Color(0xFF6E7B85), stoneShade: Color(0xFF4A555F),      timber: Color(0xFF7A6A5C), timberShade: Color(0xFF52463C),
       chop: 1.45, levelLock: 2,
+      // Gales rolling off the peaks, hard seaward.
+      windBias: 0.02,
     ),
     MapDef(
       id: 'desert', name: 'Dusty Dunes', tagline: 'A hot channel between the dunes',
@@ -232,6 +240,8 @@ class GameMaps {
       stone: Color(0xFFD3A96A), stoneShade: Color(0xFFA37C42),
       timber: Color(0xFFB49A78), timberShade: Color(0xFF7E6850),
       chop: 0.6, levelLock: 3,
+      // Hot gusts off the dunes, pushing back landward.
+      windBias: -0.012,
     ),
     MapDef(
       id: 'volcano', name: 'Mount Sizzle', tagline: 'Ash on the wind, embers on the water',
@@ -245,6 +255,8 @@ class GameMaps {
       stone: Color(0xFF4A4148), stoneShade: Color(0xFF2E282E),
       timber: Color(0xFF6B4438), timberShade: Color(0xFF3E2620),
       chop: 1.2, levelLock: 5,
+      // Ash on the wind, drifting seaward.
+      windBias: 0.01,
     ),
     MapDef(
       id: 'city', name: 'Harbour Lights', tagline: 'Duelling between the docks at dusk',
@@ -279,6 +291,8 @@ class GameMaps {
       stone: Color(0xFF5E6E78), stoneShade: Color(0xFF3C4952),
       timber: Color(0xFF8A7358), timberShade: Color(0xFF5A4A38),
       chop: 1.35, levelLock: 1,
+      // Open ocean, rolling with the swell.
+      windBias: 0.008,
     ),
   ];
 

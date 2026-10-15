@@ -47,7 +47,29 @@ class AiController {
   final AiDifficulty difficulty;
   final Random _rnd;
 
-  AiController(this.difficulty, {int? seed}) : _rnd = Random(seed);
+  AiController(this.difficulty, {int? seed})
+      : _rnd = seed == null ? Random() : Random(_mixSeed(seed));
+
+  /// Avalanche-mixes a small structured seed into a well-spread Random seed.
+  ///
+  /// A turn's AI seed comes out of the match's shared LCG, and LCG streams
+  /// grown from sequential match seeds stay parallel for a long while —
+  /// successive outputs differing by a constant. Dart's Random does not mix
+  /// such structured seeds itself: related seeds deal correlated first
+  /// draws (averaging ~0.2 instead of 0.5 over one observed progression),
+  /// so whole turns' worth of aim jitter leaned the same way and read as a
+  /// systematic aiming bias. Mixing here keeps every turn's dice independent
+  /// however structured the match seeds are. Pure function of its input, so
+  /// replays and both networked devices still agree exactly.
+  static int _mixSeed(int seed) {
+    var h = seed & 0x7FFFFFFF;
+    h ^= h >> 15;
+    h = (h * 0x85EBCA6B) & 0x7FFFFFFF;
+    h ^= h >> 13;
+    h = (h * 0xC2B2AE35) & 0x7FFFFFFF;
+    h ^= h >> 16;
+    return h;
+  }
 
   /// Jitter multiplier per difficulty — retuned for this game's ballistics:
   /// a power jitter of J translates to a landing miss of roughly
@@ -92,6 +114,12 @@ class AiController {
     Offset Function(double angleDeg)? muzzleAt,
     double baseJitter = 10,
     double powerMultiplier = 1.0,
+    // This turn's wind acceleration, in world units per 60Hz frame. The
+    // solver integrates it exactly like the real flight does, so the AI
+    // compensates for the air instead of ignoring it.
+    double wind = 0,
+    // Gravity scale for thin-air matches. Like wind, integrated exactly.
+    double gravityScale = 1.0,
   }) {
     final weapon = _pickWeapon(arsenal);
 
@@ -114,6 +142,8 @@ class AiController {
         facing: facing,
         powerMultiplier: powerMultiplier,
         targetHeight: targetHeight,
+        windAcc: wind,
+        gravityScale: gravityScale,
       );
       if (sol == null) continue;
       if (best == null || sol.score < best.score) best = sol;
@@ -151,6 +181,8 @@ class AiController {
     required int facing,
     required double powerMultiplier,
     required double targetHeight,
+    required double windAcc,
+    required double gravityScale,
   }) {
     final range = (targetX - origin.dx).abs();
     if (range < 1) return null;
@@ -165,6 +197,7 @@ class AiController {
       weapon: weapon,
       powerMultiplier: powerMultiplier,
       drop: drop,
+      gravityScale: gravityScale,
     );
 
     double landing(double p) => _predictLanding(
@@ -175,6 +208,8 @@ class AiController {
           weapon: weapon,
           powerMultiplier: powerMultiplier,
           targetHeight: targetHeight,
+          windAcc: windAcc,
+          gravityScale: gravityScale,
         );
 
     // Polish against the real integrator. Range scales with v^2, so the
@@ -192,8 +227,7 @@ class AiController {
 
     // Score: distance from the target, plus a penalty for an arc that only
     // "fits" by pinning power against a clamp — it has no correction left.
-    var score = (landing(power) - targetX).abs();
-    if (power <= BattleConst.powerMin + 0.01 || power >= BattleConst.powerMax - 0.01) {
+    var score = (landing(power) - targetX).abs();    if (power <= BattleConst.powerMin + 0.01 || power >= BattleConst.powerMax - 0.01) {
       score += 40;
     }
     return _Solution(angle: angleDeg, power: power, score: score);
@@ -212,6 +246,8 @@ class AiController {
     required WeaponDef weapon,
     required double powerMultiplier,
     required double targetHeight,
+    required double windAcc,
+    required double gravityScale,
   }) {
     var p = from;
     var v = BattleWorld.launchVelocity(
@@ -230,7 +266,7 @@ class AiController {
         return p.dx + (next.dx - p.dx) * t;
       }
       p = next;
-      v = Offset(v.dx, v.dy + BattleConst.gravity);
+      v = Offset(v.dx + windAcc, v.dy + BattleConst.gravity * gravityScale);
     }
     return p.dx;
   }
@@ -245,11 +281,12 @@ class AiController {
     required WeaponDef weapon,
     required double powerMultiplier,
     required double drop,
+    required double gravityScale,
   }) {
     final r = angleDeg * pi / 180;
     final sin2 = sin(2 * r);
     if (sin2 <= 0.02) return BattleConst.powerMax;
-    final g = BattleConst.gravity;
+    final g = BattleConst.gravity * gravityScale;
     final scale = BattleConst.velScale * weapon.speed * powerMultiplier;
     if (scale <= 0) return BattleConst.powerMax;
 

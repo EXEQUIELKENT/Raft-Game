@@ -608,6 +608,10 @@ void main() {
       }
       expect(outcome, isNotNull);
       expect(c.alive, false, reason: 'the bomb killed them');
+      // A killing blow summons the HP popup too, draining to zero while
+      // the body is falling — the death carries its own readout.
+      expect(c.hpBarT, greaterThan(0),
+          reason: 'the killing blow brings the HP bar up');
 
       // The death is a fall, not a fade: the body leaves the deck, the
       // water marks where it lands, and only then does it sink away.
@@ -628,6 +632,33 @@ void main() {
       expect(c.drowned, true, reason: 'the fall ends in the water');
       expect(sawSplash, true, reason: 'the water marks the landing');
       expect(c.gone, true, reason: 'and the body finishes sinking once it is in the sea');
+      ctrl.dispose();
+    });
+
+    test('A corpse never stands back up, however long the fall takes', () {
+      final ctrl = newMatch();
+      final world = ctrl.world;
+      final foe = world.raftOf(1)!;
+      final c = foe.crew.first;
+
+      // Killed outright with bomb force, the way _resolve does it — but
+      // parked mid-deck with a weak shove, so the fall takes longer than
+      // the ragdoll watchdog and would previously stand them back up.
+      c.hp = 0;
+      c.startDeath(const Offset(0.2, -0.2), 3.0, railDir: foe.railDir(0));
+
+      // Twice past the watchdog: no tick may start or complete a get-up.
+      for (int i = 0; i < 500; i++) {
+        world.update(1 / 60);
+        expect(c.getUpT, lessThan(0),
+            reason: 'a corpse must never start standing up (tick $i)');
+        expect(c.ragdoll || c.drowned, true,
+            reason: 'a corpse stays a ragdoll until the water takes it (tick $i)');
+        if (c.gone) break;
+      }
+
+      expect(c.drowned, true, reason: 'the fall still ends in the water');
+      expect(c.gone, true, reason: 'and the body sinks away');
       ctrl.dispose();
     });
 

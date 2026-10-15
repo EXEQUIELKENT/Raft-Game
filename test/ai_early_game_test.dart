@@ -39,9 +39,11 @@ void main() {
   setUp(() => SaveService.instance.data = SaveData());
 
   /// Where a free trajectory from [p0] with per-frame velocity [v0] crosses
-  /// `y == planeY` coming down. The same integrator the simulation uses,
-  /// minus every obstacle — see the note above on why.
-  double crossing(Offset p0, Offset v0, double planeY) {
+  /// `y == planeY` coming down. The same integrator the simulation uses —
+  /// wind included, since the plan under test compensates for the turn's
+  /// air and measuring without it would book the compensation as an error —
+  /// minus every obstacle; see the note above on why.
+  double crossing(Offset p0, Offset v0, double planeY, double wind) {
     var p = p0, v = v0;
     for (int i = 0; i < 900; i++) {
       final next = p + v;
@@ -52,7 +54,7 @@ void main() {
         return p.dx + (next.dx - p.dx) * t;
       }
       p = next;
-      v = Offset(v.dx, v.dy + BattleConst.gravity);
+      v = Offset(v.dx + wind, v.dy + BattleConst.gravity);
     }
     return p.dx;
   }
@@ -104,9 +106,12 @@ void main() {
           final aim = ctrl.lastAiAim!;
           final alive = foe.crew.where((c) => c.alive).length;
           // The shot has already taken its first step, so wind it back to
-          // the launch state to read the plan's own answer.
-          final v0 = Offset(s.vel.dx, s.vel.dy - BattleConst.gravity);
-          final signed = (crossing(s.pos - v0, v0, aim.dy) - aim.dx) *
+          // the launch state to read the plan's own answer — subtracting
+          // the frame's wind as well as its gravity, since the plan was
+          // solved in this turn's air.
+          final wind = ctrl.world.wind;
+          final v0 = Offset(s.vel.dx - wind, s.vel.dy - BattleConst.gravity);
+          final signed = (crossing(s.pos - v0, v0, aim.dy, wind) - aim.dx) *
               ctrl.world.raftOf(1)!.facing;
           out.putIfAbsent(alive, () => []).add(signed);
 
@@ -165,8 +170,12 @@ void main() {
       // against the design. What distinguishes the bug is that its bias was
       // the same size at every difficulty, including the ones with no
       // jitter left to skew.
+      //
+      // Eight seeds rather than four: the median over a handful of jittered
+      // shots is itself noisy (±6 at hard), and a threshold this tight needs
+      // the sample to outnumber the noise.
       for (final difficulty in [AiDifficulty.hard, AiDifficulty.expert]) {
-        final byAlive = errorsByCrewAlive(difficulty, seeds: 4);
+        final byAlive = errorsByCrewAlive(difficulty, seeds: 8);
         for (final e in byAlive.entries) {
           final bias = median(e.value);
           expect(bias.abs(), lessThan(8),

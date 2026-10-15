@@ -58,6 +58,24 @@ class BattleConst {
   static const double gravity = 0.35;
   static const double velScale = 0.32;
 
+  // ---------------------------------------------------------------------------
+  // Wind
+  // ---------------------------------------------------------------------------
+
+  /// Typical per-turn wind strength: horizontal acceleration on a shot in
+  /// flight, in world units per 60Hz frame — the same units as [gravity], so
+  /// the two read against each other directly. At full strength a long lob
+  /// drifts on the order of two raft-widths, which is a real aiming
+  /// consideration without deciding the match by itself.
+  static const double windMax = 0.045;
+
+  /// Hard cap after the map's prevailing bias is added.
+  static const double windLimit = 0.06;
+
+  /// Below this the air counts as calm: no arrow shown, nothing worth
+  /// compensating for.
+  static const double windCalm = 0.006;
+
   /// Pull-back aiming.
   static const double pullMax = 300;
   static const double deadzone = 16;
@@ -350,8 +368,9 @@ class BattleConst {
   static const double bodyDeadFriction = 0.96;
 
   /// A dead body on the deck that has all but stopped is kept sliding toward
-  /// the rail at this speed, so every death ends in the water.
-  static const double bodyDeadDrift = 0.9;
+  /// the rail at this speed, so every death ends in the water — and fast
+  /// enough that the fall is over while the impact is still on screen.
+  static const double bodyDeadDrift = 1.4;
 
   /// Hard cap on any ragdoll point's speed, per 60Hz frame. Constraint
   /// solving can inject energy when points pile up (and repeat hits stack
@@ -559,6 +578,48 @@ class BattleConst {
   /// HP fraction below which an alive crew member's default face turns
   /// worried (and blinks faster) whenever nothing more urgent is happening.
   static const double lowHpFace = 0.3;
+}
+
+/// The per-turn wind: a horizontal acceleration on shots in flight, rolled
+/// fresh every turn and shown on the HUD as an arrow.
+///
+/// A pure function of the match seed, the turn number and the map's
+/// prevailing bias — no shared RNG stream is consumed, so the two devices
+/// of a networked match always agree however differently their frames land,
+/// with zero wind traffic on the wire. Turn numbering comes from the
+/// controller's turn sequence, which both sides play out identically
+/// (including resumes, where the snapshot carries the counter).
+class Wind {
+  Wind._();
+
+  /// Wind acceleration for [turn] of the match with [seed], in world units
+  /// per 60Hz frame. Positive blows toward +x (seaward, downrange for the
+  /// player); negative blows back landward.
+  static double forTurn({
+    required int seed,
+    required int turn,
+    required double bias,
+  }) {
+    // Avalanche the inputs the same multiply-and-shift way the hit-chance
+    // dice does, so neighbouring turns and neighbouring seeds land nowhere
+    // near each other.
+    var h = (seed ^ (turn * 0x9E3779B1)) & 0x7FFFFFFF;
+    h = (h ^ (h >> 15)) & 0x7FFFFFFF;
+    h = (h * 0x85EBCA6B) & 0x7FFFFFFF;
+    h = (h ^ (h >> 13)) & 0x7FFFFFFF;
+    h = (h * 0xC2B2AE35) & 0x7FFFFFFF;
+    h = (h ^ (h >> 16)) & 0x7FFFFFFF;
+    final u = h / 0x7FFFFFFF; // 0..1
+    return ((u * 2 - 1) * BattleConst.windMax + bias)
+        .clamp(-BattleConst.windLimit, BattleConst.windLimit);
+  }
+
+  /// True when [wind] is too weak to show or to compensate for.
+  static bool calm(double wind) => wind.abs() < BattleConst.windCalm;
+
+  /// Display strength of [wind] in whole pips, 0..5.
+  static int pips(double wind) =>
+      (wind.abs() / BattleConst.windMax * 5).round().clamp(0, 5);
 }
 
 /// One point of the verlet ragdoll. Position is integrated; velocity is
@@ -1337,6 +1398,22 @@ class Crew {
   void clearStatus() {
     status = null;
     statusTurns = 0;
+  }
+
+  /// Turns of burning left, and HP lost at the start of each of this crew
+  /// member's own turns. Separate from [status] on purpose: fire is damage
+  /// with a fuse, not a debuff, and it must stack with (not replace) a
+  /// boss's chill or tar.
+  int burnTurns = 0;
+  double burnDps = 0;
+
+  /// Sets the crew member burning. A fresh application tops the turns back
+  /// up and keeps the hotter of the two burns — standing in a second
+  /// fireball should never cool the first one off.
+  void ignite(int turns, double dps) {
+    if (turns <= 0 || dps <= 0) return;
+    burnTurns = max(burnTurns, turns);
+    burnDps = max(burnDps, dps);
   }
 
   /// Ticks the status down by one of this crew member's own turns. Returns
@@ -2267,7 +2344,12 @@ class Crew {
   /// meant to be a real but occasional way to lose someone — not what every
   /// hit does, which is what an early, much punchier version of this did.
   static double impactForce(WeaponDef weapon) =>
-      (1.2 + weapon.damage * 0.028) * (0.8 + 0.2 * weapon.weight);
+      (1.2 + weapon.damage * 0.028) *
+      (0.8 + 0.2 * weapon.weight) *
+      // Crowd-control rounds run their shove hot instead of their damage,
+      // so the same formula throws a gale victim much further than the
+      // wound alone would carry them.
+      weapon.shove;
 }
 
 class Raft {
@@ -2811,6 +2893,11 @@ class TrajectoryDot {
 
 class BattleWorld {
   final MapDef map;
+
+  /// The match seed. Stored (not just fed to [rng]) so per-turn systems with
+  /// their own derived streams — wind — can re-derive the same values on
+  /// both devices of a networked match without touching shared RNG state.
+  final int seed;
   final GameRng rng;
   final List<Raft> rafts = [];
   final List<Fx> effects = [];
@@ -2897,13 +2984,54 @@ class BattleWorld {
 
   void bumpShake(double amount) => shake = min(shake + amount, 26.0);
 
-  BattleWorld({required this.map, required int seed}) : rng = GameRng(seed) {
+  BattleWorld({
+    required this.map,
+    required int seed,
+    this.minBreakables = 0,
+  })  : seed = seed,
+        rng = GameRng(seed) {
     // Water first: obstacles sit ON the water, so they need to know where
     // its surface is before they can be placed.
     _buildWater(seed);
     _buildObstacles(seed);
   }
 
+
+  /// This turn's wind: horizontal acceleration on a shot in flight, in world
+  /// units per 60Hz frame. Rolled fresh every turn by [rollWind] and read by
+  /// every ballistic path — the flight itself, the landing estimate, the
+  /// trajectory preview and the AI solver — so they can never disagree about
+  /// where the air is pushing.
+  double wind = 0;
+
+  /// Multiplies the rolled wind (storms), and the match's gravity (thin
+  /// air). Both default to ordinary physics; both are set from the match
+  /// settings at setup, so replays, previews and both networked devices run
+  /// the same sky.
+  double windScale = 1.0;
+  double gravityScale = 1.0;
+
+  /// A storm is blowing through this match: rain streaks, triple-strength
+  /// gusts. Set from the match settings alongside [windScale].
+  bool storm = false;
+
+  /// Rolls the wind for turn [turn] of this match. Pure function of the
+  /// match seed, so a networked opponent derives the identical value with
+  /// no traffic. Storms multiply the roll past the ordinary cap — that is
+  /// what makes them storms.
+  void rollWind(int turn) {
+    wind = (Wind.forTurn(seed: seed, turn: turn, bias: map.windBias) *
+            windScale)
+        .clamp(-BattleConst.windLimit * max(1.0, windScale),
+            BattleConst.windLimit * max(1.0, windScale));
+  }
+
+  /// One frame of ballistic integration: gravity pulls down, the turn's wind
+  /// pushes sideways. Every flight simulation in the game steps through
+  /// here, which is what keeps the preview, the AI and the real shot honest
+  /// with each other.
+  Offset stepBallistic(Offset v) =>
+      Offset(v.dx + wind, v.dy + BattleConst.gravity * gravityScale);
 
   /// The shape of the water for this match, built once from the seed.
   WaterProfile water = WaterProfile.flat;
@@ -3013,6 +3141,20 @@ class BattleWorld {
   /// from the match seed, so both devices in a hotspot match get the
   /// identical field without exchanging a byte about it.
   final List<Obstacle> obstacles = [];
+
+  /// How many breakable obstacles this match must contain. The layout rolls
+  /// kinds per slot and can in principle roll a field with nothing
+  /// shootable in it — fine normally, but a demolition objective on such a
+  /// field would be unwinnable, so those matches convert their narrowest
+  /// placed obstacle into a buoy (which fits wherever anything fit).
+  ///
+  /// A constructor parameter rather than a set-after field, because the
+  /// layout is built in the constructor itself.
+  int minBreakables;
+
+  /// Breakable obstacles placed, and how many of them have been smashed.
+  int get breakablesTotal => obstacles.where((o) => o.destructible).length;
+  int get breakablesBroken => obstacles.where((o) => o.broken).length;
 
   /// Lays out this match's obstacles.
   ///
@@ -3158,6 +3300,33 @@ class BattleWorld {
         bobPhase: r.range(0, 6.28),
       ));
       solid += halfW * 2;
+    }
+    _ensureBreakables();
+  }
+
+  /// Converts the narrowest placed obstacles into buoys until the match
+  /// holds [minBreakables] breakables. A buoy is narrower than anything it
+  /// replaces, so it fits wherever the original fit — still clear of its
+  /// neighbours, the band edges and the falls it was already clear of.
+  void _ensureBreakables() {
+    var guard = 0;
+    while (breakablesTotal < minBreakables && guard++ < 8) {
+      Obstacle? narrowest;
+      for (final o in obstacles) {
+        if (o.destructible) continue;
+        if (narrowest == null || o.halfW < narrowest.halfW) narrowest = o;
+      }
+      if (narrowest == null) break;
+      final size = BattleConst.obstacleSizes[ObstacleKind.buoy.name]!;
+      final halfH = size.$2 / 2;
+      obstacles[obstacles.indexOf(narrowest)] = Obstacle(
+        kind: ObstacleKind.buoy,
+        pos: Offset(narrowest.pos.dx, waterAt(narrowest.pos.dx) - halfH + 5),
+        halfW: size.$1,
+        halfH: halfH,
+        maxHits: size.$3,
+        bobPhase: narrowest.bobPhase,
+      );
     }
   }
 
@@ -3466,7 +3635,7 @@ class BattleWorld {
     );
     for (int i = 0; i < 400; i++) {
       p += v;
-      v = Offset(v.dx, v.dy + BattleConst.gravity);
+      v = stepBallistic(v);
       // Against the water under the shot, not a flat line: on a terraced
       // sea the surface the round comes down on depends on where it is.
       if (p.dy > waterAt(p.dx)) break;
@@ -3503,7 +3672,7 @@ class BattleWorld {
     var pv = v;
     for (; flight < 400; flight++) {
       probe += pv;
-      pv = Offset(pv.dx, pv.dy + BattleConst.gravity);
+      pv = stepBallistic(pv);
       if (probe.dy > waterAt(probe.dx) + 8) break;
     }
     final budget = max(
@@ -3516,7 +3685,7 @@ class BattleWorld {
 
     for (int i = 0; i < flight; i++) {
       p += v;
-      v = Offset(v.dx, v.dy + BattleConst.gravity);
+      v = stepBallistic(v);
       if (p.dy > waterAt(p.dx) + 8) break;
       if (p.dx < -80 || p.dx > BattleConst.worldW + 80) break;
       if (i % 4 == 0) out.add(TrajectoryDot(p, i));
@@ -3574,7 +3743,7 @@ class BattleWorld {
     if (s.trail.length > 18) s.trail.removeAt(0);
 
     s.pos += s.vel;
-    s.vel = Offset(s.vel.dx, s.vel.dy + BattleConst.gravity);
+    s.vel = stepBallistic(s.vel);
 
     // Collision resolution picks the *earliest* hit along this frame's sweep
     // — every candidate (crew capsules, raft decks, hull walls) reports the
@@ -3640,11 +3809,13 @@ class BattleWorld {
           final struckRow = row;
           act = () {
             // Damage lands on the block, not on the crew: cover works.
+            // Breaching rounds multiply into structures (but never into
+            // crew) — which is what makes a wrecker a wrecker.
             final before = cell.hp;
             struckRaft.build?.damageAt(
               BuildPlan.columnX(struckCol),
               struckRow * BuildPlan.cellH + BuildPlan.cellH / 2,
-              s.weapon.damage,
+              s.weapon.damage * s.weapon.breach,
             );
             cell.flash = BattleConst.obstacleStruckTime;
             onSfx?.call(cell.broken && before > 0 ? 'explosion' : 'hit');
@@ -3931,8 +4102,9 @@ class BattleWorld {
       dealt += before - c.hp;
       hitPlayerSide = hitRaft.playerIndex == 0;
       // The dynamic HP bar comes up the moment damage lands, animating the
-      // loss from where the HP was.
-      c.showHpBar(before / c.maxHp);
+      // loss from where the HP was — but only when HP actually moved, so a
+      // harmless graze never summons a bar for nothing.
+      if (c.hp < before) c.showHpBar(before / c.maxHp);
       // The shove is what sells the hit — they kick back the way the shot
       // was travelling and tumble, reacting to the exact spot the blow
       // landed. A crew member the shot kills goes limp instead: they never
@@ -3955,6 +4127,14 @@ class BattleWorld {
             ? 'voice_brr'
             : c.voiced('voice_gasp'));
         onStatus?.call(c, st);
+      }
+      // A burning round leaves its mark the same way a boss round does —
+      // but on the living only, and fire stacks with a chill or a tar
+      // rather than replacing it.
+      if (s.weapon.burnTurns > 0 && c.alive) {
+        c.ignite(s.weapon.burnTurns, s.weapon.burnDamage);
+        c.say("I'm burning!", seconds: 2.0);
+        onSfx?.call('burn');
       }
       // Test/preview hook: when set ('flip' | 'plant' | 'grab'), the
       // matching zone reaction always fires instead of being dice-rolled.
@@ -4010,7 +4190,9 @@ class BattleWorld {
           final headKick = flips ? 4.2 + s.weapon.weight * 1.5 : 0.0;
           c.knock(s.vel, Crew.impactForce(s.weapon) * (boom ? 1.35 : 1.0),
               hitLocal: hitLocal,
-              lift: boom ? 0.12 : 0,
+              // Crowd-control rounds carry their launch here rather than
+              // in the base lift, so only they pop bodies skyward.
+              lift: (boom ? 0.12 : 0) + s.weapon.lift,
               spin: spin,
               headKick: headKick,
               zone: zone,
@@ -4066,10 +4248,18 @@ class BattleWorld {
             final before = c.hp;
             c.hp = max(0, c.hp - s.weapon.damage * 0.6 * falloff);
             dealt += before - c.hp;
-            c.showHpBar(before / c.maxHp);
+            if (c.hp < before) c.showHpBar(before / c.maxHp);
             // Blast throws bodies: full shove plus an upward launch, so
             // caught crew fly and tumble instead of just sliding.
             final force = Crew.impactForce(s.weapon) * (1.1 + 0.5 * falloff);
+            if (s.weapon.burnTurns > 0 &&
+                c.alive &&
+                s.weapon.burnDamage * falloff >= 1) {
+              // Caught by the edge of a fireball: same fire, weaker burn —
+              // and only when the edge is hot enough to matter.
+              c.ignite(s.weapon.burnTurns, s.weapon.burnDamage * falloff);
+              c.say("I'm burning!", seconds: 2.0);
+            }
             if (c.alive) {
               c.knock(Offset(away.dx, -1.0), force,
                   hitLocal: raft.crewPos(i) - station,
@@ -4288,7 +4478,9 @@ class BattleWorld {
                 min(BattleConst.bodySlamMaxDamage, over * BattleConst.bodySlamDamage);
             final before = victim.hp;
             victim.hp = max(0.0, victim.hp - damage);
-            victim.showHpBar(before / victim.maxHp);
+            if (victim.hp < before) {
+              victim.showHpBar(before / victim.maxHp);
+            }
             victim.slamCool = BattleConst.bodySlamCooldown;
             // The flyer too, so one body cannot scythe through a whole rank
             // in consecutive frames.
@@ -4561,8 +4753,13 @@ class BattleWorld {
     // Watchdog: a ragdoll that has been running far longer than any real
     // tumble — or whose hips have left the world's sane band entirely — is
     // force-resolved instead of being left hanging in the air: over the
-    // deck they stand up where they are, over open water the sea takes
-    // them. Nothing can stay airborne, ever.
+    // deck a living body stands up where it is, over open water the sea
+    // takes them. Nothing can stay airborne, ever.
+    //
+    // A corpse never stands back up: over the deck it keeps lying where it
+    // fell (the death drift below walks it to the rail), and only open
+    // water takes it. Standing a dead body up just to kill it again the
+    // next tick is what made deaths read as a pop rather than a fall.
     final hip = pose.hip.pos;
     final stalled = !c.ragdollTime.isFinite ||
         c.ragdollTime > BattleConst.ragdollWatchdog ||
@@ -4570,6 +4767,12 @@ class BattleWorld {
         hip.dy.abs() > 400 ||
         hip.dx.abs() > 800;
     if (stalled) {
+      if (!c.alive && !c.drowned) {
+        c.ragdollTime = 0;
+        c.rest = 0;
+        if (c.deathDir == 0) c.deathDir = raft.railDir(index);
+        return;
+      }
       if (raft.surfaceY(stationX + hip.dx) != null) {
         c.getUpT = 0;
         c.rest = 0;
@@ -4600,7 +4803,18 @@ class BattleWorld {
     // whatever surface it settled on, platform or deck. When the blend
     // finishes the pose hands over to the normal standing renderer, which
     // walks them back down to their station along the deck surface.
+    //
+    // The living only: a corpse that somehow started standing (no path
+    // above sets it for the dead, but this is the guarantee) lies back
+    // down instead of popping upright mid-fall.
     if (c.getUpT >= 0) {
+      if (!c.alive) {
+        c.getUpT = -1;
+        c.ragdoll = true;
+        c.ragdollTime = 0;
+        c.rest = 0;
+        return;
+      }
       c.clearPlant();
       c.grabT = 0;
       // Uncurl before standing: blending to a standing pose while the solver

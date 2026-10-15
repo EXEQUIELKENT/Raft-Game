@@ -54,6 +54,18 @@ enum GripStyle {
   /// over it.
   topHandle,
 
+  /// Palm presses down on top of the barrel itself, arm coming over it —
+  /// no handle, just a hand flattening the gun against the kick.
+  overTop,
+
+  /// Hand cups UP under the barrel near the muzzle, catching the weight at
+  /// the far end. Looks reckless, which is the joke on a fire mortar.
+  cupMuzzle,
+
+  /// A second fist braced BEHIND the receiver, shoving it forward — the push
+  /// of a breaching lance rather than the heft under a cannon.
+  rearBrace,
+
   /// A second fist under the receiver front, hefting the weight.
   heft,
 
@@ -237,8 +249,8 @@ class WeaponView {
   /// fingers curl down; cup/heft/crank stacks sit at [supportForeY], clear
   /// of the firing hand.
   double get supportPalmY => switch (supportStyle) {
-        GripStyle.foregrip => barrelThickness / 2 + 3.0,
-        GripStyle.topHandle => -(barrelThickness / 2 + 3.5),
+        GripStyle.foregrip || GripStyle.cupMuzzle => barrelThickness / 2 + 3.0,
+        GripStyle.topHandle || GripStyle.overTop => -(barrelThickness / 2 + 3.5),
         _ => supportForeY,
       };
 
@@ -404,6 +416,57 @@ class WeaponView {
     flashR: 23, flashDur: 0.22, sway: 1.4,
   );
 
+  /// **Gale — bellows air gun.** A fat air tank slung under a short, wide
+  /// barrel, held down against its own kick: the off hand presses the barrel
+  /// from above rather than holding any handle.
+  static const WeaponView _gust = WeaponView(
+    id: 'gust',
+    receiverX0: -4, receiverX1: 6, receiverH: 19,
+    barrelX0: 6, barrelX1: 17, bore: 17.6, muzzleX: 27,
+    drumR: 6,
+    sightX: 14,
+    gripX: 0, gripY: 12.5,
+    supportForeX: 9, supportForeY: 0,
+    supportStyle: GripStyle.overTop,
+    holdDist: 22,
+    kick: 4, climb: 0.3, recoilDur: 0.25,
+    flashR: 14, flashDur: 0.18, sway: 1.0,
+  );
+
+  /// **Cinder — firepot mortar.** A squat fat tube on a bipod, cupped at the
+  /// far end like the crew member is daring the muzzle. The reckless hold
+  /// is the joke; the three-turn burn is the punchline.
+  static const WeaponView _cinder = WeaponView(
+    id: 'cinder',
+    receiverX0: -6, receiverX1: 4, receiverH: 20,
+    barrelX0: 4, barrelX1: 14, bore: 19.4, muzzleX: 24,
+    bipodX: 10,
+    gripX: -2, gripY: 13,
+    supportForeX: 15, supportForeY: 0,
+    supportStyle: GripStyle.cupMuzzle,
+    holdDist: 20,
+    kick: 6, climb: 0.32, recoilDur: 0.3,
+    flashR: 17, flashDur: 0.16, sway: 1.0,
+  );
+
+  /// **Wrecker — sapper's lance.** A long breaching barrel with teeth on the
+  /// bell, braced from behind like a push rather than hefted like a cannon.
+  static const WeaponView _wrecker = WeaponView(
+    id: 'wrecker',
+    receiverX0: -10, receiverX1: 4, receiverH: 25,
+    barrelX0: 4, barrelX1: 30, bore: 24.7, muzzleX: 40,
+    stockLen: 8,
+    magLen: 10, magTilt: 0.35,
+    prongLen: 5,
+    gripX: -4, gripY: 16,
+    supportForeX: -12, supportForeY: 15.0,
+    supportStyle: GripStyle.rearBrace,
+    supportBend: -1,
+    holdDist: 24,
+    kick: 8.5, climb: 0.4, recoilDur: 0.4,
+    flashR: 18, flashDur: 0.18, sway: 1.2,
+  );
+
   /// Default model per caliber (what [forId] hands out — tests, previews).
   static const Map<String, WeaponView> _all = {
     'tennis': _tennis,
@@ -411,6 +474,9 @@ class WeaponView {
     'bomb': _bomb,
     'cluster': _cluster,
     'anchor': _anchor,
+    'gust': _gust,
+    'cinder': _cinder,
+    'wrecker': _wrecker,
   };
 
   /// Which caliber owns each hold. Every [GripStyle] appears exactly once,
@@ -423,6 +489,9 @@ class WeaponView {
     GripStyle.heft: 'bomb',
     GripStyle.topHandle: 'cluster',
     GripStyle.crank: 'anchor',
+    GripStyle.overTop: 'gust',
+    GripStyle.cupMuzzle: 'cinder',
+    GripStyle.rearBrace: 'wrecker',
   };
 
   static Map<GripStyle, String> get gripStyleUsage => _gripStyleUsage;

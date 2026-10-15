@@ -50,13 +50,36 @@ void main() {
     expect(Campaign.isWorldUnlocked(Campaign.worlds[2], save), false);
   });
 
-  test('Star rating thresholds match HP-remaining fractions', () {
-    expect(Campaign.starsForHpFraction(1.0), 3);
-    expect(Campaign.starsForHpFraction(0.8), 3);
-    expect(Campaign.starsForHpFraction(0.79), 2);
-    expect(Campaign.starsForHpFraction(0.5), 2);
-    expect(Campaign.starsForHpFraction(0.49), 1);
-    expect(Campaign.starsForHpFraction(0.0), 1);
+  test('Star rating rewards fast, constrained wins — not HP leftovers', () {
+    final level = Campaign.allLevels.first; // ocean_0: tennisOnly, 2 rafts
+    ({int stars, bool roundsMet, bool objectiveMet}) rate({
+      required int rounds,
+      required Set<String> weapons,
+      required bool flawless,
+      required double breakFraction,
+    }) =>
+        Campaign.starsForResult(level,
+            rounds: rounds,
+            weaponsFired: weapons,
+            flawless: flawless,
+            breakFraction: breakFraction);
+
+    // The win itself is always one star.
+    expect(rate(rounds: 99, weapons: {'bomb'}, flawless: false, breakFraction: 0).stars, 1);
+
+    // Fast alone is two.
+    final fast = rate(rounds: level.star2Rounds, weapons: {'bomb'}, flawless: false, breakFraction: 0);
+    expect(fast.stars, 2);
+    expect(fast.roundsMet, true);
+    expect(rate(rounds: level.star2Rounds + 1, weapons: {'bomb'}, flawless: false, breakFraction: 0).stars, 1);
+
+    // Fast plus the constraint is three.
+    final full = rate(rounds: 3, weapons: {'tennis'}, flawless: true, breakFraction: 0);
+    expect(full.stars, 3);
+    expect(full.objectiveMet, true);
+
+    // Slow plus the constraint is two.
+    expect(rate(rounds: 99, weapons: {'tennis'}, flawless: true, breakFraction: 0).stars, 2);
   });
 
   test('recordCampaignLevel awards doubloons and never downgrades a level\'s best star rating', () {

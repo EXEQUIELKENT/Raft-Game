@@ -133,10 +133,31 @@ class _CampaignWorldScreenState extends State<CampaignWorldScreen> {
                                   _infoChip(Icons.sailing, '${level.fleet.length} rafts'),
                                   const SizedBox(width: 8),
                                   _infoChip(Icons.groups, '${level.fleet.fold<int>(0, (s, e) => s + e.crew)} crew'),
+                                  if (level.mutator != null) ...[
+                                    const SizedBox(width: 8),
+                                    _infoChip(
+                                        level.mutator == LevelMutator.storm
+                                            ? Icons.thunderstorm
+                                            : Icons.rocket_launch,
+                                        level.mutator!.title),
+                                  ],
+                                  if (level.surviveRounds > 0) ...[
+                                    const SizedBox(width: 8),
+                                    _infoChip(Icons.shield,
+                                        'SURVIVE ${level.surviveRounds}'),
+                                  ],
                                   const Spacer(),
                                   const Icon(Icons.play_circle_fill, color: Colors.white, size: 30),
                                 ],
                               ),
+                              const SizedBox(height: 8),
+                              _objectiveLine(
+                                  Icons.timer,
+                                  'Win in ${level.star2Rounds} rounds or less',
+                                  onColor),
+                              const SizedBox(height: 3),
+                              _objectiveLine(
+                                  Icons.star, level.star3.blurb, onColor),
                             ],
                           ],
                         ),
@@ -164,6 +185,23 @@ class _CampaignWorldScreenState extends State<CampaignWorldScreen> {
           Text(label, style: RT.body(size: 10, color: Colors.white, weight: FontWeight.w800)),
         ],
       ),
+    );
+  }
+
+  Widget _objectiveLine(IconData icon, String label, Color onColor) {
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Icon(icon, color: Colors.white.withOpacity(0.85), size: 13),
+        const SizedBox(width: 5),
+        Flexible(
+          child: Text(label,
+              style: RT.body(
+                  size: 10,
+                  color: onColor.withOpacity(0.9),
+                  weight: FontWeight.w700)),
+        ),
+      ],
     );
   }
 

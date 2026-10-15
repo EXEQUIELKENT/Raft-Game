@@ -64,7 +64,11 @@ class SaveData {
   double sensitivity = 1.0;
   bool aimAssist = true;
   bool showTrajectory = true;
-  List<String> achievements = [];
+
+  /// The first-run lesson has been finished at least once. Gates the
+  /// first-run banner on the menu and the one-time completion reward —
+  /// never the lesson itself, which stays replayable.
+  bool tutorialDone = false;  List<String> achievements = [];
   List<Map<String, dynamic>> matchHistory = [];
 
   // Campaign
@@ -137,8 +141,8 @@ class SaveData {
         'raftTier': raftTier, 'ammo': ammo,
         'musicVolume': musicVolume, 'sfxVolume': sfxVolume, 'vibration': vibration,
         'quality': quality, 'sensitivity': sensitivity, 'aimAssist': aimAssist,
-        'showTrajectory': showTrajectory, 'achievements': achievements,
-        'matchHistory': matchHistory,
+        'showTrajectory': showTrajectory, 'tutorialDone': tutorialDone,
+        'achievements': achievements,        'matchHistory': matchHistory,
         'buildPlan': buildPlan?.encode(), 'buildOwnRaft': buildOwnRaft,
         'doubloons': doubloons, 'campaignStars': campaignStars, 'upgradeTiers': upgradeTiers,
       };
@@ -178,6 +182,7 @@ class SaveData {
     sensitivity = (j['sensitivity'] ?? 1.0).toDouble();
     aimAssist = j['aimAssist'] ?? true;
     showTrajectory = j['showTrajectory'] ?? true;
+    tutorialDone = j['tutorialDone'] ?? false;
     achievements = List<String>.from(j['achievements'] ?? []);
     matchHistory = List<Map<String, dynamic>>.from(j['matchHistory'] ?? []);
   }

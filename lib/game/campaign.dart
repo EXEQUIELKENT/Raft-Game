@@ -22,7 +22,12 @@ import 'save.dart';
 
 const List<String> kWeaponsBasic = ['tennis', 'grenade'];
 const List<String> kWeaponsMid = ['tennis', 'grenade', 'bomb'];
-const List<String> kWeaponsFull = ['tennis', 'grenade', 'bomb', 'cluster', 'anchor'];
+const List<String> kWeaponsFull = [
+  'tennis', 'grenade', 'bomb', 'cluster', 'anchor',
+  // The utility shelf unlocks with the late game: a shove, a burn and a
+  // breaching round join every full-arsenal fight, on both sides of it.
+  'gust', 'cinder', 'wrecker',
+];
 
 /// One enemy crew archetype, ported from the design mockup's `TYPES` table.
 /// Determines the rival's look, toughness, raft and how shaky their aim is.
@@ -77,6 +82,24 @@ class CampaignLevel {
   final int doubloonReward;
   final bool isBoss;
 
+  /// The third star's constraint. Rotates by battle so every fight asks for
+  /// something different: opener is restraint, middle is care, boss is
+  /// destruction.
+  final StarObjective star3;
+
+  /// Win within this many rounds for the second star. Grows with the fleet
+  /// so a four-raft brawl is not held to a duel's pace.
+  int get star2Rounds => 4 + fleet.length * 2;
+
+  /// Flavour the world mutates: thin air, storms, or a fight that is won by
+  /// outlasting rather than sinking. Null most of the time — ordinary
+  /// physics is the default, not the exception.
+  final LevelMutator? mutator;
+
+  /// Rounds to stay afloat for a survival level. 0 means a normal fight to
+  /// the sinking.
+  final int surviveRounds;
+
   const CampaignLevel({
     required this.id,
     required this.worldId,
@@ -88,9 +111,55 @@ class CampaignLevel {
     required this.enabledWeapons,
     required this.doubloonReward,
     this.isBoss = false,
+    this.star3 = StarObjective.tennisOnly,
+    this.mutator,
+    this.surviveRounds = 0,
   });
 
   MapDef get map => GameMaps.byId(worldId);
+}
+
+/// What the third star demands, beyond winning.
+///
+/// Each is checkable from the match's own end state — no new telemetry
+/// beyond what the controller already tracks — and each pushes a different
+/// playstyle: restraint, care, or deliberate destruction.
+enum StarObjective {
+  /// Win firing nothing but the infinite starter.
+  tennisOnly('TENNIS ONLY', 'Win firing nothing but tennis balls'),
+
+  /// Win without losing a single crewmate of your own.
+  flawless('FLAWLESS', 'Win without losing a single crewmate'),
+
+  /// Win having smashed at least half the breakable defences afloat.
+  demolition('DEMOLITION', 'Smash at least half the buoys and crates');
+
+  final String title;
+  final String blurb;
+  const StarObjective(this.title, this.blurb);
+
+  bool satisfied({
+    required Set<String> weaponsFired,
+    required bool flawless,
+    required double breakFraction,
+  }) =>
+      switch (this) {
+        StarObjective.tennisOnly =>
+          weaponsFired.isNotEmpty && weaponsFired.length == 1 && weaponsFired.contains('tennis'),
+        StarObjective.flawless => flawless,
+        StarObjective.demolition => breakFraction >= 0.5,
+      };
+}
+
+/// A flavour mutation for a level: thin air that floats every shot further,
+/// a storm that triples the gusts and rains on the channel, or nothing.
+enum LevelMutator {
+  lowGravity('THIN AIR', 'Shots fly floaty and far'),
+  storm('STORM', 'Triple gusts and driving rain');
+
+  final String title;
+  final String blurb;
+  const LevelMutator(this.title, this.blurb);
 }
 
 class CampaignWorld {
@@ -129,6 +198,9 @@ class Campaign {
     List<String> weapons,
     int reward, {
     bool boss = false,
+    StarObjective? star3,
+    LevelMutator? mutator,
+    int surviveRounds = 0,
   }) =>
       CampaignLevel(
         id: '${world}_$i',
@@ -141,6 +213,15 @@ class Campaign {
         enabledWeapons: weapons,
         doubloonReward: reward,
         isBoss: boss,
+        // Openers ask restraint, middles ask care, bosses ask destruction.
+        star3: star3 ??
+            const [
+              StarObjective.tennisOnly,
+              StarObjective.flawless,
+              StarObjective.demolition,
+            ][i.clamp(0, 2)],
+        mutator: mutator,
+        surviveRounds: surviveRounds,
       );
 
   static const _raider = EnemyArchetype.raider;
@@ -161,16 +242,16 @@ class Campaign {
     CampaignWorld(id: 'island', theme: CharacterTheme.buccaneer, levels: [
       _lvl('island', 0, 'Beach Bum Benny', AiDifficulty.easy, 5, [_raider, _ducker], kWeaponsBasic, 24),
       _lvl('island', 1, 'Tiki Tom', AiDifficulty.normal, 15, [_ducker, _pirate], kWeaponsMid, 34),
-      _lvl('island', 2, 'Queen Palma', AiDifficulty.hard, 25, [_pirate, _ducker, _raider], kWeaponsFull, 55, boss: true),
+      _lvl('island', 2, 'Queen Palma', AiDifficulty.hard, 25, [_pirate, _ducker, _raider], kWeaponsFull, 55, boss: true, mutator: LevelMutator.storm),
     ]),
     CampaignWorld(id: 'mountains', theme: CharacterTheme.frostbound, levels: [
       _lvl('mountains', 0, 'Icy Ike', AiDifficulty.easy, 10, [_raider, _raider, _ducker], kWeaponsBasic, 28),
-      _lvl('mountains', 1, 'Blizzard Belle', AiDifficulty.normal, 20, [_pirate, _ducker], kWeaponsMid, 38),
+      _lvl('mountains', 1, 'Blizzard Belle', AiDifficulty.normal, 20, [_pirate, _ducker], kWeaponsMid, 38, mutator: LevelMutator.lowGravity),
       _lvl('mountains', 2, 'The Glacier King', AiDifficulty.hard, 30, [_pirate, _captain], kWeaponsFull, 60, boss: true),
     ]),
     CampaignWorld(id: 'desert', theme: CharacterTheme.sunbaked, levels: [
       _lvl('desert', 0, 'Sandstorm Sal', AiDifficulty.easy, 15, [_ducker, _raider, _ducker], kWeaponsBasic, 32),
-      _lvl('desert', 1, 'Barrel Bart', AiDifficulty.normal, 25, [_pirate, _raider, _ducker], kWeaponsMid, 42),
+      _lvl('desert', 1, 'Barrel Bart', AiDifficulty.normal, 25, [_pirate, _raider, _ducker], kWeaponsMid, 42, surviveRounds: 6),
       _lvl('desert', 2, 'Dune Baron Duke', AiDifficulty.hard, 35, [_captain, _pirate], kWeaponsFull, 65, boss: true),
     ]),
     CampaignWorld(id: 'volcano', theme: CharacterTheme.emberkin, levels: [
@@ -180,8 +261,8 @@ class Campaign {
     ]),
     CampaignWorld(id: 'city', theme: CharacterTheme.harbour, levels: [
       _lvl('city', 0, 'Rookie Rex', AiDifficulty.normal, 25, [_pirate, _ducker, _raider], kWeaponsMid, 45),
-      _lvl('city', 1, 'Skyline Sadie', AiDifficulty.hard, 35, [_captain, _pirate], kWeaponsFull, 60),
-      _lvl('city', 2, 'Captain Chaos', AiDifficulty.expert, 50, [_captain, _pirate, _pirate, _captain], kWeaponsFull, 100, boss: true),
+      _lvl('city', 1, 'Skyline Sadie', AiDifficulty.hard, 35, [_captain, _pirate], kWeaponsFull, 60, surviveRounds: 8),
+      _lvl('city', 2, 'Captain Chaos', AiDifficulty.expert, 50, [_captain, _pirate, _pirate, _captain], kWeaponsFull, 100, boss: true, mutator: LevelMutator.storm),
     ]),
   ];
 
@@ -215,13 +296,32 @@ class Campaign {
 
   static int maxStars = allLevels.length * 3;
 
-  /// Win-quality -> star rating, based on how much of the player's own
-  /// starting HP survived the battle — visible the whole match via the HP
-  /// bar, so it's an intuitive target rather than a hidden metric.
-  static int starsForHpFraction(double hpFraction) {
-    if (hpFraction >= 0.8) return 3;
-    if (hpFraction >= 0.5) return 2;
-    return 1;
+  /// Star rating for a won level, from what the victory looked like rather
+  /// than how much HP happened to survive it:
+  ///   1 star: the win itself.
+  ///   2 stars: won within [CampaignLevel.star2Rounds] rounds.
+  ///   3 stars: the level's [StarObjective] held too.
+  ///
+  /// Returns the count plus the per-objective breakdown the result panel
+  /// shows, so the sim and the UI can never disagree about what earned what.
+  static ({int stars, bool roundsMet, bool objectiveMet}) starsForResult(
+    CampaignLevel level, {
+    required int rounds,
+    required Set<String> weaponsFired,
+    required bool flawless,
+    required double breakFraction,
+  }) {
+    final roundsMet = rounds <= level.star2Rounds;
+    final objectiveMet = level.star3.satisfied(
+      weaponsFired: weaponsFired,
+      flawless: flawless,
+      breakFraction: breakFraction,
+    );
+    return (
+      stars: 1 + (roundsMet ? 1 : 0) + (objectiveMet ? 1 : 0),
+      roundsMet: roundsMet,
+      objectiveMet: objectiveMet,
+    );
   }
 
   /// Builds the (MatchSettings, players) pair for launching [level] as a
@@ -257,6 +357,15 @@ class Campaign {
       ammo: save.battleAmmo(),
       difficultyTier: difficultyTierOf(level),
       isBoss: level.isBoss,
+      // The level's flavour, translated into match physics: thin air floats
+      // every shot, storms triple the gusts and rain on the channel, and a
+      // survival level ends at the bell instead of at a sinking.
+      gravityScale: level.mutator == LevelMutator.lowGravity ? 0.55 : 1.0,
+      windScale: level.mutator == LevelMutator.storm ? 2.2 : 1.0,
+      storm: level.mutator == LevelMutator.storm,
+      roundLimit: level.surviveRounds,
+      // A demolition star is only fair on a field with something to smash.
+      minBreakables: level.star3 == StarObjective.demolition ? 1 : 0,
       // Campaign has no pre-battle setup screen, so the choice between a
       // prefab hull and a deck of your own is made once in the shipyard and
       // carried into every level from there. Without this the building
