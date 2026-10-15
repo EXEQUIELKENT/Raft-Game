@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.1.4](https://github.com/EXEQUIELKENT/Raft-Game/compare/raft_rumble-v1.1.3...raft_rumble-v1.1.4) (2026-10-15)
+
+
+### Bug Fixes
+
+* new ([5a24767](https://github.com/EXEQUIELKENT/Raft-Game/commit/5a24767c38e705ee6e21af44819a2cbab5cacec6))
+
 ## [1.1.3](https://github.com/EXEQUIELKENT/Raft-Game/compare/raft_rumble-v1.1.2...raft_rumble-v1.1.3) (2026-10-15)
 
 
