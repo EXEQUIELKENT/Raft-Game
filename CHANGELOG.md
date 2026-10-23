@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.1.4](https://github.com/EXEQUIELKENT/Raft-Game/compare/raft_rumble-v1.1.3...raft_rumble-v1.1.4) (2026-10-23)
+
+
+### Bug Fixes
+
+* new ([5a24767](https://github.com/EXEQUIELKENT/Raft-Game/commit/5a24767c38e705ee6e21af44819a2cbab5cacec6))
+* Refine battle HUD and camera framing ([e48b2c4](https://github.com/EXEQUIELKENT/Raft-Game/commit/e48b2c4ab60628ca5e63e96a61483337dd6885b7))
+
 ## [1.1.3](https://github.com/EXEQUIELKENT/Raft-Game/compare/raft_rumble-v1.1.2...raft_rumble-v1.1.3) (2026-10-15)
 
 
