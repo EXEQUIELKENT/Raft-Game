@@ -65,6 +65,12 @@ class SaveData {
   bool aimAssist = true;
   bool showTrajectory = true;
 
+  /// Whether crew may talk over each other during a battle — the speech
+  /// bubbles above their heads. On by default; the bubbles are half the
+  /// life of the game, but they are also a white box over the action, so
+  /// the player gets to turn them off.
+  bool crewChatter = true;
+
   /// The first-run lesson has been finished at least once. Gates the
   /// first-run banner on the menu and the one-time completion reward —
   /// never the lesson itself, which stays replayable.
@@ -141,7 +147,8 @@ class SaveData {
         'raftTier': raftTier, 'ammo': ammo,
         'musicVolume': musicVolume, 'sfxVolume': sfxVolume, 'vibration': vibration,
         'quality': quality, 'sensitivity': sensitivity, 'aimAssist': aimAssist,
-        'showTrajectory': showTrajectory, 'tutorialDone': tutorialDone,
+        'showTrajectory': showTrajectory, 'crewChatter': crewChatter,
+        'tutorialDone': tutorialDone,
         'achievements': achievements,        'matchHistory': matchHistory,
         'buildPlan': buildPlan?.encode(), 'buildOwnRaft': buildOwnRaft,
         'doubloons': doubloons, 'campaignStars': campaignStars, 'upgradeTiers': upgradeTiers,
@@ -182,6 +189,7 @@ class SaveData {
     sensitivity = (j['sensitivity'] ?? 1.0).toDouble();
     aimAssist = j['aimAssist'] ?? true;
     showTrajectory = j['showTrajectory'] ?? true;
+    crewChatter = j['crewChatter'] ?? true;
     tutorialDone = j['tutorialDone'] ?? false;
     achievements = List<String>.from(j['achievements'] ?? []);
     matchHistory = List<Map<String, dynamic>>.from(j['matchHistory'] ?? []);

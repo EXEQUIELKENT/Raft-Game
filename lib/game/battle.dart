@@ -4558,28 +4558,31 @@ class BattleWorld {
   ///
   /// Two wants, resolved in this order:
   ///
-  ///  1. The camera anchor's own waterline sits about two thirds of the way
-  ///     down the window, so their deck and crew have sky to work in and the
-  ///     shooter never slides up behind the top HUD just because the map put
-  ///     them on a high terrace.
+  ///  1. The camera anchor's crew body sits comfortably in frame: their body
+  ///     centre targets about 42% down the window, leaving sky above for the
+  ///     head and water below for splash feedback.
   ///  2. The lowest water in frame stays visible: when the anchor is up high
   ///     and the window reaches across a falls, the sea below would otherwise
   ///     slide off the bottom edge, and the impact of a shot lobbed down onto
   ///     it would happen off-screen.
   ///
-  /// When the two wants conflict — a tall drop across a narrow window cannot
-  /// have both — the second wins by taking whichever target sits LOWER (the
-  /// larger offset), which shows more of the drop and leaves the anchor a
-  /// little above its ideal line rather than hiding the water it is firing
-  /// into. The window may lean a little way past either world edge: above the
-  /// top is empty sky (the gradient clamps), below the bottom is deep water.
+  /// When the two wants conflict the lower target wins, which shows more of
+  /// the drop and leaves the anchor a little above its ideal line rather than
+  /// hiding the water they are firing into. The window may lean a little way
+  /// past either world edge: above the top is empty sky (the gradient clamps),
+  /// below the bottom is deep water.
   ///
-  /// The first call snaps rather than eases, so a match that opens on a
-  /// raised terrace does not start with a visible slide into place.
+  /// Elevation changes snap quickly when far away and ease smoothly when
+  /// close, so crossing a falls reads as a quick reframe rather than a slow
+  /// drag, and small jitters don't shake the view.
   void _easeCamY(double dt) {
     ensureCamY();
     final target = _camYTarget();
-    camY += (target - camY) * (dt * 2.5).clamp(0.0, 1.0);
+    final diff = target - camY;
+    // Snap quickly across large elevation changes (steps/waterfalls), ease
+    // gently when close so small jitters don't shake the view.
+    final rate = diff.abs() > 40 ? 10.0 : 3.0;
+    camY += diff * (dt * rate).clamp(0.0, 1.0);
   }
 
   /// Places the vertical camera on its target if it has never been placed.
@@ -4600,16 +4603,33 @@ class BattleWorld {
   double _camYTarget() {
     final anchor = raftOf(camAnchor);
     final centreX = anchor?.x ?? (cam + viewWidth / 2);
-    final focus = waterAt(centreX);
-    var target = focus - BattleConst.viewH * 0.62;
 
-    var lowest = focus;
+    // Target the active crew's body centre so the whole character stays in
+    // frame, not just the water beneath their feet. Crew stand on the deck
+    // which sits above the waterline, so targeting the waterline alone cuts
+    // the top of heads off on high terraces.
+    double targetY;
+    final crew = anchor?.activeCrew;
+    if (crew != null) {
+      // crew != null implies anchor != null and activeIndex is valid.
+      final a = anchor!;
+      // crewPos is feet - 24, i.e. roughly body centre.
+      targetY = a.crewPos(a.activeIndex).dy - BattleConst.viewH * 0.42;
+    } else {
+      final focus = waterAt(centreX);
+      targetY = focus - BattleConst.viewH * 0.62;
+    }
+
+    // Keep the lowest stretch of water in frame so shots landing below the
+    // anchor stay visible.
+    var lowest = waterAt(centreX);
     for (double x = cam; x <= cam + viewWidth + 60; x += 120) {
       final y = waterAt(x);
       if (y > lowest) lowest = y;
     }
-    target = max(target, lowest - BattleConst.viewH * 0.94);
-    return target.clamp(-60.0, BattleConst.worldH - BattleConst.viewH);
+    targetY = max(targetY, lowest - BattleConst.viewH * 0.90);
+
+    return targetY.clamp(-60.0, BattleConst.worldH - BattleConst.viewH);
   }
 
   /// One 60Hz tick of every crew body on the water.

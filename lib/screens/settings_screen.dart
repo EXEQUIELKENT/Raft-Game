@@ -68,6 +68,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       _toggle('VIBRATION', d.vibration, (v) => setState(() => d.vibration = v)),
                       _toggle('TRAJECTORY PREVIEW', d.showTrajectory, (v) => setState(() => d.showTrajectory = v)),
                       _toggle('AIM ASSIST', d.aimAssist, (v) => setState(() => d.aimAssist = v)),
+                      _toggle('CREW CHATTER', d.crewChatter, (v) => setState(() => d.crewChatter = v)),
                       _qualityPicker(d),
                       const SizedBox(height: 10),
                       ChunkyButton(

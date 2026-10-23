@@ -118,7 +118,10 @@ class AppIcon {
     final radius = size * visible / 2;
     final corner =
         Offset(box.width / 2 * u, box.height / 2 * u).distance;
-    final scale = radius / corner;
+    // Scale down with a small margin so that stroke widths and antialiasing
+    // on the box corners stay inside the guaranteed-visible circle instead of
+    // being cropped by OEM masks.
+    final scale = (radius / corner) * 0.8501;
 
     canvas.save();
     canvas.translate(size / 2, size / 2);

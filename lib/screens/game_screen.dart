@@ -8,6 +8,7 @@ import '../game/battle.dart';
 import '../game/build.dart';
 import '../game/campaign.dart';
 import '../game/controller.dart';
+import '../game/desktop.dart';
 import '../game/models.dart';
 import '../game/renderer.dart';
 import '../game/save.dart';
@@ -94,6 +95,32 @@ class _GameScreenState extends State<GameScreen> {
   /// Whether the in-match chat panel is expanded. Collapsed by default so
   /// it never covers the deck a player is aiming at.
   bool _chatOpen = false;
+
+  /// The transient message at the top of the screen.
+  ///
+  /// The status line used to live in a permanent pill in the bottom bar,
+  /// which meant it always showed something — even the idle "Pull back and
+  /// release" — and it sat in the same row as the nudge buttons, making the
+  /// whole right-hand group wide enough to squeeze the weapon bar. It is a
+  /// toast now: it appears for real events, fades after a couple of
+  /// seconds, and gets out of the way.
+  String _toastText = '';
+
+  /// The controller's clock when the toast was raised.
+  double _toastStart = 0;
+
+  /// The last status the controller reported, so a change can be told from
+  /// a status merely still being current.
+  String _seenStatus = '';
+
+  /// Opacity step of the toast, quantised so its fade does not rebuild the
+  /// whole HUD sixty times a second.
+  int _toastBucket = 0;
+
+  /// Whether the fine-tune nudge buttons are showing. They are hidden by
+  /// default: the pull-back drag already sets angle and power, and on a
+  /// phone the four buttons were a big chunk of the bottom bar.
+  bool _fineTune = false;
 
   int? _campaignStars;
   int? _campaignReward;
@@ -201,9 +228,11 @@ class _GameScreenState extends State<GameScreen> {
         Navigator.pop(context);
         return;
       default:
-        // 1..5 pick a weapon, matching the HUD order.
+        // 1..9 pick a weapon, matching the HUD order. The shelf grew to
+        // eight rounds, so the old 1..5 left the last three unreachable
+        // from the keyboard.
         final label = event.logicalKey.keyLabel;
-        if (label.length == 1 && label.codeUnitAt(0) >= 0x31 && label.codeUnitAt(0) <= 0x35) {
+        if (label.length == 1 && label.codeUnitAt(0) >= 0x31 && label.codeUnitAt(0) <= 0x39) {
           final i = int.parse(label) - 1;
           final weapons = ctrl.availableWeapons;
           if (i < weapons.length) setState(() => ctrl.selectWeapon(weapons[i].id));
@@ -238,6 +267,34 @@ class _GameScreenState extends State<GameScreen> {
     final angle = ctrl.aimAngle.round();
     final power = ctrl.aimPower.round();
     final enteringGameOver = _lastPhase != GamePhase.gameOver && ctrl.phase == GamePhase.gameOver;
+    // A turn arriving for the local player — the chat panel shuts for it.
+    final yourTurnBegan = ctrl.canHumanAct && _lastPlayer != ctrl.currentPlayer;
+
+    // The toast: a real event raises it, and it fades on its own clock.
+    // Idle prompts ("Your turn", "Salty Sam is aiming…") are not events and
+    // never raise it — the player can read the board for those.
+    var toastDirty = false;
+    if (ctrl.statusMessage != _seenStatus) {
+      _seenStatus = ctrl.statusMessage;
+      if (_isEventStatus(ctrl.statusMessage)) {
+        _toastText = ctrl.statusMessage;
+        _toastStart = ctrl.time;
+        toastDirty = true;
+      }
+    }
+    // The toast runs on the controller's own clock, so it is timed from the
+    // moment it was raised rather than by an absolute deadline: a rematch
+    // resets that clock, and a deadline would then hold the toast up for
+    // ever. The clamp covers the same backwards jump.
+    final elapsed = (ctrl.time - _toastStart).clamp(0.0, toastLife);
+    final remaining = toastLife - elapsed;
+    final bucket = remaining <= 0
+        ? 0
+        : ((remaining / toastFade).clamp(0.0, 1.0) * 8).round().clamp(1, 8);
+    if (bucket != _toastBucket) {
+      _toastBucket = bucket;
+      toastDirty = true;
+    }
 
     var tutorialDirty = false;
     if (_tutorial != null && !_tutorial!.completed) tutorialDirty = _trackTutorial();
@@ -252,7 +309,8 @@ class _GameScreenState extends State<GameScreen> {
         _lastWeapon != ctrl.selectedWeaponId ||
         _charging ||
         hpChanged ||
-        tutorialDirty;
+        tutorialDirty ||
+        toastDirty;
 
     if (dirty) {
       _lastPhase = ctrl.phase;
@@ -264,6 +322,10 @@ class _GameScreenState extends State<GameScreen> {
       _lastPower = power;
       _lastWeapon = ctrl.selectedWeaponId;
       _lastHp = hp;
+      // The chat panel folds itself away the moment a turn comes to you:
+      // a 230x172 box over the right-hand side is exactly where the player
+      // is about to be aiming.
+      if (_chatOpen && yourTurnBegan) _chatOpen = false;
       setState(() {});
     }
     if (enteringGameOver && widget.campaignLevel != null) _recordCampaignResult();
@@ -296,6 +358,52 @@ class _GameScreenState extends State<GameScreen> {
   Future<void> _completeTutorial() async {
     _tutorialReward = await Tutorial.complete();
     if (mounted) setState(() {});
+  }
+
+  /// How long a toast stays up, and how long it takes to fade out at the end.
+  static const double toastLife = 2.0;
+  static const double toastFade = 0.45;
+
+  /// Whether a status message is worth interrupting for.
+  ///
+  /// The idle prompts are the board speaking, not an event: "Your turn" and
+  /// "Salty Sam is aiming…" are visible from the turn order and the camera
+  /// itself. Everything else — a shot away, a hit, a body still recovering,
+  /// a crew member tangled up — is something that happened.
+  static bool _isEventStatus(String status) {
+    if (status.isEmpty) return false;
+    if (status == 'Pull back and release') return false;
+    if (status == 'Your turn') return false;
+    if (status.endsWith(' is aiming…')) return false;
+    return true;
+  }
+
+  /// The toast itself: a small pill at the top of the screen, over the
+  /// water rather than over the controls.
+  Widget _buildToast() {
+    if (_toastBucket == 0 || _toastText.isEmpty) return const SizedBox.shrink();
+    // The tutorial card owns the top of the screen in a lesson, so the
+    // toast stands aside rather than stacking on it.
+    if (_tutorial != null && !_tutorial!.completed) return const SizedBox.shrink();
+    return Positioned(
+      top: 62,
+      left: 0,
+      right: 0,
+      child: Center(
+        child: Opacity(
+          opacity: _toastBucket / 8,
+          child: Container(
+            padding: EdgeInsets.symmetric(horizontal: 16, vertical: 8 * _ui),
+            decoration: RT.pill(color: RT.ink, opacity: 0.72, radius: 14),
+            child: Text(_toastText,
+                style: RT.body(
+                    size: 13 * _ui,
+                    color: Colors.white,
+                    weight: FontWeight.w800)),
+          ),
+        ),
+      ),
+    );
   }
 
   void _recordCampaignResult() {
@@ -569,6 +677,9 @@ class _GameScreenState extends State<GameScreen> {
               // build screen unreadable and let a stray tap drive the match
               // instead of the raft.
               if (!_building) SafeArea(child: _buildHud()),
+              // The toast sits above the HUD, over the water rather than over
+              // the controls, and only ever up for a couple of seconds.
+              if (!_building) _buildToast(),
               if (_tutorial != null &&
                   !_tutorial!.completed &&
                   ctrl.phase != GamePhase.gameOver)
@@ -703,7 +814,12 @@ class _GameScreenState extends State<GameScreen> {
 
   /// The lesson card for a tutorial match: which step is showing, what to do,
   /// and the solved hint on the final step. Sits top-centre, clear of the
-  /// health bar (left) and the foe marker (right).
+  /// health bar (left) and the chips (right).
+  ///
+  /// Deliberately only the step text and the progress dots. The card used
+  /// to carry a "LEARN THE ROPES" header and a "STEP 1 OF 3" caption as
+  /// well, which is three lines of chrome for one line of instruction — and
+  /// the dots already say which step this is.
   Widget _buildTutorialCard() {
     final t = _tutorial!;
     final stepIndex = TutorialStep.values.indexOf(t.step);
@@ -711,7 +827,8 @@ class _GameScreenState extends State<GameScreen> {
     final String body;
     switch (t.step) {
       case TutorialStep.shoot:
-        body = 'Pull back on the water, then release — fire your first shot anywhere.';
+        body = 'Pull back on the water, then release — fire your first shot '
+            'anywhere. Tap a crew member to switch who is aiming.';
       case TutorialStep.power:
         body =
             'Power is range. Pull further back and fire a shot over ${TutorialConfig.powerThreshold.round()}% power.';
@@ -721,54 +838,37 @@ class _GameScreenState extends State<GameScreen> {
             : 'Lob over the rock and sink the practice raft. Try about ${hint.angle.round()}° and ${hint.power.round()}% power.';
     }
     return Positioned(
-      top: 74,
+      top: 62,
       left: 0,
       right: 0,
       child: Center(
         child: Container(
           constraints: const BoxConstraints(maxWidth: 430),
-          margin: const EdgeInsets.symmetric(horizontal: 90),
-          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+          margin: const EdgeInsets.symmetric(horizontal: 70),
+          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 9),
           decoration: RT.pill(color: RT.ink, opacity: 0.78, radius: 16),
-          child: Column(
+          child: Row(
             mainAxisSize: MainAxisSize.min,
             children: [
-              Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Text('LEARN THE ROPES',
-                      style: RT.body(
-                          size: 10,
-                          color: RT.yellow,
-                          weight: FontWeight.w800,
-                          letterSpacing: 2)),
-                  const SizedBox(width: 10),
-                  for (int i = 0; i < TutorialStep.values.length; i++)
-                    Padding(
-                      padding: const EdgeInsets.only(left: 4),
-                      child: Icon(
-                        i < stepIndex
-                            ? Icons.check_circle
-                            : (i == stepIndex
-                                ? Icons.radio_button_checked
-                                : Icons.radio_button_unchecked),
-                        size: 13,
-                        color: i <= stepIndex ? RT.yellow : Colors.white.withOpacity(0.45),
-                      ),
-                    ),
-                  const SizedBox(width: 10),
-                  Text('STEP ${stepIndex + 1} OF ${TutorialStep.values.length}',
-                      style: RT.body(
-                          size: 10,
-                          color: Colors.white.withOpacity(0.7),
-                          weight: FontWeight.w800,
-                          letterSpacing: 1.2)),
-                ],
+              for (int i = 0; i < TutorialStep.values.length; i++)
+                Padding(
+                  padding: const EdgeInsets.only(right: 4),
+                  child: Icon(
+                    i < stepIndex
+                        ? Icons.check_circle
+                        : (i == stepIndex
+                            ? Icons.radio_button_checked
+                            : Icons.radio_button_unchecked),
+                    size: 13,
+                    color: i <= stepIndex ? RT.yellow : Colors.white.withOpacity(0.45),
+                  ),
+                ),
+              const SizedBox(width: 6),
+              Flexible(
+                child: Text(body,
+                    textAlign: TextAlign.center,
+                    style: RT.body(size: 12, color: Colors.white, weight: FontWeight.w700)),
               ),
-              const SizedBox(height: 4),
-              Text(body,
-                  textAlign: TextAlign.center,
-                  style: RT.body(size: 12, color: Colors.white, weight: FontWeight.w700)),
             ],
           ),
         ),
@@ -780,32 +880,6 @@ class _GameScreenState extends State<GameScreen> {
     return Column(
       children: [
         _topBar(),
-        if (ctrl.offscreenFoes > 0)
-          Align(
-            alignment: Alignment.centerRight,
-            child: Padding(
-              padding: const EdgeInsets.only(right: 22, top: 6),
-              child: Container(
-                padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 7),
-                decoration: RT.pill(color: RT.ink, opacity: 0.6, radius: 12),
-                child: Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Text('${ctrl.offscreenFoes} FOE OVER THE HORIZON',
-                        style: RT.body(
-                            size: 11,
-                            color: Colors.white,
-                            weight: FontWeight.w800)),
-                    // An icon, not U+25B8: Nunito has no Geometric Shapes at
-                    // all, so the arrow was down to whatever the platform
-                    // happened to substitute.
-                    const Icon(Icons.chevron_right,
-                        size: 15, color: Colors.white),
-                  ],
-                ),
-              ),
-            ),
-          ),
         const Spacer(),
         _bottomBar(),
       ],
@@ -824,7 +898,6 @@ class _GameScreenState extends State<GameScreen> {
   double get _ui => (MediaQuery.sizeOf(context).height / 470).clamp(0.78, 1.0);
 
   Widget _topBar() {
-    final save = SaveService.instance.data;
     final me = ctrl.world.raftOf(ctrl.localPlayerIndex);
     return Padding(
       key: _topBarKey,
@@ -833,7 +906,7 @@ class _GameScreenState extends State<GameScreen> {
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           _roundBtn(() => Navigator.pop(context), icon: Icons.arrow_back_ios_new, size: 40 * _ui),
-          const SizedBox(width: 10),
+          const SizedBox(width: 8),
           // Player health, at a fixed width and claiming no share of the
           // free space.
           //
@@ -843,44 +916,46 @@ class _GameScreenState extends State<GameScreen> {
           // flex 1 it swallowed three quarters of the row. The chips then
           // had nowhere to go but left. The overflow it was guarding against
           // came from the chips anyway, and they scroll now.
+          //
+          // One bar with the number inside it, not a labelled panel with a
+          // number above it: "YOUR RAFT" and a separate readout said the
+          // same thing twice and cost a third of the bar's width.
           SizedBox(
-            width: 210 * _ui,
+            width: 130 * _ui,
             child: Container(
-            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-            decoration: RT.pill(opacity: 0.8, radius: 14),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Row(
-                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                  children: [
-                    Text('YOUR RAFT',
-                        style: RT.body(size: 10, color: RT.ink, weight: FontWeight.w800, letterSpacing: 1.2)),
-                    Text('${(me?.hp ?? 0).round()}',
-                        style: RT.body(size: 10, color: RT.ink, weight: FontWeight.w800)),
-                  ],
-                ),
-                const SizedBox(height: 4),
-                ClipRRect(
-                  borderRadius: BorderRadius.circular(6),
-                  child: LinearProgressIndicator(
-                    value: me?.hpFrac ?? 0,
-                    minHeight: 9,
-                    backgroundColor: RT.ink.withOpacity(0.14),
-                    valueColor: AlwaysStoppedAnimation(
-                      (me?.hpFrac ?? 0) > 0.5 ? RT.green : ((me?.hpFrac ?? 0) > 0.25 ? RT.orange : RT.red),
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
+              decoration: RT.pill(opacity: 0.8, radius: 14),
+              child: Stack(
+                alignment: Alignment.center,
+                children: [
+                  ClipRRect(
+                    borderRadius: BorderRadius.circular(6),
+                    child: LinearProgressIndicator(
+                      value: me?.hpFrac ?? 0,
+                      minHeight: 20,
+                      backgroundColor: RT.ink.withOpacity(0.14),
+                      valueColor: AlwaysStoppedAnimation(
+                        (me?.hpFrac ?? 0) > 0.5 ? RT.green : ((me?.hpFrac ?? 0) > 0.25 ? RT.orange : RT.red),
+                      ),
                     ),
                   ),
-                ),
-              ],
-            ),
+                  Text('${(me?.hp ?? 0).round()}',
+                      style: RT.body(
+                          size: 11, color: RT.ink, weight: FontWeight.w800)),
+                ],
+              ),
             ),
           ),
           const SizedBox(width: 8),
           // The readouts, held against the RIGHT edge and allowed to scroll
-          // off to the left if they cannot all fit. Reversed so the things
-          // that must never be lost — the purse and the crew count — keep
-          // the right edge, and the aim readout is the first to go.
+          // off to the left if they cannot all fit.
+          //
+          // Only two chips are left: the wind (which changes the shot and
+          // must be read) and one combined chip carrying the crew left, the
+          // opponents still over the horizon and — in a survival level —
+          // the round. The aim readout and the purse used to sit here too;
+          // the first now lives on the floating card above the shooter, and
+          // the second belongs on the results screen, not over the water.
           //
           // Expanded rather than Flexible, and this is the whole of it: a
           // Flexible box only claims its share of the free space, so on a
@@ -894,36 +969,9 @@ class _GameScreenState extends State<GameScreen> {
               reverse: true,
               child: Row(
                 children: [
-                  _infoChip(
-                      'ANGLE ${ctrl.aimAngle.round()}° · PWR ${ctrl.aimPower.round()}%'),
-                  const SizedBox(width: 8),
                   _windChip(),
                   const SizedBox(width: 8),
-                  _infoChip('${_levelLabel()} · ${ctrl.foesLeft} CREW LEFT'),
-                  if (ctrl.settings.roundLimit > 0) ...[
-                    const SizedBox(width: 8),
-                    _infoChip(
-                        'SURVIVE ${ctrl.round}/${ctrl.settings.roundLimit}'),
-                  ],
-                  const SizedBox(width: 8),
-                  Container(
-                    padding:
-                        EdgeInsets.symmetric(horizontal: 12 * _ui, vertical: 9 * _ui),
-                    decoration: RT.pill(color: RT.yellow, opacity: 1, radius: 13),
-                    child: Row(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        const Icon(Icons.monetization_on,
-                            size: 14, color: Color(0xFF6B4A00)),
-                        const SizedBox(width: 4),
-                        Text('${save.doubloons}',
-                            style: RT.body(
-                                size: 12 * _ui,
-                                color: const Color(0xFF6B4A00),
-                                weight: FontWeight.w800)),
-                      ],
-                    ),
-                  ),
+                  _crewChip(),
                 ],
               ),
             ),
@@ -933,9 +981,18 @@ class _GameScreenState extends State<GameScreen> {
     );
   }
 
-  String _levelLabel() {
-    final lv = widget.campaignLevel;
-    return lv == null ? 'QUICK' : 'LV ${lv.indexInWorld + 1}';
+  /// The one status chip: how much enemy crew is left, how many opponents
+  /// are still over the horizon, and — in a survival level — the round
+  /// counter. Everything the player needs to know about the state of the
+  /// fight, in one pill, instead of three.
+  Widget _crewChip() {
+    final foes = ctrl.offscreenFoes;
+    final parts = <String>['${ctrl.foesLeft} CREW LEFT'];
+    if (foes > 0) parts.add('$foes OVER HORIZON');
+    if (ctrl.settings.roundLimit > 0) {
+      parts.add('ROUND ${ctrl.round}/${ctrl.settings.roundLimit}');
+    }
+    return _infoChip(parts.join(' · '));
   }
 
   Widget _infoChip(String text) => Container(
@@ -979,6 +1036,13 @@ class _GameScreenState extends State<GameScreen> {
   }
 
   Widget _bottomBar() {
+    // Controls that are not yours to press are dimmed, not hidden. The
+    // fire button has always kept its place on screen so a thumb resting
+    // there is never surprised, and the same reasoning covers the weapon
+    // bar: fading them to a third clears the view without moving anything
+    // under a thumb that is already resting there.
+    final yours = ctrl.canHumanAct || ctrl.canSteer;
+    final dim = yours ? 1.0 : 0.3;
     return Padding(
       padding: EdgeInsets.fromLTRB(16, 0, 16, 14 * _ui),
       child: Row(
@@ -992,18 +1056,21 @@ class _GameScreenState extends State<GameScreen> {
           // right edge — a plain gap here left them stranded in the middle
           // of a wide window with the whole right half of the screen empty.
           Expanded(
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                // Only on your own turn, and only while there is somebody on
-                // their feet to walk — the pads would be a lie otherwise.
-                if (ctrl.canSteer) ...[
-                  _walkBar(),
-                  const SizedBox(height: 8),
+            child: Opacity(
+              opacity: dim,
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  // Only on your own turn, and only while there is somebody on
+                  // their feet to walk — the pads would be a lie otherwise.
+                  if (ctrl.canSteer) ...[
+                    _walkBar(),
+                    const SizedBox(height: 8),
+                  ],
+                  _weaponBar(),
                 ],
-                _weaponBar(),
-              ],
+              ),
             ),
           ),
           const SizedBox(width: 12),
@@ -1013,7 +1080,7 @@ class _GameScreenState extends State<GameScreen> {
             mainAxisSize: MainAxisSize.min,
             crossAxisAlignment: CrossAxisAlignment.end,
             children: [
-              _nudgeBar(),
+              Opacity(opacity: dim, child: _nudgeBar()),
               const SizedBox(height: 10),
               _fireButton(),
             ],
@@ -1046,6 +1113,12 @@ class _GameScreenState extends State<GameScreen> {
     );
   }
 
+  /// A weapon chip.
+  ///
+  /// A row of eight of these used to run the width of a phone, because each
+  /// one carried its name. The name is only on the SELECTED chip now: the
+  /// colour dot says which round it is, the count says how many are left,
+  /// and the name of the one in your hand is the only one worth reading.
   Widget _weaponChip(WeaponDef w) {
     final selected = ctrl.selectedWeaponId == w.id;
     final count = ctrl.ammoFor(w.id);
@@ -1059,7 +1132,8 @@ class _GameScreenState extends State<GameScreen> {
       child: Opacity(
         opacity: enabled ? 1 : 0.45,
         child: Container(
-          padding: EdgeInsets.symmetric(horizontal: 13 * _ui, vertical: 9 * _ui),
+          padding: EdgeInsets.symmetric(
+              horizontal: selected ? 13 * _ui : 10 * _ui, vertical: 9 * _ui),
           decoration: selected
               ? RT.card(color: RT.orange, radius: 16, border: 0)
               : RT.pill(opacity: 0.9, radius: 16),
@@ -1067,28 +1141,25 @@ class _GameScreenState extends State<GameScreen> {
             mainAxisSize: MainAxisSize.min,
             children: [
               Container(
-                width: 22 * _ui,
-                height: 22 * _ui,
+                width: (selected ? 22.0 : 18.0) * _ui,
+                height: (selected ? 22.0 : 18.0) * _ui,
                 decoration: BoxDecoration(color: w.color, shape: BoxShape.circle),
               ),
-              const SizedBox(width: 8),
-              Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Text(w.chipLabel,
-                      style: RT.body(
-                          size: 10,
-                          color: selected ? Colors.white : RT.ink,
-                          weight: FontWeight.w800,
-                          letterSpacing: 0.8)),
-                  Text(label,
-                      style: RT.body(
-                          size: 11,
-                          color: (selected ? Colors.white : RT.ink).withOpacity(0.78),
-                          weight: FontWeight.w800)),
-                ],
-              ),
+              if (selected) ...[
+                const SizedBox(width: 8),
+                Text(w.chipLabel,
+                    style: RT.body(
+                        size: 10,
+                        color: Colors.white,
+                        weight: FontWeight.w800,
+                        letterSpacing: 0.8)),
+              ],
+              const SizedBox(width: 6),
+              Text(label,
+                  style: RT.body(
+                      size: 11,
+                      color: (selected ? Colors.white : RT.ink).withOpacity(0.78),
+                      weight: FontWeight.w800)),
             ],
           ),
         ),
@@ -1096,27 +1167,41 @@ class _GameScreenState extends State<GameScreen> {
     );
   }
 
+  /// The fine-tune controls: four buttons that nudge the angle and the power
+  /// by a degree and a percent.
+  ///
+  /// They are hidden behind a small toggle by default. The pull-back drag
+  /// already sets angle and power together, so the buttons are a second way
+  /// of doing something the primary control does better — but they are the
+  /// only way to adjust *after* letting go of a drag, so they cannot go
+  /// away entirely.
+  ///
+  /// On a desktop they do not appear at all: the keyboard already nudges
+  /// (WASD or the arrows, Shift for the coarse step), and four buttons on a
+  /// mouse-driven layout are a fifth of the bottom bar for nothing.
   Widget _nudgeBar() {
+    if (Desktop.isDesktop) return const SizedBox.shrink();
+    final shown = _fineTune;
     return Row(
       key: _nudgeBarKey,
       mainAxisSize: MainAxisSize.min,
       children: [
-        _roundBtn(() => ctrl.nudgeAngle(-1), icon: Icons.keyboard_arrow_down),
-        const SizedBox(width: 6),
-        _roundBtn(() => ctrl.nudgeAngle(1), icon: Icons.keyboard_arrow_up),
-        const SizedBox(width: 6),
-        _roundBtn(() => ctrl.nudgePower(-1), icon: Icons.remove),
-        const SizedBox(width: 6),
-        _roundBtn(() => ctrl.nudgePower(1), icon: Icons.add),
-        const SizedBox(width: 10),
-        Container(
-          padding: EdgeInsets.symmetric(horizontal: 16, vertical: 11 * _ui),
-          decoration: RT.pill(color: RT.ink, opacity: 0.58, radius: 16),
-          child: Text(
-            ctrl.statusMessage.isEmpty ? 'Pull back and release' : ctrl.statusMessage,
-            style: RT.body(size: 13 * _ui, color: Colors.white, weight: FontWeight.w800),
-          ),
+        // The toggle: a small button that opens and closes the four nudges.
+        _roundBtn(
+          () => setState(() => _fineTune = !_fineTune),
+          icon: Icons.tune,
+          size: 30,
         ),
+        if (shown) ...[
+          const SizedBox(width: 6),
+          _roundBtn(() => ctrl.nudgeAngle(-1), icon: Icons.keyboard_arrow_down),
+          const SizedBox(width: 6),
+          _roundBtn(() => ctrl.nudgeAngle(1), icon: Icons.keyboard_arrow_up),
+          const SizedBox(width: 6),
+          _roundBtn(() => ctrl.nudgePower(-1), icon: Icons.remove),
+          const SizedBox(width: 6),
+          _roundBtn(() => ctrl.nudgePower(1), icon: Icons.add),
+        ],
       ],
     );
   }
@@ -1163,24 +1248,6 @@ class _GameScreenState extends State<GameScreen> {
         pad('◀', -1),
         const SizedBox(width: 8),
         pad('▶', 1),
-        const SizedBox(width: 10),
-        // The hint gives way before the pads do. It is the only thing in
-        // this row that is merely nice to know, so on a narrow screen it
-        // shortens rather than shoving the walk controls off the edge.
-        Flexible(
-          child: Container(
-            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-            decoration: RT.pill(color: RT.ink, opacity: 0.5, radius: 14),
-            child: Text('TAP A CREW MEMBER TO SWITCH',
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-                style: RT.body(
-                    size: 9,
-                    color: Colors.white.withOpacity(0.85),
-                    weight: FontWeight.w800,
-                    letterSpacing: 0.8)),
-          ),
-        ),
       ],
     );
   }
@@ -1410,6 +1477,16 @@ class _GameScreenState extends State<GameScreen> {
                   ],
                 ],
               ),
+              // The purse, which used to sit in the top bar over the water.
+              // It is a between-battles number, not a battle number, so it
+              // belongs here with the rest of the accounting.
+              const SizedBox(height: 8),
+              Text('${SaveService.instance.data.doubloons} DOUBLOONS IN YOUR PURSE',
+                  style: RT.body(
+                      size: 10,
+                      color: RT.ink.withOpacity(0.5),
+                      weight: FontWeight.w800,
+                      letterSpacing: 1.2)),
               const SizedBox(height: 14),
               _xpPanel(),
               const SizedBox(height: 14),
@@ -1662,6 +1739,9 @@ class _ScenePainter extends CustomPainter {
       buildTarget: ctrl.buildPhase && !ctrl.inIntro
           ? ctrl.world.raftOf(ctrl.localPlayerIndex)
           : null,
+      // Crew chatter is a setting: the bubbles are half the life of the
+      // game, and also a white box over the action.
+      chatter: SaveService.instance.data.crewChatter,
     );
 
     // Trajectory preview for the human shooter, drawn over the scene.

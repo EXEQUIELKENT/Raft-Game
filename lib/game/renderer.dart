@@ -40,6 +40,16 @@ class WorldRenderer {
   final List<_Cloud> _clouds = [];
   bool _decorBuilt = false;
 
+  /// Whether crew may talk over each other this frame. Set from the
+  /// renderer's [chatter] argument.
+  bool _chatter = true;
+
+  /// True when there is more than one opponent, and so a name plate is
+  /// worth drawing. In a plain duel the enemy is the only other raft on the
+  /// water and its name tells the player nothing they do not already know.
+  bool get _showEnemyLabels =>
+      world.rafts.where((r) => r.playerIndex != 0 && r.alive).length > 1;
+
   WorldRenderer(this.world, {required this.map});
 
   /// [currentPlayer]/[isAiming]/[aimAngleDeg]/[weapon] describe the live aim
@@ -47,6 +57,10 @@ class WorldRenderer {
   /// the active shooter's arm: raised and tracking the drag while aiming,
   /// kicking back into a muzzle flash for a beat right after firing, and
   /// hanging relaxed at every other crew member and at every other time.
+  ///
+  /// [chatter] turns the crew's speech bubbles off. They are half the life
+  /// of the game, but each one is a white box over the action, so it is the
+  /// player's call (see the Crew Chatter setting).
   void render(
     Canvas canvas,
     Size size,
@@ -56,8 +70,10 @@ class WorldRenderer {
     double aimAngleDeg = 45,
     WeaponDef? weapon,
     Raft? buildTarget,
+    bool chatter = true,
   }) {
     _buildTarget = buildTarget;
+    _chatter = chatter;
     // A degenerate canvas is refused rather than divided by.
     //
     // `viewWidth` below is `size.width / scale`, and `scale` is proportional
@@ -1151,13 +1167,18 @@ class WorldRenderer {
         // long as the fire has turns left. Sits above the status badge when
         // both are showing, so they never overlap.
         if (c.alive && c.burnTurns > 0) _burnMark(canvas, raft, c, pose, time);
-        if (c.alive && c.talking) _speechBubble(canvas, raft, c, pose);
+        // Crew chatter is a setting: the bubbles are half the life of the
+        // game, but they are also a white box over the action, so the
+        // player gets to turn them off.
+        if (c.alive && c.talking && _chatter) _speechBubble(canvas, raft, c, pose);
         canvas.restore();
       }
 
       canvas.restore();
 
-      if (raft.playerIndex != 0 && raft.alive) _enemyLabel(canvas, raft, bob);
+      if (raft.playerIndex != 0 && raft.alive && _showEnemyLabels) {
+        _enemyLabel(canvas, raft, bob);
+      }
     }
   }
 
@@ -1536,19 +1557,14 @@ class WorldRenderer {
         ..strokeWidth = 1.2,
     );
 
-    // The numbers: current/max HP under the bar, and the damage still left
-    // in the ghost drain floating above it. Both ride the same fade as the
-    // bar, so the whole readout arrives and leaves as one piece — and both
-    // keep working on a corpse, where the bar is draining to zero.
-    final cur = c.hp.round().clamp(0, c.maxHp.round());
-    final label = _text(
-      '$cur/${c.maxHp.round()}',
-      size: 8,
-      color: RT.ink,
-      alpha: alpha * 0.9,
-      letterSpacing: 0.4,
-    );
-    label.paint(canvas, Offset(cx - label.width / 2, rect.bottom + 2));
+    // The damage still in the ghost drain, floating above the bar. It rides
+    // the same fade as the bar, so the readout arrives and leaves as one
+    // piece — and it keeps working on a corpse, where the bar is draining to
+    // zero.
+    //
+    // The exact current/max HP is deliberately NOT printed: at this size it
+    // was never readable, and the bar plus the damage number already say
+    // everything the player acts on.
     final delta = ((c.hpDisplay - c.hpFrac) * c.maxHp).round();
     if (delta > 0) {
       final dmg = _text(
