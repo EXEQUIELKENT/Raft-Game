@@ -1,5 +1,14 @@
 # Changelog
 
+## [1.1.6](https://github.com/EXEQUIELKENT/Raft-Game/compare/raft_rumble-v1.1.5...raft_rumble-v1.1.6) (2026-10-24)
+
+
+### Bug Fixes
+
+* Improve vertical camera framing and easing ([3b45af4](https://github.com/EXEQUIELKENT/Raft-Game/commit/3b45af45c8a84138fb3b3b19511ce9815dbc5395))
+* Move stray shot resolution into BattleWorld ([4ab403b](https://github.com/EXEQUIELKENT/Raft-Game/commit/4ab403b32ce76cd79ac7ba339f013bfa673d6e53))
+* Update controller.dart ([01e8742](https://github.com/EXEQUIELKENT/Raft-Game/commit/01e8742cb7fe9e0d01b5cc760d8498a9edbc71f8))
+
 ## [1.1.5](https://github.com/EXEQUIELKENT/Raft-Game/compare/raft_rumble-v1.1.4...raft_rumble-v1.1.5) (2026-10-24)
 
 
