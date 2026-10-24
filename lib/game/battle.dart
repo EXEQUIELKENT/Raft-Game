@@ -3998,6 +3998,19 @@ class BattleWorld {
     return resolve;
   }
 
+  /// Safety net for the controller: if the in-flight shot has left the valid
+  /// area (sunk below the waterline or flown off the sides) without
+  /// [stepShot] resolving it, resolve it now as a splash/miss. Returns the
+  /// outcome, or null when there is no shot or it is still in play.
+  ShotOutcome? resolveIfOutOfBounds() {
+    final s = shot;
+    if (s == null) return null;
+    final gone = s.pos.dy > waterAt(s.pos.dx) + 40 ||
+        s.pos.dx < -100 ||
+        s.pos.dx > BattleConst.worldW + 100;
+    return gone ? _resolve(s, null, -1) : null;
+  }
+
   /// Sweep fraction [t] ∈ [0,1] at which the frame's segment passes nearest
   /// to [point] — used to order simultaneous collision candidates.
   double _sweepT(Offset from, Offset to, Offset point) {

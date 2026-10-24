@@ -7,7 +7,7 @@ import 'package:flutter/scheduler.dart';
 
 import 'ai.dart';
 import 'audio.dart';
-import 'battle.dart' as battle;
+import 'battle.dart';
 import 'build.dart';
 import 'bosses.dart';
 import 'maps.dart';
@@ -1338,15 +1338,10 @@ class GameController extends ChangeNotifier {
     // After stepping, check if the shot has gone out of bounds or resolved.
     // This handles the case where stepShot() returns null repeatedly but the
     // shot has already left the valid area (e.g. fallen in water or flown off screen).
-    if (world.shot != null) {
-      final s = world.shot!;
-      final goneOutOfBounds = s.pos.dy > battle.waterAt(s.pos.dx) + 40 ||
-          s.pos.dx < -100 ||
-          s.pos.dx > BattleConst.worldW + 100;
-      if (goneOutOfBounds) {
-        // Resolve as splash/miss and nil the shot so the phase can transition.
-        battle._resolve(s, null, -1);
-      }
+    final stray = world.resolveIfOutOfBounds();
+    if (stray != null) {
+      _onShotResolved(stray);
+      return;
     }
     if (world.shot == null) {
       phase = GamePhase.resolving;
