@@ -2933,6 +2933,11 @@ class BattleWorld {
   double camY = 0;
   bool _camYSet = false;
 
+  /// Vertical speed of [camY], in world units per second. Carried between
+  /// frames so the camera accelerates and settles smoothly instead of being
+  /// re-aimed from rest every tick. See [_easeCamY].
+  double _camYVel = 0;
+
   /// Whose raft the camera is locked to. Shots are lobbed blind, so the view
   /// belongs to whoever is firing — never to their target.
   int camAnchor = 0;
@@ -4569,33 +4574,40 @@ class BattleWorld {
   /// Eases the vertical camera so the view keeps the crews framed on a
   /// terraced sea.
   ///
-  /// Two wants, resolved in this order:
-  ///
-  ///  1. The camera anchor's crew body sits comfortably in frame: their body
-  ///     centre targets about 42% down the window, leaving sky above for the
-  ///     head and water below for splash feedback.
-  ///  2. The lowest water in frame stays visible: when the anchor is up high
-  ///     and the window reaches across a falls, the sea below would otherwise
-  ///     slide off the bottom edge, and the impact of a shot lobbed down onto
-  ///     it would happen off-screen.
-  ///
-  /// When the two wants conflict the lower target wins, which shows more of
-  /// the drop and leaves the anchor a little above its ideal line rather than
-  /// hiding the water they are firing into. The window may lean a little way
-  /// past either world edge: above the top is empty sky (the gradient clamps),
-  /// below the bottom is deep water.
-  ///
-  /// Elevation changes snap quickly when far away and ease smoothly when
-  /// close, so crossing a falls reads as a quick reframe rather than a slow
-  /// drag, and small jitters don't shake the view.
+  /// This is a critically damped spring (the classic "smooth damp"), not a
+  /// fixed-fraction ease. The old version switched its rate from 10 to 3 the
+  /// instant the gap fell under 40 units: the camera sprinted, then suddenly
+  /// braked, and the long slow tail read as the view lagging behind the
+  /// action every time it rose or fell to reveal a raft on another terrace.
+  /// Here velocity is continuous, so the move accelerates, glides and settles
+  /// with no seam in it, and it is frame-rate independent.
   void _easeCamY(double dt) {
     ensureCamY();
+    // A hitched frame must not fling the camera; the controller already caps
+    // its step, this protects direct callers too.
+    final h = dt.clamp(0.0, 1 / 20);
+    if (h <= 0) return;
     final target = _camYTarget();
-    final diff = target - camY;
-    // Snap quickly across large elevation changes (steps/waterfalls), ease
-    // gently when close so small jitters don't shake the view.
-    final rate = diff.abs() > 40 ? 10.0 : 3.0;
-    camY += diff * (dt * rate).clamp(0.0, 1.0);
+
+    const smoothTime = 0.20; // seconds to close most of a gap
+    const maxSpeed = 900.0; // world units per second
+    final omega = 2 / smoothTime;
+    final x = omega * h;
+    final e = 1 / (1 + x + 0.48 * x * x + 0.235 * x * x * x);
+
+    final maxChange = maxSpeed * smoothTime;
+    final change = (camY - target).clamp(-maxChange, maxChange);
+    final clippedTarget = camY - change;
+    final temp = (_camYVel + omega * change) * h;
+    _camYVel = (_camYVel - omega * temp) * e;
+    var out = clippedTarget + (change + temp) * e;
+
+    // Never overshoot the target.
+    if ((target - camY > 0) == (out > target)) {
+      out = target;
+      _camYVel = 0;
+    }
+    camY = out;
   }
 
   /// Places the vertical camera on its target if it has never been placed.
@@ -4611,30 +4623,97 @@ class BattleWorld {
     camY = _camYTarget();
   }
 
+  /// [_raftTopY] for tests, which assert the camera keeps this on screen.
+  @visibleForTesting
+  double raftTopForTest(Raft raft) => _raftTopY(raft);
+
+  /// World-y of the highest thing on [raft] that must stay on screen: the mast
+  /// and flag, the tallest built block, the deck structures, and the heads of
+  /// the crew standing on them.
+  double _raftTopY(Raft raft) {
+    final lo = raft.loadout;
+    final water = raft.waterLine;
+    // Deck structures and the mast, as the renderer draws them.
+    var reach = lo.deckRise + 104;
+    if (lo.hull.hasMast) reach = max(reach, lo.hullHeight * 0.5 + 116);
+    var top = water - reach;
+
+    // A built superstructure stands on the deck.
+    final plan = raft.build;
+    if (plan != null) {
+      var tallest = -1;
+      for (final (_, row, _) in plan.standing) {
+        if (row > tallest) tallest = row;
+      }
+      if (tallest >= 0) {
+        top = min(top, raft.deckY - (tallest + 1) * BuildPlan.cellH - 12);
+      }
+    }
+
+    // Crew can stand on top of it (or on a tiered deck) - keep their heads in.
+    for (int i = 0; i < raft.crew.length; i++) {
+      if (!raft.crew[i].alive || raft.crew[i].ragdoll) continue;
+      top = min(top, raft.feetPos(i).dy - BattleConst.bodyHeight - 12);
+    }
+    return top;
+  }
+
+  /// How strongly [raft] counts when framing, 0..1.
+  ///
+  /// 1 once it is properly inside the window, fading to 0 as it slides out of
+  /// view. The window is widened a little each side so the camera starts to
+  /// rise or fall *as a raft arrives* and is already in place when it is
+  /// revealed, rather than snapping late once the raft is on screen. The
+  /// camera anchor's own raft always counts in full.
+  ///
+  /// The look-ahead stays well under [BattleConst.camEnemyMargin] (140, less
+  /// the 20 of slack in [half] below): the blind-fire lock holds enemies
+  /// that far outside the frame, and they must contribute nothing to the
+  /// framing while the player is aiming.
+  double _frameWeight(Raft raft) {
+    if (raft.playerIndex == camAnchor) return 1.0;
+    const lookAhead = 60.0;
+    const feather = 220.0;
+    final half = raft.loadout.width * 0.5 + 20;
+    final inside = min(
+      raft.x + half - (cam - lookAhead),
+      (cam + viewWidth + lookAhead) - (raft.x - half),
+    );
+    return (inside / feather).clamp(0.0, 1.0);
+  }
+
   /// Where the vertical camera wants to be right now. See [_easeCamY] for
-  /// how the two wants inside it are weighed.
+  /// how it gets there.
+  ///
+  /// Wants, in priority order:
+  ///
+  ///  1. Every raft in (or arriving in) the window is shown whole. The camera
+  ///     rises when a raft stands on a higher terrace and drops when it
+  ///     stands on a lower one, so nothing is cropped at the top by the
+  ///     anchor's own framing.
+  ///  2. The anchor's crew body sits comfortably in frame (about 42% down).
+  ///  3. The lowest water in view stays visible for shots landing below -
+  ///     but only as far as (1) allows. This used to win outright, which
+  ///     slid the view down the moment the window reached a lower terrace
+  ///     and pushed the raft up past the top edge.
   double _camYTarget() {
     final anchor = raftOf(camAnchor);
     final centreX = anchor?.x ?? (cam + viewWidth / 2);
 
-    // Target the active crew's body centre so the whole character stays in
-    // frame, not just the water beneath their feet. Crew stand on the deck
+    // Preferred framing: the anchor's body centre. Crew stand on the deck
     // which sits above the waterline, so targeting the waterline alone cuts
     // the top of heads off on high terraces.
     double targetY;
     final crew = anchor?.activeCrew;
     if (crew != null) {
-      // crew != null implies anchor != null and activeIndex is valid.
       final a = anchor!;
       // crewPos is feet - 24, i.e. roughly body centre.
       targetY = a.crewPos(a.activeIndex).dy - BattleConst.viewH * 0.42;
     } else {
-      final focus = waterAt(centreX);
-      targetY = focus - BattleConst.viewH * 0.62;
+      targetY = waterAt(centreX) - BattleConst.viewH * 0.62;
     }
 
-    // Keep the lowest stretch of water in frame so shots landing below the
-    // anchor stay visible.
+    // Soft want: the lowest stretch of water in frame.
     var lowest = waterAt(centreX);
     for (double x = cam; x <= cam + viewWidth + 60; x += 120) {
       final y = waterAt(x);
@@ -4642,7 +4721,33 @@ class BattleWorld {
     }
     targetY = max(targetY, lowest - BattleConst.viewH * 0.90);
 
-    return targetY.clamp(-60.0, BattleConst.worldH - BattleConst.viewH);
+    // Hard want: whole rafts. Each raft pulls the window up (so its top is
+    // inside) or down (so its waterline is inside) by its frame weight.
+    const topMargin = 18.0;
+    const bottomMargin = 26.0;
+    final preferred = targetY;
+    var needTop = preferred; // camY must not exceed this
+    var needBottom = -double.maxFinite; // camY must not fall below this
+    for (final r in rafts) {
+      if (!r.alive) continue;
+      final w = _frameWeight(r);
+      if (w <= 0) continue;
+      final reqTop = _raftTopY(r) - topMargin;
+      final blendedTop = preferred + (reqTop - preferred) * w;
+      if (blendedTop < needTop) needTop = blendedTop;
+      final reqBottom = r.waterLine + bottomMargin - BattleConst.viewH;
+      final blendedBottom = preferred + (reqBottom - preferred) * w;
+      if (blendedBottom > needBottom) needBottom = blendedBottom;
+    }
+
+    var y = min(preferred, needTop);
+    y = max(y, needBottom);
+    y = min(y, needTop); // on a conflict the raft's top wins
+
+    // The window may lean above the world (empty sky, the gradient clamps);
+    // allow as far as it takes to fit the tallest raft.
+    final lowerBound = min(-60.0, needTop);
+    return y.clamp(lowerBound, BattleConst.worldH - BattleConst.viewH);
   }
 
   /// One 60Hz tick of every crew body on the water.
